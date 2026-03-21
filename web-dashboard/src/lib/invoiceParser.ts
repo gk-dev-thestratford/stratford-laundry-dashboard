@@ -103,8 +103,8 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
   const line = raw.trim()
   if (!line) return null
 
-  // Skip non-data lines
-  if (/^(DATE|TICKET|NUMBER|DESCRIPTION|NET\b|VAT\b|GROSS|Goldstar|Manhattan|Olympic|London|E\d|United|020|Account|Sort|Company|National|Invoice)/i.test(line)) return null
+  // Skip non-data lines (headers, company info, etc.)
+  if (/^(DATE|TICKET|NUMBER|DESCRIPTION|NET\b|VAT\b|GROSS|Goldstar|Manhattan|Olympic|London|United|020|Account|Sort|Company|National|Invoice)/i.test(line)) return null
 
   // Must have 3 price values: £ net £vat £gross
   const priceRe = /£\s*([\d,]+\.\d{2})\s+£\s*([\d,]+\.\d{2})\s+£\s*([\d,]+\.\d{2})\s*$/
@@ -167,9 +167,22 @@ const SECTION_NAMES: Record<string, InvoiceSectionType> = {
 
 function detectSection(line: string): InvoiceSectionType | null {
   const lower = line.toLowerCase().trim()
-  // Only match short lines that are purely section headers
-  if (lower.length > 25) return null
-  return SECTION_NAMES[lower] ?? null
+  // Section headers are short lines without prices
+  if (lower.length > 40) return null
+  if (lower.includes('£')) return null
+
+  // Exact match first
+  if (SECTION_NAMES[lower]) return SECTION_NAMES[lower]
+
+  // Substring/keyword match for variations like "STAFF UNIFORMS", "GUEST LAUNDRY"
+  if (/\bstaff\b/.test(lower)) return 'staff'
+  if (/\bguest\b/.test(lower)) return 'guest'
+  if (/\bnapkin/.test(lower)) return 'napkins'
+  if (/\btable\s*cloth/.test(lower)) return 'table_cloths'
+  if (/\bbathrobe/.test(lower)) return 'bathrobes'
+  if (/\bhsk\b/.test(lower)) return 'hsk'
+
+  return null
 }
 
 // ── Main parser ──
@@ -213,37 +226,23 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
       continue
     }
 
-    // Data line
-    if (currentSection) {
-      const parsed = parseLine(line, lastDate)
-      if (parsed) {
-        const { parsedDate, ...invoiceLine } = parsed
-        invoiceLine.sectionType = currentSection.type
-        currentSection.lines.push(invoiceLine)
-        lastDate = parsedDate
+    // Data line — if no section detected yet, create a default one
+    const parsed = parseLine(line, lastDate)
+    if (parsed) {
+      if (!currentSection) {
+        let type: InvoiceSectionType = 'staff'
+        if (/GM/i.test(invoiceNumber)) type = 'guest'
+        else if (/HH/i.test(invoiceNumber)) type = 'bathrobes'
+        else if (/NM/i.test(invoiceNumber)) type = 'napkins'
+        else if (/HM/i.test(invoiceNumber)) type = 'hsk'
+        currentSection = { name: type, type, lines: [] }
+        sections.push(currentSection)
       }
+      const { parsedDate, ...invoiceLine } = parsed
+      invoiceLine.sectionType = currentSection.type
+      currentSection.lines.push(invoiceLine)
+      lastDate = parsedDate
     }
-  }
-
-  // If no sections detected, create one from invoice number
-  if (sections.length === 0) {
-    let type: InvoiceSectionType = 'staff'
-    if (/GM/i.test(invoiceNumber)) type = 'guest'
-    else if (/HH/i.test(invoiceNumber)) type = 'bathrobes'
-    else if (/NM/i.test(invoiceNumber)) type = 'napkins'
-    else if (/HM/i.test(invoiceNumber)) type = 'hsk'
-
-    const section: InvoiceSection = { name: type, type, lines: [] }
-    for (const line of lines) {
-      const parsed = parseLine(line, lastDate)
-      if (parsed) {
-        const { parsedDate, ...invoiceLine } = parsed
-        invoiceLine.sectionType = type
-        section.lines.push(invoiceLine)
-        lastDate = parsedDate
-      }
-    }
-    if (section.lines.length > 0) sections.push(section)
   }
 
   return {

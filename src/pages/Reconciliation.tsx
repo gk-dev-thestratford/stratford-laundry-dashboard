@@ -502,6 +502,8 @@ export default function Reconciliation() {
 
   const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
   const grandInvoiceNet = result.invoiceTotal + totalTopUp
+  const statedNet = invoice.totals.net
+  const parsedVsStatedGap = statedNet > 0 ? Math.abs(statedNet - grandInvoiceNet) : 0
 
   return (
     <div className="space-y-6">
@@ -535,6 +537,21 @@ export default function Reconciliation() {
         <div><span className="text-gray-500">Lines:</span> <span className="font-medium">{invoice.sections.reduce((s, sec) => s + sec.lines.length, 0)}</span></div>
         <div><span className="text-gray-500">System orders:</span> <span className="font-medium">{orders.length}</span></div>
       </div>
+
+      {/* Parse integrity warning */}
+      {parsedVsStatedGap > 1 && (
+        <div className="bg-amber-50 border border-amber-300 rounded-lg p-4 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
+          <div className="text-sm">
+            <p className="font-semibold text-amber-800">Parse discrepancy detected</p>
+            <p className="text-amber-700 mt-1">
+              Invoice states NET total of <span className="font-medium">{'\u00a3'}{statedNet.toFixed(2)}</span> but
+              parsed lines total <span className="font-medium">{'\u00a3'}{grandInvoiceNet.toFixed(2)}</span> (items {'\u00a3'}{result.invoiceTotal.toFixed(2)} + TopUp {'\u00a3'}{totalTopUp.toFixed(2)}).
+              Gap: <span className="font-bold">{'\u00a3'}{parsedVsStatedGap.toFixed(2)}</span> — some invoice lines may not have been captured from the PDF.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
