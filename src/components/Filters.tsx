@@ -1,36 +1,54 @@
-import { Search } from 'lucide-react'
+import { Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { MONTHS, ORDER_STATUS_LABELS } from '../types'
 import type { OrderStatus, Department } from '../types'
+import type { Filters as FilterType } from '../hooks/useOrders'
 
 interface FiltersProps {
-  filters: {
-    status: OrderStatus | 'all'
-    department: string
-    month: number
-    search: string
-  }
+  filters: FilterType
   departments: Department[]
-  onChange: (filters: FiltersProps['filters']) => void
+  onChange: (filters: FilterType) => void
 }
 
 export default function Filters({ filters, departments, onChange }: FiltersProps) {
   return (
     <div className="space-y-4">
-      {/* Month quick-filters */}
-      <div className="flex flex-wrap gap-1.5">
-        {MONTHS.map((label, idx) => (
+      {/* Year selector + Month quick-filters */}
+      <div className="flex items-center gap-3">
+        {/* Year picker */}
+        <div className="flex items-center gap-1 bg-white border border-gray-200 rounded-lg px-1 py-0.5">
           <button
-            key={label}
-            onClick={() => onChange({ ...filters, month: idx })}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
-              filters.month === idx
-                ? 'bg-navy text-white'
-                : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'
-            }`}
+            onClick={() => onChange({ ...filters, year: filters.year - 1 })}
+            className="p-1.5 hover:bg-gray-100 rounded transition-colors"
           >
-            {label}
+            <ChevronLeft className="w-4 h-4 text-gray-600" />
           </button>
-        ))}
+          <span className="px-2 text-sm font-semibold text-navy min-w-[48px] text-center">
+            {filters.year}
+          </span>
+          <button
+            onClick={() => onChange({ ...filters, year: filters.year + 1 })}
+            className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+          >
+            <ChevronRight className="w-4 h-4 text-gray-600" />
+          </button>
+        </div>
+
+        {/* Month pills */}
+        <div className="flex flex-wrap gap-1.5">
+          {MONTHS.map((label, idx) => (
+            <button
+              key={label}
+              onClick={() => onChange({ ...filters, month: idx })}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                filters.month === idx
+                  ? 'bg-navy text-white'
+                  : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Dropdowns and search */}

@@ -2,10 +2,11 @@ import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import type { Order, Department, OrderStatus } from '../types'
 
-interface Filters {
+export interface Filters {
   status: OrderStatus | 'all'
   department: string
   month: number // 0 = all, 1-12 = Jan-Dec
+  year: number  // e.g. 2026
   search: string
 }
 
@@ -17,6 +18,7 @@ export function useOrders() {
     status: 'all',
     department: 'all',
     month: 0,
+    year: new Date().getFullYear(),
     search: '',
   })
 
@@ -47,10 +49,16 @@ export function useOrders() {
     if (filters.department !== 'all') {
       query = query.eq('department_id', filters.department)
     }
+
+    // Year + month filtering
     if (filters.month > 0) {
-      const year = new Date().getFullYear()
-      const startDate = new Date(year, filters.month - 1, 1).toISOString()
-      const endDate = new Date(year, filters.month, 1).toISOString()
+      const startDate = new Date(filters.year, filters.month - 1, 1).toISOString()
+      const endDate = new Date(filters.year, filters.month, 1).toISOString()
+      query = query.gte('created_at', startDate).lt('created_at', endDate)
+    } else {
+      // Year only
+      const startDate = new Date(filters.year, 0, 1).toISOString()
+      const endDate = new Date(filters.year + 1, 0, 1).toISOString()
       query = query.gte('created_at', startDate).lt('created_at', endDate)
     }
 
@@ -98,6 +106,24 @@ export function useOrders() {
     return { error }
   }, [fetchOrders])
 
+  const updateOrder = useCallback(async (orderId: string, updates: Partial<Order>) => {
+    const { error } = await supabase
+      .from('orders')
+      .update(updates)
+      .eq('id', orderId)
+    if (!error) fetchOrders()
+    return { error }
+  }, [fetchOrders])
+
+  const updateOrderItem = useCallback(async (itemId: string, updates: { quantity_sent?: number; quantity_received?: number }) => {
+    const { error } = await supabase
+      .from('order_items')
+      .update(updates)
+      .eq('id', itemId)
+    if (!error) fetchOrders()
+    return { error }
+  }, [fetchOrders])
+
   const deleteOrders = useCallback(async (orderIds: string[]) => {
     const { error } = await supabase
       .from('orders')
@@ -107,5 +133,5 @@ export function useOrders() {
     return { error }
   }, [fetchOrders])
 
-  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, deleteOrders }
+  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders }
 }

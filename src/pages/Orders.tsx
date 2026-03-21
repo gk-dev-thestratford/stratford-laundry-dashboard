@@ -11,7 +11,7 @@ import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
 
 export default function Orders() {
-  const { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, deleteOrders } = useOrders()
+  const { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders } = useOrders()
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [detailOrder, setDetailOrder] = useState<Order | null>(null)
   const [showCreate, setShowCreate] = useState(false)
@@ -165,11 +165,14 @@ export default function Orders() {
       {detailOrder && (
         <OrderDetail
           order={detailOrder}
+          departments={departments}
           onClose={() => setDetailOrder(null)}
           onStatusChange={(id, status, reason) => {
             updateOrderStatus(id, status, reason)
             setDetailOrder(null)
           }}
+          onSave={updateOrder}
+          onSaveItem={updateOrderItem}
         />
       )}
 
