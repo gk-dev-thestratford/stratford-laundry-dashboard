@@ -66,7 +66,7 @@ export default function CreateOrderModal({ departments, onClose, onCreated }: Cr
         bag_count: isGuestOrder ? bagCount : null,
         notes: notes || null,
         status: 'submitted' as const,
-        total_price: orderType === 'uniform' ? totalPrice : null,
+        total_price: !isGuestOrder && totalPrice > 0 ? totalPrice : null,
       }
 
       const { data: order, error: orderError } = await supabase

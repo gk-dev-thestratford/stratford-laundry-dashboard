@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
-import type { Order, Department, OrderStatus } from '../types'
+import type { Order, Department, OrderStatus, OrderType, BulkEdits } from '../types'
 
 export interface Filters {
   status: OrderStatus | 'all'
@@ -8,6 +8,8 @@ export interface Filters {
   month: number // 0 = all, 1-12 = Jan-Dec
   year: number  // e.g. 2026
   search: string
+  orderType: OrderType | 'all'
+  outstanding: boolean // true = only show orders with outstanding items
 }
 
 export function useOrders() {
@@ -20,6 +22,8 @@ export function useOrders() {
     month: 0,
     year: new Date().getFullYear(),
     search: '',
+    orderType: 'all',
+    outstanding: false,
   })
 
   const fetchDepartments = useCallback(async () => {
@@ -49,6 +53,9 @@ export function useOrders() {
     if (filters.department !== 'all') {
       query = query.eq('department_id', filters.department)
     }
+    if (filters.orderType !== 'all') {
+      query = query.eq('order_type', filters.orderType)
+    }
 
     // Year + month filtering
     if (filters.month > 0) {
@@ -73,6 +80,14 @@ export function useOrders() {
           o.staff_name?.toLowerCase().includes(s) ||
           o.guest_name?.toLowerCase().includes(s) ||
           o.room_number?.toLowerCase().includes(s)
+      )
+    }
+
+    if (filters.outstanding) {
+      results = results.filter((o) =>
+        (o.order_items || []).some(
+          (i) => i.quantity_sent > (i.quantity_received ?? 0)
+        )
       )
     }
 
@@ -133,5 +148,45 @@ export function useOrders() {
     return { error }
   }, [fetchOrders])
 
-  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders }
+  /** Bulk save: docket numbers + item prices in one go */
+  const bulkSaveEdits = useCallback(async (edits: BulkEdits) => {
+    const promises: Promise<unknown>[] = []
+
+    for (const [orderId, updates] of Object.entries(edits.orders)) {
+      if (Object.keys(updates).length > 0) {
+        promises.push(supabase.from('orders').update(updates).eq('id', orderId))
+      }
+    }
+
+    for (const [itemId, updates] of Object.entries(edits.items)) {
+      if (Object.keys(updates).length > 0) {
+        promises.push(supabase.from('order_items').update({ price_at_time: updates.price_at_time }).eq('id', itemId))
+      }
+    }
+
+    await Promise.all(promises)
+
+    // Recalculate total_price for affected orders
+    const affectedOrderIds = new Set<string>(Object.keys(edits.orders))
+    for (const upd of Object.values(edits.items)) {
+      if (upd.order_id) affectedOrderIds.add(upd.order_id)
+    }
+
+    for (const orderId of affectedOrderIds) {
+      const { data: items } = await supabase
+        .from('order_items')
+        .select('quantity_sent, price_at_time')
+        .eq('order_id', orderId)
+      if (items) {
+        const total = items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
+        if (total > 0) {
+          await supabase.from('orders').update({ total_price: Number(total.toFixed(2)) }).eq('id', orderId)
+        }
+      }
+    }
+
+    await fetchOrders()
+  }, [fetchOrders])
+
+  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits }
 }

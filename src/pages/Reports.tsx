@@ -26,7 +26,7 @@ export default function Reports() {
     setLoading(true)
     const { data } = await supabase
       .from('orders')
-      .select('*, departments(*), order_items(*)')
+      .select('*, department:departments(*), order_items(*)')
       .gte('created_at', `${year}-01-01T00:00:00.000Z`)
       .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
       .order('created_at', { ascending: true })
@@ -42,11 +42,23 @@ export default function Reports() {
     return orders.filter(o => new Date(o.created_at).getMonth() + 1 === month)
   }, [orders, month])
 
+  // ── helpers ──
+  /** Compute order cost from item-level prices (works for uniforms AND linens) */
+  function orderCost(o: Order): number {
+    if (o.order_items && o.order_items.length > 0) {
+      const itemTotal = o.order_items.reduce(
+        (sum, i) => sum + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0,
+      )
+      if (itemTotal > 0) return itemTotal
+    }
+    return o.total_price ?? 0
+  }
+
   // ── KPIs ──
   const kpis = useMemo(() => {
     let sent = 0, received = 0, cost = 0
     filtered.forEach(o => {
-      cost += o.total_price || 0
+      cost += orderCost(o)
       o.order_items?.forEach(item => {
         sent += item.quantity_sent || 0
         received += item.quantity_received || 0
@@ -70,13 +82,13 @@ export default function Reports() {
       const mo = orders.filter(o => new Date(o.created_at).getMonth() === m)
       let sent = 0, received = 0, cost = 0
       mo.forEach(o => {
-        cost += o.total_price || 0
+        cost += orderCost(o)
         o.order_items?.forEach(item => {
           sent += item.quantity_sent || 0
           received += item.quantity_received || 0
         })
       })
-      return { month: MONTHS[m + 1] as string, orders: mo.length, sent, received, outstanding: sent - received, cost: Number(cost.toFixed(2)) }
+      return { month: MONTHS[m + 1] as string, orders: mo.length, sent, received, outstanding: sent - received, cost: Number(cost.toFixed(2)), costIncVat: Number((cost * 1.2).toFixed(2)) }
     })
   }, [orders])
 
@@ -89,7 +101,7 @@ export default function Reports() {
       if (!map.has(id)) map.set(id, { name, orders: 0, sent: 0, received: 0, cost: 0 })
       const d = map.get(id)!
       d.orders++
-      d.cost += o.total_price || 0
+      d.cost += orderCost(o)
       o.order_items?.forEach(item => {
         d.sent += item.quantity_sent || 0
         d.received += item.quantity_received || 0
@@ -99,6 +111,7 @@ export default function Reports() {
   }, [filtered])
 
   const deptChartData = useMemo(() => deptData.map(d => ({ name: d.name, orders: d.orders })), [deptData])
+  const deptCostChartData = useMemo(() => deptData.filter(d => d.cost > 0).map(d => ({ name: d.name, costIncVat: Number((d.cost * 1.2).toFixed(2)) })), [deptData])
 
   // ── Discrepancies / outstanding ──
   const discrepancies = useMemo(() => {
@@ -138,7 +151,8 @@ export default function Reports() {
     const monthlySheet = monthlyData.map(m => ({
       'Month': m.month, 'Orders': m.orders, 'Items Sent': m.sent,
       'Items Received': m.received, 'Outstanding': m.outstanding,
-      'Cost (\u00a3)': m.cost,
+      'Cost ex VAT (\u00a3)': m.cost,
+      'Cost inc VAT (\u00a3)': Number((m.cost * 1.2).toFixed(2)),
     }))
     monthlySheet.push({
       'Month': 'TOTAL',
@@ -146,13 +160,15 @@ export default function Reports() {
       'Items Sent': monthlyData.reduce((s, m) => s + m.sent, 0),
       'Items Received': monthlyData.reduce((s, m) => s + m.received, 0),
       'Outstanding': monthlyData.reduce((s, m) => s + m.outstanding, 0),
-      'Cost (\u00a3)': Number(monthlyData.reduce((s, m) => s + m.cost, 0).toFixed(2)),
+      'Cost ex VAT (\u00a3)': Number(monthlyData.reduce((s, m) => s + m.cost, 0).toFixed(2)),
+      'Cost inc VAT (\u00a3)': Number((monthlyData.reduce((s, m) => s + m.cost, 0) * 1.2).toFixed(2)),
     })
 
     const deptSheet = deptData.map(d => ({
       'Department': d.name, 'Orders': d.orders, 'Items Sent': d.sent,
       'Items Received': d.received, 'Outstanding': d.sent - d.received,
-      'Cost (\u00a3)': Number(d.cost.toFixed(2)),
+      'Cost ex VAT (\u00a3)': Number(d.cost.toFixed(2)),
+      'Cost inc VAT (\u00a3)': Number((d.cost * 1.2).toFixed(2)),
     }))
 
     const outstandingSheet: Record<string, string | number>[] = []
@@ -235,7 +251,7 @@ export default function Reports() {
       </div>
 
       {/* KPI cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <KpiCard icon={<ClipboardList className="w-4 h-4" />} label="Total Orders" value={kpis.orders.toLocaleString()} />
         <KpiCard icon={<Package className="w-4 h-4" />} label="Items Sent" value={kpis.sent.toLocaleString()} />
         <KpiCard icon={<Package className="w-4 h-4" />} label="Items Received" value={kpis.received.toLocaleString()} />
@@ -247,8 +263,13 @@ export default function Reports() {
         />
         <KpiCard
           icon={<TrendingUp className="w-4 h-4" />}
-          label="Total Cost"
+          label="Cost (ex VAT)"
           value={kpis.cost > 0 ? `\u00a3${kpis.cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '\u2014'}
+        />
+        <KpiCard
+          icon={<TrendingUp className="w-4 h-4" />}
+          label="Cost (inc VAT)"
+          value={kpis.cost > 0 ? `\u00a3${(kpis.cost * 1.2).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '\u2014'}
         />
       </div>
 
@@ -265,6 +286,7 @@ export default function Reports() {
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Monthly Orders */}
         <div className="bg-white rounded-xl border border-gray-200 p-4">
           <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Orders ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
@@ -282,6 +304,28 @@ export default function Reports() {
           </ResponsiveContainer>
         </div>
 
+        {/* Monthly Cost inc VAT */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Cost inc VAT ({year})</h3>
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={monthlyData} barSize={20}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
+              <Tooltip
+                contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                formatter={(value: number) => [`£${value.toFixed(2)}`, 'Cost inc VAT']}
+              />
+              <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[3, 3, 0, 0]}>
+                {monthlyData.map((_, i) => (
+                  <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#10B981'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Orders by Department */}
         <div className="bg-white rounded-xl border border-gray-200 p-4">
           <h3 className="text-sm font-semibold text-gray-900 mb-3">Orders by Department</h3>
           {deptChartData.length > 0 ? (
@@ -300,6 +344,31 @@ export default function Reports() {
             </ResponsiveContainer>
           ) : (
             <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No data for this period</div>
+          )}
+        </div>
+
+        {/* Cost by Department inc VAT */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Cost by Department inc VAT</h3>
+          {deptCostChartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(180, deptCostChartData.length * 36)}>
+              <BarChart data={deptCostChartData} layout="vertical" barSize={16}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" horizontal={false} />
+                <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `£${v}`} />
+                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(value: number) => [`£${value.toFixed(2)}`, 'Cost inc VAT']}
+                />
+                <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[0, 3, 3, 0]}>
+                  {deptCostChartData.map((_, i) => (
+                    <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No cost data for this period</div>
           )}
         </div>
       </div>
@@ -352,6 +421,7 @@ export default function Reports() {
                   <th className="px-4 py-2 text-right font-medium text-gray-600">Sent</th>
                   <th className="px-4 py-2 text-right font-medium text-gray-600">Received</th>
                   <th className="px-4 py-2 text-right font-medium text-gray-600">Outstanding</th>
+                  <th className="px-4 py-2 text-right font-medium text-gray-600">Value (\u00a3)</th>
                 </tr>
               </thead>
               <tbody>
@@ -378,6 +448,12 @@ export default function Reports() {
                       <td className="px-4 py-2.5 text-right">{o.totalSent}</td>
                       <td className="px-4 py-2.5 text-right">{o.totalReceived}</td>
                       <td className="px-4 py-2.5 text-right font-semibold text-amber-600">{o.totalOutstanding}</td>
+                      <td className="px-4 py-2.5 text-right font-semibold text-amber-600">
+                        {(() => {
+                          const val = o.items.reduce((s, i) => s + (i.price_at_time ?? 0) * i.outstanding, 0)
+                          return val > 0 ? `\u00a3${val.toFixed(2)}` : '\u2014'
+                        })()}
+                      </td>
                     </tr>
                     {expandedOrders.has(o.id) && o.items.map((item, idx) => (
                       <tr key={`${o.id}-${idx}`} className="bg-amber-50/50 border-b border-amber-100/50">
@@ -386,6 +462,9 @@ export default function Reports() {
                         <td className="px-4 py-1.5 text-right text-xs">{item.quantity_sent}</td>
                         <td className="px-4 py-1.5 text-right text-xs">{item.quantity_received ?? 0}</td>
                         <td className="px-4 py-1.5 text-right text-xs font-medium text-amber-600">-{item.outstanding}</td>
+                        <td className="px-4 py-1.5 text-right text-xs text-amber-600">
+                          {item.price_at_time ? `\u00a3${(item.price_at_time * item.outstanding).toFixed(2)}` : '\u2014'}
+                        </td>
                       </tr>
                     ))}
                   </Fragment>
@@ -411,7 +490,8 @@ export default function Reports() {
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Items Sent</th>
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Items Received</th>
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Outstanding</th>
-                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost (\u00a3)</th>
+                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost ex VAT</th>
+                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost inc VAT</th>
               </tr>
             </thead>
             <tbody>
@@ -432,6 +512,7 @@ export default function Reports() {
                       {out > 0 ? out : '\u2713'}
                     </td>
                     <td className="px-5 py-2.5 text-right">{d.cost > 0 ? `\u00a3${d.cost.toFixed(2)}` : '\u2014'}</td>
+                    <td className="px-5 py-2.5 text-right">{d.cost > 0 ? `\u00a3${(d.cost * 1.2).toFixed(2)}` : '\u2014'}</td>
                   </tr>
                 )
               })}
@@ -447,10 +528,13 @@ export default function Reports() {
                   <td className="px-5 py-2.5 text-right">
                     {kpis.cost > 0 ? `\u00a3${kpis.cost.toFixed(2)}` : '\u2014'}
                   </td>
+                  <td className="px-5 py-2.5 text-right">
+                    {kpis.cost > 0 ? `\u00a3${(kpis.cost * 1.2).toFixed(2)}` : '\u2014'}
+                  </td>
                 </tr>
               )}
               {deptData.length === 0 && (
-                <tr><td colSpan={6} className="px-5 py-8 text-center text-gray-400">No data for this period</td></tr>
+                <tr><td colSpan={7} className="px-5 py-8 text-center text-gray-400">No data for this period</td></tr>
               )}
             </tbody>
           </table>
@@ -472,7 +556,8 @@ export default function Reports() {
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Items Sent</th>
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Items Received</th>
                 <th className="px-5 py-2 text-right font-medium text-gray-600">Outstanding</th>
-                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost (\u00a3)</th>
+                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost ex VAT</th>
+                <th className="px-5 py-2 text-right font-medium text-gray-600">Cost inc VAT</th>
               </tr>
             </thead>
             <tbody>
@@ -489,6 +574,7 @@ export default function Reports() {
                     {m.orders > 0 ? (m.outstanding > 0 ? m.outstanding : '\u2713') : '\u2014'}
                   </td>
                   <td className="px-5 py-2 text-right">{m.cost > 0 ? `\u00a3${m.cost.toFixed(2)}` : '\u2014'}</td>
+                  <td className="px-5 py-2 text-right">{m.cost > 0 ? `\u00a3${(m.cost * 1.2).toFixed(2)}` : '\u2014'}</td>
                 </tr>
               ))}
               <tr className="border-t-2 border-gray-300 bg-gray-50 font-semibold">
@@ -502,6 +588,11 @@ export default function Reports() {
                 <td className="px-5 py-2.5 text-right">
                   {monthlyData.reduce((s, m) => s + m.cost, 0) > 0
                     ? `\u00a3${monthlyData.reduce((s, m) => s + m.cost, 0).toFixed(2)}`
+                    : '\u2014'}
+                </td>
+                <td className="px-5 py-2.5 text-right">
+                  {monthlyData.reduce((s, m) => s + m.cost, 0) > 0
+                    ? `\u00a3${(monthlyData.reduce((s, m) => s + m.cost, 0) * 1.2).toFixed(2)}`
                     : '\u2014'}
                 </td>
               </tr>

@@ -111,3 +111,9 @@ export const MONTHS = [
   'All', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ] as const
+
+/** Tracks pending edits for bulk edit mode */
+export interface BulkEdits {
+  orders: Record<string, { docket_number?: string }>
+  items: Record<string, { price_at_time?: number; order_id: string }>
+}

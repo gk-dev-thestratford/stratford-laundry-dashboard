@@ -1,6 +1,6 @@
 import { Search, ChevronLeft, ChevronRight } from 'lucide-react'
-import { MONTHS, ORDER_STATUS_LABELS } from '../types'
-import type { OrderStatus, Department } from '../types'
+import { MONTHS, ORDER_STATUS_LABELS, ORDER_TYPE_LABELS } from '../types'
+import type { OrderStatus, OrderType, Department } from '../types'
 import type { Filters as FilterType } from '../hooks/useOrders'
 
 interface FiltersProps {
@@ -76,6 +76,17 @@ export default function Filters({ filters, departments, onChange }: FiltersProps
         </select>
 
         <select
+          value={filters.orderType}
+          onChange={(e) => onChange({ ...filters, orderType: e.target.value as OrderType | 'all' })}
+          className="px-3 py-2 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
+        >
+          <option value="all">All Types</option>
+          {Object.entries(ORDER_TYPE_LABELS).map(([key, label]) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+
+        <select
           value={filters.department}
           onChange={(e) => onChange({ ...filters, department: e.target.value })}
           className="px-3 py-2 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
@@ -85,6 +96,17 @@ export default function Filters({ filters, departments, onChange }: FiltersProps
             <option key={d.id} value={d.id}>{d.name}</option>
           ))}
         </select>
+
+        <button
+          onClick={() => onChange({ ...filters, outstanding: !filters.outstanding })}
+          className={`px-3 py-2 text-sm rounded-lg border transition-colors ${
+            filters.outstanding
+              ? 'bg-amber-500 text-white border-amber-500'
+              : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
+          }`}
+        >
+          Outstanding Only
+        </button>
       </div>
     </div>
   )

@@ -225,12 +225,26 @@ export default function OrderDetail({ order, departments, onClose, onStatusChang
               <p className="text-xs font-medium text-gray-500">Created</p>
               <p className="text-sm text-gray-900 mt-0.5">{format(new Date(order.created_at), 'dd MMM yyyy HH:mm')}</p>
             </div>
-            {order.total_price != null && (
-              <div>
-                <p className="text-xs font-medium text-gray-500">Total</p>
-                <p className="text-sm text-gray-900 mt-0.5 font-medium">{`£${order.total_price.toFixed(2)}`}</p>
-              </div>
-            )}
+            {(() => {
+              const itemTotal = (order.order_items || []).reduce(
+                (sum, i) => sum + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0,
+              )
+              const cost = itemTotal > 0 ? itemTotal : (order.total_price ?? 0)
+              if (cost <= 0) return null
+              const costVat = cost * 1.2
+              return (
+                <>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500">Total (ex VAT)</p>
+                    <p className="text-sm text-gray-900 mt-0.5 font-medium">{`£${cost.toFixed(2)}`}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500">Total (inc VAT)</p>
+                    <p className="text-sm text-gray-900 mt-0.5 font-medium">{`£${costVat.toFixed(2)}`}</p>
+                  </div>
+                </>
+              )
+            })()}
           </div>
 
           {/* Notes */}
