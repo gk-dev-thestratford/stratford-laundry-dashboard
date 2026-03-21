@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Hotel, ClipboardList, BarChart3, Settings, LogOut, Menu, X } from 'lucide-react'
+import { Hotel, ClipboardList, BarChart3, Users, Package, LogOut, Menu, X } from 'lucide-react'
 import { useState } from 'react'
 import type { DashboardUser } from '../types'
 
@@ -11,7 +11,8 @@ interface LayoutProps {
 const navItems = [
   { to: '/', icon: ClipboardList, label: 'Orders' },
   { to: '/reports', icon: BarChart3, label: 'Reports' },
-  { to: '/settings', icon: Settings, label: 'Settings' },
+  { to: '/user-management', icon: Users, label: 'User Management' },
+  { to: '/catalogue', icon: Package, label: 'Catalogue' },
 ]
 
 export default function Layout({ user, onSignOut }: LayoutProps) {

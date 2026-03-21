@@ -68,7 +68,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
     if (insertError) {
       setError(insertError.message)
     } else {
-      setSuccess(`Admin "${newName}" created successfully`)
+      setSuccess(`User "${newName}" created successfully`)
       setNewName('')
       setNewPin('')
       setShowCreate(false)
@@ -93,7 +93,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
   }
 
   async function handleDelete(admin: AdminUser) {
-    if (!window.confirm(`Delete admin "${admin.name}"? This cannot be undone.`)) return
+    if (!window.confirm(`Delete user "${admin.name}"? This cannot be undone.`)) return
 
     const { error } = await supabase
       .from('admin_users')
@@ -132,15 +132,15 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-gray-900">Settings</h1>
-          <p className="text-sm text-gray-500 mt-1">Manage tablet admin users and their PIN access</p>
+          <h1 className="text-2xl font-semibold text-gray-900">User Management</h1>
+          <p className="text-sm text-gray-500 mt-1">Manage tablet users and their PIN access</p>
         </div>
         <button
           onClick={() => { setShowCreate(!showCreate); setError(''); setSuccess('') }}
           className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light"
         >
           <UserPlus className="w-4 h-4" />
-          Add Admin
+          Add User
         </button>
       </div>
 
@@ -156,7 +156,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
         <div className="bg-white rounded-xl border border-gray-200 p-6">
           <h2 className="text-sm font-semibold text-gray-900 mb-4 flex items-center gap-2">
             <UserPlus className="w-4 h-4" />
-            Create New Tablet Admin
+            Create New Tablet User
           </h2>
           <form onSubmit={handleCreate} className="flex flex-wrap items-end gap-4">
             <div className="flex-1 min-w-[200px]">
@@ -206,7 +206,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="px-6 py-4 border-b border-gray-200 flex items-center gap-2">
           <Users className="w-5 h-5 text-gray-500" />
-          <h2 className="text-sm font-semibold text-gray-900">Tablet Admin Users</h2>
+          <h2 className="text-sm font-semibold text-gray-900">Tablet Users</h2>
           <span className="text-xs text-gray-400 ml-1">({admins.length})</span>
         </div>
 
@@ -286,7 +286,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
       </div>
 
       <p className="text-xs text-gray-400">
-        These are the admin users who can log into the tablet app with a PIN to manage orders.
+        These are the users who can log into the tablet app with a PIN to manage orders.
       </p>
     </div>
   )
