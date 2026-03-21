@@ -4,7 +4,8 @@ import Login from './pages/Login'
 import Layout from './components/Layout'
 import Orders from './pages/Orders'
 import Reports from './pages/Reports'
-import SettingsPage from './pages/Settings'
+import UserManagement from './pages/Settings'
+import Catalogue from './pages/Catalogue'
 
 export default function App() {
   const { user, dashboardUser, loading, signIn, signOut } = useAuth()
@@ -27,7 +28,8 @@ export default function App() {
         <Route element={<Layout user={dashboardUser} onSignOut={signOut} />}>
           <Route path="/" element={<Orders />} />
           <Route path="/reports" element={<Reports />} />
-          <Route path="/settings" element={<SettingsPage currentUser={dashboardUser} />} />
+          <Route path="/user-management" element={<UserManagement currentUser={dashboardUser} />} />
+          <Route path="/catalogue" element={<Catalogue />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
