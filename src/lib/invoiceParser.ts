@@ -21,6 +21,7 @@ export interface InvoiceLine {
   vat: number
   gross: number
   isTopUp: boolean
+  sectionType?: InvoiceSectionType
 }
 
 export type InvoiceSectionType = 'staff' | 'guest' | 'napkins' | 'table_cloths' | 'bathrobes' | 'hsk'
@@ -217,6 +218,7 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
       const parsed = parseLine(line, lastDate)
       if (parsed) {
         const { parsedDate, ...invoiceLine } = parsed
+        invoiceLine.sectionType = currentSection.type
         currentSection.lines.push(invoiceLine)
         lastDate = parsedDate
       }
@@ -236,6 +238,7 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
       const parsed = parseLine(line, lastDate)
       if (parsed) {
         const { parsedDate, ...invoiceLine } = parsed
+        invoiceLine.sectionType = type
         section.lines.push(invoiceLine)
         lastDate = parsedDate
       }
