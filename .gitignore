@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Web dashboard lives on the 'main' branch — do not track on master
+web-dashboard/
