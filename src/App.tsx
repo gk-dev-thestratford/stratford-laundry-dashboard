@@ -6,6 +6,7 @@ import Orders from './pages/Orders'
 import Reports from './pages/Reports'
 import UserManagement from './pages/Settings'
 import Catalogue from './pages/Catalogue'
+import Reconciliation from './pages/Reconciliation'
 
 export default function App() {
   const { user, dashboardUser, loading, signIn, signOut } = useAuth()
@@ -30,6 +31,7 @@ export default function App() {
           <Route path="/reports" element={<Reports />} />
           <Route path="/user-management" element={<UserManagement currentUser={dashboardUser} />} />
           <Route path="/catalogue" element={<Catalogue />} />
+          <Route path="/reconciliation" element={<Reconciliation />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
