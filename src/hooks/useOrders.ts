@@ -86,7 +86,7 @@ export function useOrders() {
     if (filters.outstanding) {
       results = results.filter((o) =>
         (o.order_items || []).some(
-          (i) => i.quantity_sent > (i.quantity_received ?? 0)
+          (i: any) => i.quantity_sent > (i.quantity_received ?? 0)
         )
       )
     }
@@ -150,17 +150,17 @@ export function useOrders() {
 
   /** Bulk save: docket numbers + item prices in one go */
   const bulkSaveEdits = useCallback(async (edits: BulkEdits) => {
-    const promises: Promise<unknown>[] = []
+    const promises: PromiseLike<unknown>[] = []
 
     for (const [orderId, updates] of Object.entries(edits.orders)) {
       if (Object.keys(updates).length > 0) {
-        promises.push(supabase.from('orders').update(updates).eq('id', orderId))
+        promises.push(supabase.from('orders').update(updates).eq('id', orderId).then())
       }
     }
 
     for (const [itemId, updates] of Object.entries(edits.items)) {
       if (Object.keys(updates).length > 0) {
-        promises.push(supabase.from('order_items').update({ price_at_time: updates.price_at_time }).eq('id', itemId))
+        promises.push(supabase.from('order_items').update({ price_at_time: updates.price_at_time }).eq('id', itemId).then())
       }
     }
 

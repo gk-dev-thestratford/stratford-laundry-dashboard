@@ -4,7 +4,7 @@ import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, parseInvoice, parseInvoicePeriod,
   sectionTypeToOrderType,
-  type ParsedInvoice, type InvoiceLine, type InvoiceSection,
+  type ParsedInvoice, type InvoiceLine,
 } from '../lib/invoiceParser'
 import type { Order } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'

@@ -27,8 +27,8 @@ export default function App() {
     <HashRouter>
       <Routes>
         <Route element={<Layout user={dashboardUser} onSignOut={signOut} />}>
-          <Route path="/" element={<Orders />} />
-          <Route path="/reports" element={<Reports />} />
+          <Route path="/" element={<Reports />} />
+          <Route path="/orders" element={<Orders />} />
           <Route path="/user-management" element={<UserManagement currentUser={dashboardUser} />} />
           <Route path="/catalogue" element={<Catalogue />} />
           <Route path="/reconciliation" element={<Reconciliation />} />

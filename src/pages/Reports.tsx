@@ -284,95 +284,6 @@ export default function Reports() {
         </div>
       )}
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Monthly Orders */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Orders ({year})</h3>
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={monthlyData} barSize={20}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={30} allowDecimals={false} />
-              <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-              <Bar dataKey="orders" radius={[3, 3, 0, 0]}>
-                {monthlyData.map((_, i) => (
-                  <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#1B2A4A'} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-
-        {/* Monthly Cost inc VAT */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Cost inc VAT ({year})</h3>
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={monthlyData} barSize={20}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
-              <Tooltip
-                contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                formatter={(value: number) => [`£${value.toFixed(2)}`, 'Cost inc VAT']}
-              />
-              <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[3, 3, 0, 0]}>
-                {monthlyData.map((_, i) => (
-                  <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#10B981'} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-
-        {/* Orders by Department */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Orders by Department</h3>
-          {deptChartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(180, deptChartData.length * 36)}>
-              <BarChart data={deptChartData} layout="vertical" barSize={16}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" horizontal={false} />
-                <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} allowDecimals={false} />
-                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
-                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-                <Bar dataKey="orders" radius={[0, 3, 3, 0]}>
-                  {deptChartData.map((_, i) => (
-                    <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No data for this period</div>
-          )}
-        </div>
-
-        {/* Cost by Department inc VAT */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Cost by Department inc VAT</h3>
-          {deptCostChartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={Math.max(180, deptCostChartData.length * 36)}>
-              <BarChart data={deptCostChartData} layout="vertical" barSize={16}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" horizontal={false} />
-                <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `£${v}`} />
-                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
-                <Tooltip
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                  formatter={(value: number) => [`£${value.toFixed(2)}`, 'Cost inc VAT']}
-                />
-                <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[0, 3, 3, 0]}>
-                  {deptCostChartData.map((_, i) => (
-                    <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No cost data for this period</div>
-          )}
-        </div>
-      </div>
-
       {/* Outstanding & Discrepancies */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2 flex-wrap">
@@ -473,6 +384,95 @@ export default function Reports() {
             </table>
           </div>
         )}
+      </div>
+
+      {/* Charts */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Monthly Orders */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Orders ({year})</h3>
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={monthlyData} barSize={20}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={30} allowDecimals={false} />
+              <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+              <Bar dataKey="orders" radius={[3, 3, 0, 0]}>
+                {monthlyData.map((_, i) => (
+                  <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#1B2A4A'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Monthly Cost inc VAT */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Cost inc VAT ({year})</h3>
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={monthlyData} barSize={20}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
+              <Tooltip
+                contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                formatter={(value: any) => [`£${Number(value).toFixed(2)}`, 'Cost inc VAT']}
+              />
+              <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[3, 3, 0, 0]}>
+                {monthlyData.map((_, i) => (
+                  <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#10B981'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Orders by Department */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Orders by Department</h3>
+          {deptChartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(180, deptChartData.length * 36)}>
+              <BarChart data={deptChartData} layout="vertical" barSize={16}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" horizontal={false} />
+                <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                <Bar dataKey="orders" radius={[0, 3, 3, 0]}>
+                  {deptChartData.map((_, i) => (
+                    <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No data for this period</div>
+          )}
+        </div>
+
+        {/* Cost by Department inc VAT */}
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Cost by Department inc VAT</h3>
+          {deptCostChartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(180, deptCostChartData.length * 36)}>
+              <BarChart data={deptCostChartData} layout="vertical" barSize={16}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" horizontal={false} />
+                <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `£${v}`} />
+                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(value: any) => [`£${Number(value).toFixed(2)}`, 'Cost inc VAT']}
+                />
+                <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[0, 3, 3, 0]}>
+                  {deptCostChartData.map((_, i) => (
+                    <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex items-center justify-center h-[180px] text-sm text-gray-400">No cost data for this period</div>
+          )}
+        </div>
       </div>
 
       {/* Department Breakdown */}

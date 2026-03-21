@@ -1,6 +1,6 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, LogOut, Menu, X } from 'lucide-react'
-import { useState } from 'react'
+import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, LogOut, Menu, X, Sun, Moon } from 'lucide-react'
+import { useState, useEffect } from 'react'
 import type { DashboardUser } from '../types'
 
 interface LayoutProps {
@@ -9,18 +9,36 @@ interface LayoutProps {
 }
 
 const navItems = [
-  { to: '/', icon: ClipboardList, label: 'Orders' },
-  { to: '/reports', icon: BarChart3, label: 'Reports' },
+  { to: '/', icon: BarChart3, label: 'Reports' },
+  { to: '/orders', icon: ClipboardList, label: 'Orders' },
   { to: '/user-management', icon: Users, label: 'User Management' },
   { to: '/catalogue', icon: Package, label: 'Catalogue' },
   { to: '/reconciliation', icon: FileCheck, label: 'Reconciliation' },
 ]
 
+function useDarkMode() {
+  const [dark, setDark] = useState(() => localStorage.getItem('theme') === 'dark')
+
+  useEffect(() => {
+    const root = document.documentElement
+    if (dark) {
+      root.classList.add('dark')
+      localStorage.setItem('theme', 'dark')
+    } else {
+      root.classList.remove('dark')
+      localStorage.setItem('theme', 'light')
+    }
+  }, [dark])
+
+  return [dark, () => setDark(d => !d)] as const
+}
+
 export default function Layout({ user, onSignOut }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [dark, toggleDark] = useDarkMode()
 
   return (
-    <div className="min-h-screen bg-gray-50 flex">
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex">
       {/* Mobile overlay */}
       {sidebarOpen && (
         <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setSidebarOpen(false)} />
@@ -86,12 +104,22 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
 
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Mobile header */}
-        <header className="lg:hidden bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3">
-          <button onClick={() => setSidebarOpen(true)}>
-            <Menu className="w-6 h-6 text-gray-600" />
+        {/* Top bar */}
+        <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center gap-3">
+          <button className="lg:hidden" onClick={() => setSidebarOpen(true)}>
+            <Menu className="w-6 h-6 text-gray-600 dark:text-gray-300" />
           </button>
-          <h1 className="font-semibold text-gray-900">The Stratford</h1>
+          <h1 className="font-semibold text-gray-900 dark:text-white lg:hidden">The Stratford</h1>
+          <div className="flex-1" />
+          <button
+            onClick={toggleDark}
+            className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+            title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {dark
+              ? <Sun className="w-5 h-5 text-amber-400" />
+              : <Moon className="w-5 h-5 text-gray-500" />}
+          </button>
         </header>
 
         <main className="flex-1 p-4 lg:p-8 overflow-auto">
