@@ -189,6 +189,13 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
   let before = line.substring(0, pm.index).trim()
   if (!before) return null
 
+  // Strip leading section name if merged with data line during extraction
+  // e.g. "Guest 02/01/26 604 (Liu) 1x jumper" → "02/01/26 604 (Liu) 1x jumper"
+  const sectionPrefixM = before.match(/^(Staff|Guest|Napkins?|Table\s*Cloths?|Bathrobes?|HSK)\s+/i)
+  if (sectionPrefixM) {
+    before = before.substring(sectionPrefixM[0].length).trim()
+  }
+
   // Extract date (range or single)
   let date = lastDate
   const drm = before.match(/^(\d{2}\/\d{2}(?:\/\d{2,4})?\s*-\s*\d{2}\/\d{2}(?:\/\d{2,4})?)\s+(.*)/)
