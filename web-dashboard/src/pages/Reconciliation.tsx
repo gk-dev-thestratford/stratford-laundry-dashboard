@@ -6,6 +6,7 @@ import {
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
+import { generateReconciliationPdf, type DepartmentDisplayRow } from '../lib/pdfReport'
 import type { Order, OrderType } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -144,6 +145,67 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
   return Array.from(deptMap.values()).sort((a, b) => b.totalCostNet - a.totalCostNet)
 }
 
+/** Derive a human label for the regular items in a department based on the predominant order/section type */
+function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): string {
+  const typeCounts = new Map<string, number>()
+  for (const row of rows) {
+    const dept = row.order?.department?.name || 'Unallocated'
+    if (dept !== deptName) continue
+    const t = row.sectionType || 'uniform'
+    typeCounts.set(t, (typeCounts.get(t) || 0) + 1)
+  }
+  if (typeCounts.size === 0) return 'Items'
+  // Pick the most common type
+  let best = 'uniform'
+  let max = 0
+  for (const [t, c] of typeCounts) { if (c > max) { max = c; best = t } }
+  const label = ORDER_TYPE_LABELS[best as OrderType]
+  if (label) return label
+  switch (best) {
+    case 'uniform': return 'Uniforms'
+    case 'fnb_linen': return 'F&B Linen'
+    case 'hsk_linen': return 'HSK Linen'
+    case 'guest_laundry': return 'Guest Laundry'
+    default: return 'Items'
+  }
+}
+
+/** Build display rows from department breakdown + topUp, splitting items and TopUp per dept */
+function buildDepartmentDisplayRows(
+  breakdown: DepartmentBreakdown[],
+  allRows: ReconciliationRow[]
+): DepartmentDisplayRow[] {
+  const displayRows: DepartmentDisplayRow[] = []
+  for (const dept of breakdown) {
+    // Regular items row
+    const label = departmentItemsLabel(allRows, dept.departmentName)
+    displayRows.push({
+      departmentName: dept.departmentName,
+      lineLabel: label,
+      isTopUp: false,
+      orderCount: dept.orderCount,
+      invoiceNet: dept.invoiceNet,
+      systemTotal: dept.systemTotal,
+      difference: dept.difference,
+      totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+    })
+    // TopUp sub-row if allocated
+    if (dept.allocatedTopUp > 0) {
+      displayRows.push({
+        departmentName: dept.departmentName,
+        lineLabel: 'Minimum TopUp',
+        isTopUp: true,
+        orderCount: 0,
+        invoiceNet: dept.allocatedTopUp,
+        systemTotal: 0,
+        difference: 0,
+        totalGross: +(dept.allocatedTopUp * 1.2).toFixed(2),
+      })
+    }
+  }
+  return displayRows
+}
+
 function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null): ReconciliationResult {
   const byDocket = new Map<string, Order>()
   const byRoom = new Map<string, Order[]>()
@@ -225,6 +287,8 @@ export default function Reconciliation() {
   const [showHistory, setShowHistory] = useState(false)
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
+  const [missingResolutions, setMissingResolutions] = useState<Record<string, string>>({})
 
   const loadHistory = useCallback(async () => {
     setLoadingHistory(true)
@@ -271,6 +335,7 @@ export default function Reconciliation() {
   function reset() {
     setFile(null); setInvoice(null); setOrders([]); setResult(null)
     setError(''); setFilter('all'); setSaved(false)
+    setUpdatingPrices(new Set()); setMissingResolutions({})
   }
 
   const saveReconciliation = useCallback(async () => {
@@ -302,6 +367,11 @@ export default function Reconciliation() {
     if (filter === 'not_found') return result.rows.filter(r => r.status === 'not_found')
     return []
   }, [result, filter])
+
+  const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
+    if (!result) return []
+    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+  }, [result])
 
   // ── Accounting Report Export ──
   const exportAccountingReport = useCallback(() => {
@@ -336,22 +406,31 @@ export default function Reconciliation() {
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
-    // Sheet 2: Department Breakdown
-    const deptRows = result.departmentBreakdown.map(d => ({
-      'Department': d.departmentName, 'Orders': d.orderCount,
-      'Invoice NET (\u00a3)': +d.invoiceNet.toFixed(2), 'System NET (\u00a3)': +d.systemTotal.toFixed(2),
-      'Difference (\u00a3)': +d.difference.toFixed(2), 'TopUp Allocated (\u00a3)': d.allocatedTopUp,
-      'Total Cost NET (\u00a3)': d.totalCostNet, 'Total Cost inc VAT (\u00a3)': d.totalCostGross,
+    // Sheet 2: Department Breakdown (split items + TopUp rows)
+    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+    const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
+      'Department': row.departmentName,
+      'Line': row.lineLabel,
+      'Orders': row.isTopUp ? '' as any : row.orderCount,
+      'Invoice NET (\u00a3)': +row.invoiceNet.toFixed(2),
+      'System NET (\u00a3)': row.isTopUp ? '' as any : +row.systemTotal.toFixed(2),
+      'Difference (\u00a3)': row.isTopUp ? '' as any : +row.difference.toFixed(2),
+      'Total inc VAT (\u00a3)': +row.totalGross.toFixed(2),
     }))
-    deptRows.push({
-      'Department': 'TOTAL',
-      'Orders': result.departmentBreakdown.reduce((s, d) => s + d.orderCount, 0),
-      'Invoice NET (\u00a3)': +result.invoiceTotal.toFixed(2), 'System NET (\u00a3)': +result.systemTotal.toFixed(2),
-      'Difference (\u00a3)': +(result.invoiceTotal - result.systemTotal).toFixed(2),
-      'TopUp Allocated (\u00a3)': +totalTopUp.toFixed(2),
-      'Total Cost NET (\u00a3)': +grandNet.toFixed(2), 'Total Cost inc VAT (\u00a3)': +(grandNet * 1.2).toFixed(2),
+    const totalDisplayOrders = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)
+    const totalDisplayInvNet = deptDisplayRows.reduce((s, r) => s + r.invoiceNet, 0)
+    const totalDisplaySysNet = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.systemTotal, 0)
+    const totalDisplayDiff = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.difference, 0)
+    const totalDisplayGross = deptDisplayRows.reduce((s, r) => s + r.totalGross, 0)
+    deptExcelRows.push({
+      'Department': 'TOTAL', 'Line': '',
+      'Orders': totalDisplayOrders,
+      'Invoice NET (\u00a3)': +totalDisplayInvNet.toFixed(2),
+      'System NET (\u00a3)': +totalDisplaySysNet.toFixed(2),
+      'Difference (\u00a3)': +totalDisplayDiff.toFixed(2),
+      'Total inc VAT (\u00a3)': +totalDisplayGross.toFixed(2),
     })
-    utils.book_append_sheet(wb, utils.json_to_sheet(deptRows), 'Department Breakdown')
+    utils.book_append_sheet(wb, utils.json_to_sheet(deptExcelRows), 'Department Breakdown')
 
     // Sheet 3: Detailed Items
     utils.book_append_sheet(wb, utils.json_to_sheet(result.rows.map(r => ({
@@ -409,6 +488,83 @@ export default function Reconciliation() {
     if (s === 'price_mismatch') return <AlertTriangle className="w-4 h-4 text-amber-500" />
     return <XCircle className="w-4 h-4 text-red-500" />
   }
+
+  // ── Action: update prices to match invoice ──
+  const handleUpdatePrice = useCallback(async (row: ReconciliationRow) => {
+    if (!row.order || !invoice) return
+    const orderId = row.order.id
+    setUpdatingPrices(prev => new Set(prev).add(orderId))
+    try {
+      const items = row.order.order_items || []
+      const currentTotal = computeOrderCost(row.order)
+      const invoiceNet = row.invoiceLine.net
+
+      if (items.length > 0 && currentTotal > 0) {
+        // Scale each item price proportionally so total matches invoice NET
+        const ratio = invoiceNet / currentTotal
+        for (const item of items) {
+          const oldPrice = item.price_at_time ?? 0
+          const newPrice = +(oldPrice * ratio).toFixed(4)
+          await supabase.from('order_items').update({ price_at_time: newPrice }).eq('id', item.id)
+        }
+      }
+      // Update order total_price to invoice NET
+      await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+
+      // Re-fetch orders and re-run reconciliation
+      const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
+      let fetchedOrders: Order[] = []
+      if (period) {
+        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
+          .order('created_at', { ascending: true })
+        fetchedOrders = data ?? []
+      } else {
+        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .order('created_at', { ascending: false }).limit(500)
+        fetchedOrders = data ?? []
+      }
+      setOrders(fetchedOrders)
+      setResult(reconcile(invoice, fetchedOrders, period))
+    } catch (e) {
+      console.error('Failed to update prices:', e)
+    } finally {
+      setUpdatingPrices(prev => { const next = new Set(prev); next.delete(orderId); return next })
+    }
+  }, [invoice])
+
+  // ── Action: delete a missing order ──
+  const handleDeleteOrder = useCallback(async (orderId: string) => {
+    if (!window.confirm('Are you sure you want to delete this order? This cannot be undone.')) return
+    if (!invoice) return
+    try {
+      await supabase.from('order_items').delete().eq('order_id', orderId)
+      await supabase.from('orders').delete().eq('id', orderId)
+      // Re-fetch and re-run
+      const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
+      let fetchedOrders: Order[] = []
+      if (period) {
+        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
+          .order('created_at', { ascending: true })
+        fetchedOrders = data ?? []
+      } else {
+        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .order('created_at', { ascending: false }).limit(500)
+        fetchedOrders = data ?? []
+      }
+      setOrders(fetchedOrders)
+      setResult(reconcile(invoice, fetchedOrders, period))
+    } catch (e) {
+      console.error('Failed to delete order:', e)
+    }
+  }, [invoice])
+
+  // ── PDF Report ──
+  const handlePdfReport = useCallback(() => {
+    if (!result || !invoice) return
+    generateReconciliationPdf(invoice, result, departmentDisplayRows)
+  }, [result, invoice, departmentDisplayRows])
 
   // ── History view ──
   if (showHistory) return (
@@ -527,6 +683,9 @@ export default function Reconciliation() {
           <button onClick={exportAccountingReport} className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light">
             <Download className="w-4 h-4" /> Accounting Report
           </button>
+          <button onClick={handlePdfReport} className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light">
+            <FileText className="w-4 h-4" /> PDF Report
+          </button>
           <button onClick={saveReconciliation} disabled={saving || saved}
             className={`flex items-center gap-2 px-3 py-2 text-sm rounded-lg transition-colors ${saved ? 'bg-green-100 text-green-700' : 'text-white bg-gold hover:bg-gold/90'} ${saving ? 'opacity-50' : ''}`}>
             {saved ? <CheckCircle className="w-4 h-4" /> : <Save className="w-4 h-4" />}
@@ -592,7 +751,7 @@ export default function Reconciliation() {
         </div>
       </div>
 
-      {/* Department Breakdown */}
+      {/* Department Breakdown — split items + TopUp rows */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
           <ChevronRight className="w-4 h-4 text-gray-500" />
@@ -602,40 +761,36 @@ export default function Reconciliation() {
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-gray-200 bg-gray-50">
-              <th className="px-4 py-2.5 text-left font-medium text-gray-600">Department</th>
+              <th className="px-4 py-2.5 text-left font-medium text-gray-600">Department / Line</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Orders</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Invoice NET</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">System NET</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Diff</th>
-              <th className="px-4 py-2.5 text-right font-medium text-gray-600">TopUp</th>
-              <th className="px-4 py-2.5 text-right font-medium text-gray-600">Total NET</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Total inc VAT</th>
             </tr></thead>
-            <tbody>{result.departmentBreakdown.map((d, i) => (
-              <tr key={i} className="border-b border-gray-100">
-                <td className="px-4 py-2.5 font-medium">{d.departmentName}</td>
-                <td className="px-4 py-2.5 text-right">{d.orderCount}</td>
-                <td className="px-4 py-2.5 text-right">{'\u00a3'}{d.invoiceNet.toFixed(2)}</td>
-                <td className="px-4 py-2.5 text-right">{'\u00a3'}{d.systemTotal.toFixed(2)}</td>
-                <td className={`px-4 py-2.5 text-right font-medium ${Math.abs(d.difference) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
-                  {Math.abs(d.difference) < 0.02 ? '\u2713' : `\u00a3${d.difference.toFixed(2)}`}
+            <tbody>{departmentDisplayRows.map((row, i) => (
+              <tr key={i} className={`border-b border-gray-100 ${row.isTopUp ? 'bg-amber-50/20' : ''}`}>
+                <td className={`px-4 py-2.5 ${row.isTopUp ? 'pl-8 italic text-gray-500 text-xs' : 'font-medium'}`}>
+                  {row.departmentName} {'\u2014'} {row.lineLabel}
                 </td>
-                <td className="px-4 py-2.5 text-right text-amber-600">{d.allocatedTopUp > 0 ? `\u00a3${d.allocatedTopUp.toFixed(2)}` : '\u2014'}</td>
-                <td className="px-4 py-2.5 text-right font-semibold">{'\u00a3'}{d.totalCostNet.toFixed(2)}</td>
-                <td className="px-4 py-2.5 text-right font-semibold">{'\u00a3'}{d.totalCostGross.toFixed(2)}</td>
+                <td className="px-4 py-2.5 text-right">{row.isTopUp ? '\u2014' : row.orderCount}</td>
+                <td className="px-4 py-2.5 text-right">{'\u00a3'}{row.invoiceNet.toFixed(2)}</td>
+                <td className="px-4 py-2.5 text-right">{row.isTopUp ? '\u2014' : `\u00a3${row.systemTotal.toFixed(2)}`}</td>
+                <td className={`px-4 py-2.5 text-right font-medium ${row.isTopUp ? 'text-gray-400' : Math.abs(row.difference) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
+                  {row.isTopUp ? '\u2014' : Math.abs(row.difference) < 0.02 ? '\u2713' : `\u00a3${row.difference.toFixed(2)}`}
+                </td>
+                <td className="px-4 py-2.5 text-right font-semibold">{'\u00a3'}{row.totalGross.toFixed(2)}</td>
               </tr>
             ))}</tbody>
             <tfoot><tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
               <td className="px-4 py-3">Total</td>
-              <td className="px-4 py-3 text-right">{result.departmentBreakdown.reduce((s, d) => s + d.orderCount, 0)}</td>
-              <td className="px-4 py-3 text-right">{'\u00a3'}{result.invoiceTotal.toFixed(2)}</td>
-              <td className="px-4 py-3 text-right">{'\u00a3'}{result.systemTotal.toFixed(2)}</td>
+              <td className="px-4 py-3 text-right">{departmentDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)}</td>
+              <td className="px-4 py-3 text-right">{'\u00a3'}{departmentDisplayRows.reduce((s, r) => s + r.invoiceNet, 0).toFixed(2)}</td>
+              <td className="px-4 py-3 text-right">{'\u00a3'}{departmentDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.systemTotal, 0).toFixed(2)}</td>
               <td className={`px-4 py-3 text-right ${Math.abs(result.invoiceTotal - result.systemTotal) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
-                {'\u00a3'}{(result.invoiceTotal - result.systemTotal).toFixed(2)}
+                {'\u00a3'}{departmentDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.difference, 0).toFixed(2)}
               </td>
-              <td className="px-4 py-3 text-right text-amber-600">{totalTopUp > 0 ? `\u00a3${totalTopUp.toFixed(2)}` : '\u2014'}</td>
-              <td className="px-4 py-3 text-right">{'\u00a3'}{grandInvoiceNet.toFixed(2)}</td>
-              <td className="px-4 py-3 text-right">{'\u00a3'}{(grandInvoiceNet * 1.2).toFixed(2)}</td>
+              <td className="px-4 py-3 text-right">{'\u00a3'}{departmentDisplayRows.reduce((s, r) => s + r.totalGross, 0).toFixed(2)}</td>
             </tr></tfoot>
           </table>
         </div>
@@ -665,10 +820,11 @@ export default function Reconciliation() {
               <th className="px-3 py-3 text-right font-medium text-gray-600">Invoice NET</th>
               <th className="px-3 py-3 text-right font-medium text-gray-600">System NET</th>
               <th className="px-3 py-3 text-right font-medium text-gray-600">Diff</th>
+              <th className="px-3 py-3 text-center font-medium text-gray-600">Action</th>
             </tr></thead>
             <tbody>
               {filteredRows.length === 0
-                ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
+                ? <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
                 : filteredRows.map((row, i) => (
                 <tr key={i} className={`border-b border-gray-100 ${row.status === 'price_mismatch' ? 'bg-amber-50/50' : row.status === 'not_found' ? 'bg-red-50/50' : ''}`}>
                   <td className="px-3 py-2.5 text-center">{statusIcon(row.status)}</td>
@@ -683,6 +839,20 @@ export default function Reconciliation() {
                   <td className={`px-3 py-2.5 text-right font-medium ${row.status === 'matched' ? 'text-green-600' : row.status === 'price_mismatch' ? 'text-amber-600' : 'text-gray-400'}`}>
                     {row.order ? (row.difference >= 0 ? '+' : '') + `\u00a3${row.difference.toFixed(2)}` : '\u2014'}
                   </td>
+                  <td className="px-3 py-2.5 text-center">
+                    {row.status === 'matched' && <CheckCircle className="w-4 h-4 text-green-500 mx-auto" />}
+                    {row.status === 'price_mismatch' && row.order && (
+                      <button
+                        onClick={() => handleUpdatePrice(row)}
+                        disabled={updatingPrices.has(row.order!.id)}
+                        className="px-2 py-1 text-xs font-medium text-white bg-amber-500 rounded hover:bg-amber-600 disabled:opacity-50 whitespace-nowrap"
+                      >
+                        {updatingPrices.has(row.order!.id) ? (
+                          <RefreshCw className="w-3 h-3 animate-spin inline" />
+                        ) : 'Update Price'}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -691,6 +861,7 @@ export default function Reconciliation() {
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.invoiceLine.net, 0).toFixed(2)}</td>
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.systemTotal, 0).toFixed(2)}</td>
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.difference, 0).toFixed(2)}</td>
+              <td />
             </tr></tfoot>}
           </table>
         </div></div>
@@ -705,12 +876,15 @@ export default function Reconciliation() {
               <th className="px-3 py-3 text-left font-medium text-gray-600">Items</th>
               <th className="px-3 py-3 text-right font-medium text-gray-600">System Total</th>
               <th className="px-3 py-3 text-left font-medium text-gray-600">Date</th>
+              <th className="px-3 py-3 text-center font-medium text-gray-600">Action</th>
             </tr></thead>
             <tbody>
               {result.missingFromInvoice.length === 0
-                ? <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-500">All system orders found on invoice</td></tr>
-                : result.missingFromInvoice.map(o => (
-                <tr key={o.id} className="border-b border-gray-100 bg-blue-50/30">
+                ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">All system orders found on invoice</td></tr>
+                : result.missingFromInvoice.map(o => {
+                const resolution = missingResolutions[o.id]
+                return (
+                <tr key={o.id} className={`border-b border-gray-100 ${resolution === 'Ignore' ? 'bg-gray-50/60 opacity-60' : resolution === 'Investigate' ? 'bg-yellow-50/40' : 'bg-blue-50/30'}`}>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">{o.docket_number}</td>
                   <td className="px-3 py-2.5 text-gray-600">{o.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-600">{ORDER_TYPE_LABELS[o.order_type as OrderType] ?? o.order_type}</td>
@@ -718,8 +892,32 @@ export default function Reconciliation() {
                   <td className="px-3 py-2.5 text-gray-600 max-w-[250px] truncate">{(o.order_items || []).map(i => `${i.quantity_sent}x ${i.item_name}`).join(', ') || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-right font-medium">{'\u00a3'}{computeOrderCost(o).toFixed(2)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{format(new Date(o.created_at), 'dd/MM/yyyy')}</td>
+                  <td className="px-3 py-2.5 text-center">
+                    <select
+                      value={resolution || ''}
+                      onChange={e => {
+                        const val = e.target.value
+                        if (val === 'Delete') {
+                          handleDeleteOrder(o.id)
+                        } else {
+                          setMissingResolutions(prev => ({ ...prev, [o.id]: val }))
+                        }
+                      }}
+                      className="text-xs border border-gray-300 rounded px-1.5 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-navy"
+                    >
+                      <option value="">-- Resolve --</option>
+                      <option value="Ignore">Ignore</option>
+                      <option value="Investigate">Investigate</option>
+                      <option value="Delete">Delete</option>
+                    </select>
+                    {resolution && resolution !== 'Delete' && (
+                      <span className={`ml-1.5 inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium ${resolution === 'Ignore' ? 'bg-gray-200 text-gray-600' : 'bg-yellow-100 text-yellow-700'}`}>
+                        {resolution}
+                      </span>
+                    )}
+                  </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
           </table>
         </div></div>
