@@ -46,3 +46,11 @@ app.*.map.json
 
 # Web dashboard lives on the 'main' branch — do not track on master
 web-dashboard/
+
+# Node / build artifacts
+node_modules/
+dist/
+
+# Supabase local config
+supabase/.gitignore
+supabase/config.toml
