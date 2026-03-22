@@ -362,6 +362,67 @@ class DatabaseService {
     await db.delete('orders', where: 'id = ?', whereArgs: [orderId]);
   }
 
+  // ── Departments ──
+
+  Future<List<Map<String, dynamic>>> getDepartments({bool activeOnly = true}) async {
+    final db = await database;
+    if (activeOnly) {
+      return db.query('departments', where: 'is_active = 1');
+    }
+    return db.query('departments');
+  }
+
+  /// Replace all departments with fresh data from Supabase
+  Future<void> syncDepartments(List<Map<String, dynamic>> remoteDepts) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('departments');
+      for (final dept in remoteDepts) {
+        await txn.insert('departments', {
+          'id': dept['id'],
+          'code': dept['code'] ?? '',
+          'name': dept['name'],
+          'can_submit_uniforms': (dept['can_submit_uniforms'] == true) ? 1 : 0,
+          'has_linen_items': (dept['has_linen_items'] == true) ? 1 : 0,
+          'is_active': (dept['is_active'] == true) ? 1 : 0,
+        });
+      }
+    });
+  }
+
+  // ── Catalogue Items ──
+
+  Future<List<Map<String, dynamic>>> getCatalogueItems({String? category}) async {
+    final db = await database;
+    if (category != null) {
+      return db.query('item_catalogue',
+          where: 'is_active = 1 AND category = ?',
+          whereArgs: [category],
+          orderBy: 'sort_order');
+    }
+    return db.query('item_catalogue', where: 'is_active = 1', orderBy: 'sort_order');
+  }
+
+  /// Replace all catalogue items with fresh data from Supabase
+  Future<void> syncCatalogueItems(List<Map<String, dynamic>> remoteItems) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('item_catalogue');
+      for (final item in remoteItems) {
+        await txn.insert('item_catalogue', {
+          'id': item['id'],
+          'code': item['code'] ?? '',
+          'name': item['name'],
+          'category': item['category'] ?? 'uniform',
+          'price': item['price'],
+          'department_id': item['department_id'],
+          'sort_order': item['sort_order'] ?? 0,
+          'is_active': (item['is_active'] == true) ? 1 : 0,
+        });
+      }
+    });
+  }
+
   // ── Admin Users ──
 
   Future<List<Map<String, dynamic>>> getAdminUsers() async {

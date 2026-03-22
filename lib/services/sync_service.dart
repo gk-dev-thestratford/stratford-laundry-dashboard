@@ -43,7 +43,9 @@ class SyncService {
       return;
     }
 
-    // Always sync admin users from Supabase so new admins appear on the tablet
+    // Always sync reference data from Supabase so changes appear on the tablet
+    await _syncDepartments();
+    await _syncCatalogueItems();
     await _syncAdminUsers();
 
     final pending = await DatabaseService.instance.getPendingSyncItems();
@@ -53,6 +55,30 @@ class SyncService {
     }
 
     await syncNow();
+  }
+
+  /// Pull departments from Supabase and update local SQLite
+  Future<void> _syncDepartments() async {
+    try {
+      final remoteDepts = await SupabaseService.instance.fetchDepartments();
+      if (remoteDepts.isNotEmpty) {
+        await DatabaseService.instance.syncDepartments(remoteDepts);
+      }
+    } catch (_) {
+      // Non-critical — departments will update on next sync
+    }
+  }
+
+  /// Pull catalogue items from Supabase and update local SQLite
+  Future<void> _syncCatalogueItems() async {
+    try {
+      final remoteItems = await SupabaseService.instance.fetchCatalogueItems();
+      if (remoteItems.isNotEmpty) {
+        await DatabaseService.instance.syncCatalogueItems(remoteItems);
+      }
+    } catch (_) {
+      // Non-critical — items will update on next sync
+    }
   }
 
   /// Pull admin users from Supabase and update local SQLite

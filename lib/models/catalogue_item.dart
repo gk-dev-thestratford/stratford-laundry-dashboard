@@ -24,6 +24,32 @@ class CatalogueItem {
     this.icon = Icons.checkroom,
   });
 
+  factory CatalogueItem.fromMap(Map<String, dynamic> map) {
+    final category = map['category'] as String? ?? 'uniform';
+    return CatalogueItem(
+      id: map['id'] as String,
+      code: map['code'] as String? ?? '',
+      name: map['name'] as String,
+      category: category,
+      price: (map['price'] as num?)?.toDouble(),
+      departmentId: map['department_id'] as String?,
+      sortOrder: (map['sort_order'] as int?) ?? 0,
+      isActive: (map['is_active'] == 1 || map['is_active'] == true),
+      icon: _defaultIconForCategory(category),
+    );
+  }
+
+  static IconData _defaultIconForCategory(String category) {
+    switch (category) {
+      case 'hsk_linen':
+        return Icons.bed;
+      case 'fnb_linen':
+        return Icons.restaurant;
+      default:
+        return Icons.checkroom;
+    }
+  }
+
   /// Uniform items — prices TBC by Georgi
   static final List<CatalogueItem> uniformItems = [
     CatalogueItem(id: 'uni001', code: 'UNI-001', name: 'Shirt', category: 'uniform', price: 3.50, sortOrder: 1, icon: MdiIcons.tshirtCrewOutline),

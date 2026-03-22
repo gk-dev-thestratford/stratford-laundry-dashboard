@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/screen_scaffold.dart';
 import '../../providers/order_provider.dart';
+import '../../providers/department_provider.dart';
 import '../../models/department.dart';
 
 class OrderDetailsScreen extends ConsumerStatefulWidget {
@@ -64,7 +65,8 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     }
 
     final notifier = ref.read(orderProvider.notifier);
-    final dept = Department.seedData.where((d) => d.id == _selectedDepartmentId).firstOrNull;
+    final departments = ref.read(departmentsProvider).valueOrNull ?? Department.seedData;
+    final dept = departments.where((d) => d.id == _selectedDepartmentId).firstOrNull;
 
     if (_isLinenOrder) {
       notifier.setOrderType(_selectedLinenType!);
@@ -459,13 +461,15 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
   }
 
   List<DropdownMenuItem<String>> _getDepartmentItems() {
+    final departments = ref.read(departmentsProvider).valueOrNull ?? Department.seedData;
     if (_isLinenOrder) {
-      return Department.seedData
+      return departments
           .where((d) => d.hasLinenItems)
           .map((d) => DropdownMenuItem(value: d.id, child: Text(d.name)))
           .toList();
     }
-    return Department.staffDepartments
+    return departments
+        .where((d) => d.canSubmitUniforms)
         .map((d) => DropdownMenuItem(value: d.id, child: Text(d.name)))
         .toList();
   }

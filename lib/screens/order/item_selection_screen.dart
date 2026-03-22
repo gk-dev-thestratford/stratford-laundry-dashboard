@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/screen_scaffold.dart';
 import '../../providers/order_provider.dart';
+import '../../providers/catalogue_provider.dart';
 import '../../models/catalogue_item.dart';
 
 class ItemSelectionScreen extends ConsumerWidget {
@@ -12,7 +13,8 @@ class ItemSelectionScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final order = ref.watch(orderProvider);
-    final catalogueItems = CatalogueItem.getByCategory(order.itemCategory);
+    final catalogueAsync = ref.watch(catalogueItemsProvider(order.itemCategory));
+    final catalogueItems = catalogueAsync.valueOrNull ?? CatalogueItem.getByCategory(order.itemCategory);
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
     final showPrices = order.isUniformOrder;
 
