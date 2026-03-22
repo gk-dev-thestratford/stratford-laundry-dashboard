@@ -22,3 +22,18 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Flutter / Dart (lives on master branch)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+android/
+ios/
+linux/
+macos/
+windows/
+*.iml
+
+# Supabase local
+supabase/
