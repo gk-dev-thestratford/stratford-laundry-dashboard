@@ -51,6 +51,32 @@ export function sectionTypeToOrderType(type: InvoiceSectionType): string {
 
 // ── PDF text extraction ──
 
+/**
+ * Merge consecutive lines where a description got split from its prices.
+ * e.g. Line 1: "25/01/26 8004 1x duvet" (no prices)
+ *      Line 2: "£11.99 £2.40 £14.39"   (prices only)
+ * → merged: "25/01/26 8004 1x duvet £11.99 £2.40 £14.39"
+ */
+function mergeSplitLines(lines: string[]): string[] {
+  const priceEnd = /£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}\s*$/
+  const result: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (priceEnd.test(line) && result.length > 0) {
+      const prev = result[result.length - 1]
+      // If the previous line has no £ signs, it's likely a split description
+      if (!/£/.test(prev) && prev.length < 120
+        && !/^(DATE|TICKET|NET|VAT|GROSS|Invoice|Account|Company|Goldstar|Sort|National)/i.test(prev)) {
+        result[result.length - 1] = (prev + ' ' + line).replace(/\s+/g, ' ').trim()
+        continue
+      }
+    }
+    result.push(line)
+  }
+  return result
+}
+
 export async function extractPdfLines(file: File): Promise<string[]> {
   const arrayBuffer = await file.arrayBuffer()
   const pdf = await getDocument({ data: new Uint8Array(arrayBuffer) }).promise
@@ -60,22 +86,68 @@ export async function extractPdfLines(file: File): Promise<string[]> {
     const page = await pdf.getPage(p)
     const content = await page.getTextContent()
 
-    // Group text items by Y position to reconstruct lines
-    const lineMap = new Map<number, { x: number; str: string }[]>()
+    // Collect all text items with positions
+    const textItems: { x: number; y: number; str: string }[] = []
     for (const item of content.items) {
       if (!('str' in item) || !(item as any).str?.trim()) continue
-      const y = Math.round((item as any).transform[5] / 2) * 2
-      const x = (item as any).transform[4] as number
-      if (!lineMap.has(y)) lineMap.set(y, [])
-      lineMap.get(y)!.push({ x, str: (item as any).str })
+      textItems.push({
+        x: (item as any).transform[4] as number,
+        y: (item as any).transform[5] as number,
+        str: (item as any).str,
+      })
     }
 
-    // Sort top-to-bottom, left-to-right
-    const sortedYs = [...lineMap.keys()].sort((a, b) => b - a)
-    for (const y of sortedYs) {
-      const items = lineMap.get(y)!.sort((a, b) => a.x - b.x)
-      const text = items.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim()
+    // Sort by Y descending (top to bottom of page)
+    textItems.sort((a, b) => b.y - a.y)
+
+    // Cluster items into lines using Y-proximity (tolerance of 3 units)
+    // This handles cases where text items on the same visual line have
+    // slightly different Y positions (e.g. currency symbol vs number)
+    const LINE_TOLERANCE = 3
+    const lineGroups: { x: number; str: string }[][] = []
+    let currentY = -Infinity
+
+    for (const item of textItems) {
+      if (Math.abs(item.y - currentY) > LINE_TOLERANCE || lineGroups.length === 0) {
+        lineGroups.push([])
+        currentY = item.y
+      }
+      lineGroups[lineGroups.length - 1].push({ x: item.x, str: item.str })
+    }
+
+    // Sort items within each line left-to-right and join
+    for (const group of lineGroups) {
+      group.sort((a, b) => a.x - b.x)
+      const text = group.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim()
       if (text) allLines.push(text)
+    }
+  }
+
+  // Post-process: merge lines where description and prices got split
+  return mergeSplitLines(allLines)
+}
+
+/** Extract raw PDF lines for diagnostics (unmerged) */
+export async function extractPdfLinesRaw(file: File): Promise<string[]> {
+  const arrayBuffer = await file.arrayBuffer()
+  const pdf = await getDocument({ data: new Uint8Array(arrayBuffer) }).promise
+  const allLines: string[] = []
+  for (let p = 1; p <= pdf.numPages; p++) {
+    allLines.push(`--- PAGE ${p} ---`)
+    const page = await pdf.getPage(p)
+    const content = await page.getTextContent()
+    const textItems: { x: number; y: number; str: string }[] = []
+    for (const item of content.items) {
+      if (!('str' in item) || !(item as any).str?.trim()) continue
+      textItems.push({
+        x: (item as any).transform[4] as number,
+        y: (item as any).transform[5] as number,
+        str: (item as any).str,
+      })
+    }
+    textItems.sort((a, b) => b.y - a.y || a.x - b.x)
+    for (const item of textItems) {
+      allLines.push(`[Y=${item.y.toFixed(1)} X=${item.x.toFixed(1)}] ${item.str}`)
     }
   }
   return allLines

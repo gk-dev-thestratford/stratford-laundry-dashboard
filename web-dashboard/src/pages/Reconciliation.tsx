@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useEffect } from 'react'
 import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
-  extractPdfLines, parseInvoice, parseInvoicePeriod,
+  extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod,
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
@@ -542,13 +542,28 @@ export default function Reconciliation() {
       {parsedVsStatedGap > 1 && (
         <div className="bg-amber-50 border border-amber-300 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
-          <div className="text-sm">
+          <div className="text-sm flex-1">
             <p className="font-semibold text-amber-800">Parse discrepancy detected</p>
             <p className="text-amber-700 mt-1">
               Invoice states NET total of <span className="font-medium">{'\u00a3'}{statedNet.toFixed(2)}</span> but
               parsed lines total <span className="font-medium">{'\u00a3'}{grandInvoiceNet.toFixed(2)}</span> (items {'\u00a3'}{result.invoiceTotal.toFixed(2)} + TopUp {'\u00a3'}{totalTopUp.toFixed(2)}).
               Gap: <span className="font-bold">{'\u00a3'}{parsedVsStatedGap.toFixed(2)}</span> — some invoice lines may not have been captured from the PDF.
             </p>
+            {file && (
+              <button
+                onClick={async () => {
+                  const raw = await extractPdfLinesRaw(file)
+                  const blob = new Blob([raw.join('\n')], { type: 'text/plain' })
+                  const a = document.createElement('a')
+                  a.href = URL.createObjectURL(blob)
+                  a.download = `pdf-diagnostic-${file.name.replace('.pdf', '')}.txt`
+                  a.click()
+                }}
+                className="mt-2 text-xs text-amber-800 underline hover:text-amber-900"
+              >
+                Download PDF diagnostic
+              </button>
+            )}
           </div>
         </div>
       )}
