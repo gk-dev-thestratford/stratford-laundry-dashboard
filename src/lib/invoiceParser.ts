@@ -334,12 +334,58 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
 // ── Period parsing ──
 
 export function parseInvoicePeriod(period: string): { start: Date; end: Date } | null {
-  const m = period.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s*-\s*(\d{2})\.(\d{2})\.(\d{2,4})/)
-  if (!m) return null
-  let sy = parseInt(m[3]); if (sy < 100) sy += 2000
-  let ey = parseInt(m[6]); if (ey < 100) ey += 2000
+  // Try DD.MM.YY(YY) - DD.MM.YY(YY)
+  const dotM = period.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s*-\s*(\d{2})\.(\d{2})\.(\d{2,4})/)
+  if (dotM) return buildPeriod(dotM[1], dotM[2], dotM[3], dotM[4], dotM[5], dotM[6])
+
+  // Try DD/MM/YY(YY) - DD/MM/YY(YY)
+  const slashM = period.match(/(\d{2})\/(\d{2})\/(\d{2,4})\s*-\s*(\d{2})\/(\d{2})\/(\d{2,4})/)
+  if (slashM) return buildPeriod(slashM[1], slashM[2], slashM[3], slashM[4], slashM[5], slashM[6])
+
+  return null
+}
+
+function buildPeriod(sd: string, sm: string, sy: string, ed: string, em: string, ey: string) {
+  let startY = parseInt(sy); if (startY < 100) startY += 2000
+  let endY = parseInt(ey); if (endY < 100) endY += 2000
   return {
-    start: new Date(sy, parseInt(m[2]) - 1, parseInt(m[1])),
-    end: new Date(ey, parseInt(m[5]) - 1, parseInt(m[4]), 23, 59, 59),
+    start: new Date(startY, parseInt(sm) - 1, parseInt(sd)),
+    end: new Date(endY, parseInt(em) - 1, parseInt(ed), 23, 59, 59),
+  }
+}
+
+/**
+ * Derive a date range from parsed invoice line dates as a fallback
+ * when the invoice period text can't be parsed.
+ */
+export function derivePeriodFromLines(invoice: ParsedInvoice): { start: Date; end: Date } | null {
+  const dates: Date[] = []
+  for (const section of invoice.sections) {
+    for (const line of section.lines) {
+      if (!line.date) continue
+      // Handle single dates DD/MM/YY or DD/MM/YYYY
+      const dm = line.date.match(/(\d{2})\/(\d{2})\/(\d{2,4})/)
+      if (dm) {
+        let y = parseInt(dm[3]); if (y < 100) y += 2000
+        dates.push(new Date(y, parseInt(dm[2]) - 1, parseInt(dm[1])))
+        continue
+      }
+      // Handle date ranges DD/MM - DD/MM or DD/MM/YY - DD/MM/YY
+      const drm = line.date.match(/(\d{2})\/(\d{2})(?:\/(\d{2,4}))?\s*-\s*(\d{2})\/(\d{2})(?:\/(\d{2,4}))?/)
+      if (drm) {
+        let y1 = drm[3] ? parseInt(drm[3]) : new Date().getFullYear()
+        let y2 = drm[6] ? parseInt(drm[6]) : y1
+        if (y1 < 100) y1 += 2000
+        if (y2 < 100) y2 += 2000
+        dates.push(new Date(y1, parseInt(drm[2]) - 1, parseInt(drm[1])))
+        dates.push(new Date(y2, parseInt(drm[5]) - 1, parseInt(drm[4])))
+      }
+    }
+  }
+  if (dates.length === 0) return null
+  const sorted = dates.sort((a, b) => a.getTime() - b.getTime())
+  return {
+    start: sorted[0],
+    end: new Date(sorted[sorted.length - 1].getFullYear(), sorted[sorted.length - 1].getMonth(), sorted[sorted.length - 1].getDate(), 23, 59, 59),
   }
 }

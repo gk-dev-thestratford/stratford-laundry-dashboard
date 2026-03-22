@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useEffect } from 'react'
 import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
-  extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod,
+  extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
@@ -144,7 +144,7 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
   return Array.from(deptMap.values()).sort((a, b) => b.totalCostNet - a.totalCostNet)
 }
 
-function reconcile(invoice: ParsedInvoice, orders: Order[]): ReconciliationResult {
+function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null): ReconciliationResult {
   const byDocket = new Map<string, Order>()
   const byRoom = new Map<string, Order[]>()
   for (const o of orders) {
@@ -182,7 +182,16 @@ function reconcile(invoice: ParsedInvoice, orders: Order[]): ReconciliationResul
   }
 
   const invoiceOrderTypes = new Set(invoice.sections.map(s => sectionTypeToOrderType(s.type)))
-  const missingFromInvoice = orders.filter(o => !matchedOrderIds.has(o.id) && invoiceOrderTypes.has(o.order_type))
+  const missingFromInvoice = orders.filter(o => {
+    if (matchedOrderIds.has(o.id)) return false
+    if (!invoiceOrderTypes.has(o.order_type)) return false
+    // Only flag orders within the invoice period
+    if (period) {
+      const orderDate = new Date(o.created_at)
+      if (orderDate < period.start || orderDate > period.end) return false
+    }
+    return true
+  })
 
   return {
     rows, topUpCharges, missingFromInvoice,
@@ -239,7 +248,8 @@ export default function Reconciliation() {
         setError('Could not parse any invoice lines.'); setParsing(false); return
       }
       setInvoice(parsed)
-      const period = parseInvoicePeriod(parsed.invoicePeriod)
+      // Try parsing the period text, fall back to deriving from invoice line dates
+      const period = parseInvoicePeriod(parsed.invoicePeriod) || derivePeriodFromLines(parsed)
       let fetchedOrders: Order[] = []
       if (period) {
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
@@ -252,7 +262,7 @@ export default function Reconciliation() {
         fetchedOrders = data ?? []
       }
       setOrders(fetchedOrders)
-      setResult(reconcile(parsed, fetchedOrders))
+      setResult(reconcile(parsed, fetchedOrders, period))
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to parse PDF')
     } finally { setParsing(false) }
