@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, LogOut, Menu, X, Sun, Moon } from 'lucide-react'
+import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, Clock, LogOut, Menu, X, Sun, Moon } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import type { DashboardUser } from '../types'
 
@@ -14,6 +14,7 @@ const navItems = [
   { to: '/user-management', icon: Users, label: 'User Management' },
   { to: '/catalogue', icon: Package, label: 'Catalogue' },
   { to: '/reconciliation', icon: FileCheck, label: 'Reconciliation' },
+  { to: '/reconciliation/history', icon: Clock, label: 'Recon History' },
 ]
 
 function useDarkMode() {
