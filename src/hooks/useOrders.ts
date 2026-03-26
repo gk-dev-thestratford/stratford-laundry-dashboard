@@ -19,7 +19,7 @@ export function useOrders() {
   const [filters, setFilters] = useState<Filters>({
     status: 'all',
     department: 'all',
-    month: 0,
+    month: new Date().getMonth() + 1,
     year: new Date().getFullYear(),
     search: '',
     orderType: 'all',
