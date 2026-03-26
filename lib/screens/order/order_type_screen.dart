@@ -9,16 +9,13 @@ class OrderTypeScreen extends ConsumerWidget {
   const OrderTypeScreen({super.key});
 
   void _selectType(BuildContext context, WidgetRef ref, String type) {
+    // setOrderType already resets the draft to empty before setting the new type
     ref.read(orderProvider.notifier).setOrderType(type);
     context.push('/order/details');
   }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Reset any stale order state when entering the type selection screen
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(orderProvider.notifier).reset();
-    });
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
 
     return ScreenScaffold(
