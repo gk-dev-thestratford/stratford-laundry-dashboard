@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'database_service.dart';
 import 'supabase_service.dart';
@@ -166,48 +167,74 @@ class SyncService {
         return;
       }
 
+      debugPrint('[Push] ${pending.length} pending items to sync');
+
       for (final item in pending) {
         final tableName = item['table_name'] as String;
         final operation = item['operation'] as String;
         final data = jsonDecode(item['data'] as String) as Map<String, dynamic>;
 
-        switch (operation) {
-          case 'insert':
-            if (tableName == 'orders') {
-              await SupabaseService.instance.pushOrder(data);
-              // Also push order items and status logs for this order
-              final orderId = data['id'] as String;
-              final items = await DatabaseService.instance.getOrderItems(orderId);
-              if (items.isNotEmpty) {
-                await SupabaseService.instance.pushOrderItems(items);
+        try {
+          debugPrint('[Push] $operation $tableName: ${data['id']}');
+          switch (operation) {
+            case 'insert':
+              if (tableName == 'orders') {
+                await SupabaseService.instance.pushOrder(data);
+                // Also push order items and status logs for this order
+                final orderId = data['id'] as String;
+                final items = await DatabaseService.instance.getOrderItems(orderId);
+                if (items.isNotEmpty) {
+                  await SupabaseService.instance.pushOrderItems(items);
+                  debugPrint('[Push] Pushed ${items.length} order items');
+                }
+                final logs = await DatabaseService.instance.getOrderStatusLog(orderId);
+                for (final log in logs) {
+                  await SupabaseService.instance.pushStatusLog(log);
+                }
+                if (logs.isNotEmpty) debugPrint('[Push] Pushed ${logs.length} status logs');
               }
-              final logs = await DatabaseService.instance.getOrderStatusLog(orderId);
-              for (final log in logs) {
-                await SupabaseService.instance.pushStatusLog(log);
+            case 'update':
+              if (tableName == 'orders') {
+                final orderId = data['id'] as String;
+                await SupabaseService.instance.updateOrderStatus(
+                  orderId,
+                  data['status'] as String,
+                );
+                // Push latest status log entry for this order
+                final logs = await DatabaseService.instance.getOrderStatusLog(orderId);
+                if (logs.isNotEmpty) {
+                  await SupabaseService.instance.pushStatusLog(logs.last);
+                }
               }
-            }
-          case 'update':
-            if (tableName == 'orders') {
-              final orderId = data['id'] as String;
-              await SupabaseService.instance.updateOrderStatus(
-                orderId,
-                data['status'] as String,
-              );
-              // Push latest status log entry for this order
-              final logs = await DatabaseService.instance.getOrderStatusLog(orderId);
-              if (logs.isNotEmpty) {
-                await SupabaseService.instance.pushStatusLog(logs.last);
-              }
-            }
-          case 'delete':
-            await SupabaseService.instance.deleteOrder(data['id'] as String);
-        }
+            case 'delete':
+              await SupabaseService.instance.deleteOrder(data['id'] as String);
+          }
 
-        await DatabaseService.instance.markSynced(item['id'] as int);
+          await DatabaseService.instance.markSynced(item['id'] as int);
+          debugPrint('[Push] Synced successfully');
+        } catch (e) {
+          debugPrint('[Push] FAILED $operation $tableName: $e');
+          // Mark as synced if it's a data error (won't succeed on retry)
+          final isDataError = e.toString().contains('22P02') || // invalid UUID
+              e.toString().contains('23') || // integrity constraint
+              e.toString().contains('42');   // syntax/schema error
+          if (isDataError) {
+            await DatabaseService.instance.markSynced(item['id'] as int);
+            debugPrint('[Push] Marked as synced (permanent failure, won\'t retry)');
+          }
+        }
       }
 
-      _updateState(SyncState.synced);
-    } catch (_) {
+      // Check if any items remain unsynced
+      final remaining = await DatabaseService.instance.getPendingSyncItems();
+      if (remaining.isEmpty) {
+        _updateState(SyncState.synced);
+      } else {
+        debugPrint('[Push] ${remaining.length} items still pending');
+        _updateState(SyncState.pending);
+      }
+    } catch (e) {
+      debugPrint('[Push] Fatal error: $e');
       _updateState(SyncState.pending);
     } finally {
       _isPushing = false;

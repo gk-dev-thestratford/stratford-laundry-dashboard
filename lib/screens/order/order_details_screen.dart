@@ -96,7 +96,9 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
       final room = _roomController.text.trim();
       notifier.updateDetails(
         docketNumber: room,
-        departmentId: _selectedGuestType == 'Hotel' ? 'gst' : 'lft',
+        departmentId: _selectedGuestType == 'Hotel'
+            ? 'c333cf77-1e29-40c4-9a0e-e1e5df09306f'   // GST
+            : '0241132b-ab91-497e-a19a-5571238b5406',   // LFT
         departmentName: _selectedGuestType,
         guestName: _nameController.text.trim(),
         staffName: _nameController.text.trim(),
@@ -482,10 +484,10 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
 
   /// Hardcoded linen departments: Housekeeping = hsk_linen, rest = fnb_linen
   static const _linenDepartments = [
-    {'id': 'hsk', 'name': 'Housekeeping', 'type': 'hsk_linen', 'icon': Icons.bed_rounded},
-    {'id': 'lounge', 'name': 'Lounge', 'type': 'fnb_linen', 'icon': Icons.weekend_rounded},
-    {'id': 'events', 'name': 'Events', 'type': 'fnb_linen', 'icon': Icons.celebration_rounded},
-    {'id': 'kef', 'name': 'Kitchen E20 Front', 'type': 'fnb_linen', 'icon': Icons.restaurant_rounded},
+    {'id': '25606c38-03ab-486c-9d97-151e039c68a9', 'name': 'Housekeeping', 'type': 'hsk_linen', 'icon': Icons.bed_rounded},
+    {'id': '2482ccaa-c8d3-49c4-84c1-6dd45d4745e7', 'name': 'Lounge', 'type': 'fnb_linen', 'icon': Icons.weekend_rounded},
+    {'id': '6ad328b2-6f21-42a2-9071-dc258fa63ca4', 'name': 'Events', 'type': 'fnb_linen', 'icon': Icons.celebration_rounded},
+    {'id': '5056ce99-6d0c-443c-a459-59185cf81530', 'name': 'Kitchen E20 Front', 'type': 'fnb_linen', 'icon': Icons.restaurant_rounded},
   ];
 
   Widget _buildSideLinenDepartmentList() {
