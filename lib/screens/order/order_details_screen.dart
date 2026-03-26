@@ -8,6 +8,29 @@ import '../../providers/order_provider.dart';
 import '../../providers/department_provider.dart';
 import '../../models/department.dart';
 
+/// Capitalizes the first letter of each word as the user types.
+class _CapitalizeWordsFormatter extends TextInputFormatter {
+  @override
+  TextEditingValue formatEditUpdate(TextEditingValue oldValue, TextEditingValue newValue) {
+    if (newValue.text.isEmpty) return newValue;
+    final text = newValue.text;
+    final buffer = StringBuffer();
+    bool capitalizeNext = true;
+    for (int i = 0; i < text.length; i++) {
+      if (text[i] == ' ') {
+        buffer.write(' ');
+        capitalizeNext = true;
+      } else if (capitalizeNext) {
+        buffer.write(text[i].toUpperCase());
+        capitalizeNext = false;
+      } else {
+        buffer.write(text[i]);
+      }
+    }
+    return newValue.copyWith(text: buffer.toString(), selection: newValue.selection);
+  }
+}
+
 class OrderDetailsScreen extends ConsumerStatefulWidget {
   const OrderDetailsScreen({super.key});
 
@@ -208,7 +231,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
       TextFormField(
         controller: _nameController,
         textCapitalization: TextCapitalization.words,
-        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]'))],
+        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]')), _CapitalizeWordsFormatter()],
         decoration: const InputDecoration(
           hintText: 'Enter your full name',
           prefixIcon: Icon(Icons.person),
@@ -272,7 +295,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
             child: TextFormField(
               controller: _nameController,
               textCapitalization: TextCapitalization.words,
-              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]'))],
+              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]')), _CapitalizeWordsFormatter()],
               decoration: const InputDecoration(
                 hintText: 'Enter guest name',
                 prefixIcon: Icon(Icons.person),
