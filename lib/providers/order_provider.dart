@@ -4,6 +4,7 @@ import 'package:uuid/uuid.dart';
 import '../models/order.dart';
 import '../models/catalogue_item.dart';
 import '../services/database_service.dart';
+import '../services/sync_service.dart';
 
 const _uuid = Uuid();
 
@@ -13,6 +14,11 @@ class OrderNotifier extends StateNotifier<OrderDraft> {
 
   void setOrderType(String type) {
     state = OrderDraft.empty.copyWith(orderType: type);
+  }
+
+  /// Update order type without resetting the draft (used when refining linen → hsk_linen/fnb_linen)
+  void updateOrderType(String type) {
+    state = state.copyWith(orderType: type);
   }
 
   void updateDetails({
@@ -121,8 +127,9 @@ class OrderNotifier extends StateNotifier<OrderDraft> {
       'created_at': now,
     });
 
-    // Queue for sync
+    // Queue for sync and push immediately
     await db.addToSyncQueue('orders', orderId, 'insert', jsonEncode(orderMap));
+    SyncService.instance.pushPendingNow();
 
     reset();
     return orderId;

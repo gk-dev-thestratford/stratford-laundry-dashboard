@@ -1,11 +1,56 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'config/router.dart';
+import 'providers/sync_refresh_provider.dart';
 import 'services/supabase_service.dart';
 import 'services/connectivity_service.dart';
 import 'services/database_service.dart';
 import 'services/sync_service.dart';
 import 'theme/app_theme.dart';
+
+/// Pull all reference data from Supabase into local SQLite.
+/// Called at startup and by background sync.
+Future<bool> initialSync() async {
+  final db = DatabaseService.instance;
+  final supa = SupabaseService.instance;
+  if (!supa.isInitialized) return false;
+
+  bool synced = false;
+  try {
+    final depts = await supa.fetchDepartments();
+    debugPrint('[Sync] Fetched ${depts.length} departments from Supabase');
+    if (depts.isNotEmpty) {
+      await db.syncDepartments(depts);
+      synced = true;
+    }
+  } catch (e) {
+    debugPrint('[Sync] Failed to sync departments: $e');
+  }
+
+  try {
+    final items = await supa.fetchCatalogueItems();
+    debugPrint('[Sync] Fetched ${items.length} catalogue items from Supabase');
+    if (items.isNotEmpty) {
+      await db.syncCatalogueItems(items);
+      synced = true;
+    }
+  } catch (e) {
+    debugPrint('[Sync] Failed to sync catalogue items: $e');
+  }
+
+  try {
+    final admins = await supa.fetchAdminUsers();
+    debugPrint('[Sync] Fetched ${admins.length} admin users from Supabase');
+    if (admins.isNotEmpty) {
+      await db.syncAdminUsers(admins);
+      synced = true;
+    }
+  } catch (e) {
+    debugPrint('[Sync] Failed to sync admin users: $e');
+  }
+
+  return synced;
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,47 +60,59 @@ void main() async {
 
   // Initialize connectivity monitoring
   await ConnectivityService.instance.initialize();
+  debugPrint('[Init] Connectivity: ${ConnectivityService.instance.currentStatus}');
 
   // Initialize Supabase (no-op if not configured)
   await SupabaseService.instance.initialize();
+  debugPrint('[Init] Supabase initialized: ${SupabaseService.instance.isInitialized}');
 
-  // Start sync service (pulls departments, items, admins from Supabase)
+  // Pull fresh reference data from Supabase before UI loads
+  // No connectivity gate — just try it. 5s timeout so it doesn't block forever.
+  if (SupabaseService.instance.isInitialized) {
+    try {
+      final result = await initialSync().timeout(const Duration(seconds: 5));
+      debugPrint('[Init] Startup sync completed: $result');
+    } catch (e) {
+      debugPrint('[Init] Startup sync failed/timed out: $e');
+    }
+  }
+
+  // Start sync service — keeps data fresh in background, pushes pending changes
   SyncService.instance.initialize();
 
   runApp(const ProviderScope(child: StratfordLaundryApp()));
 }
 
-class StratfordLaundryApp extends StatelessWidget {
+/// Removes the overscroll bounce/glow effect on all scrollable widgets.
+class _NoOverscrollBehavior extends ScrollBehavior {
+  const _NoOverscrollBehavior();
+
+  @override
+  Widget buildOverscrollIndicator(BuildContext context, Widget child, ScrollableDetails details) {
+    return child; // No glow or stretch effect
+  }
+
+  @override
+  ScrollPhysics getScrollPhysics(BuildContext context) {
+    return const ClampingScrollPhysics(); // Clamp instead of bounce
+  }
+}
+
+class StratfordLaundryApp extends ConsumerWidget {
   const StratfordLaundryApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Eagerly initialize — listens for sync events and invalidates data providers
+    ref.watch(syncRefreshProvider);
+
     return MaterialApp.router(
       title: 'Stratford Laundry',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: AppColors.navy),
-        fontFamily: 'Inter',
-        useMaterial3: true,
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: AppColors.white,
-          border: OutlineInputBorder(borderRadius: AppRadius.mediumBR),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: AppRadius.mediumBR,
-            borderSide: BorderSide(color: AppColors.grey300),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: AppRadius.mediumBR,
-            borderSide: BorderSide(color: AppColors.navy, width: 2),
-          ),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: AppSpacing.lg,
-            vertical: AppSpacing.base,
-          ),
-        ),
-      ),
+      theme: AppTheme.theme,
       routerConfig: AppRouter.router,
+      // Remove overscroll bounce/glow on all scrollables
+      scrollBehavior: const _NoOverscrollBehavior(),
     );
   }
 }

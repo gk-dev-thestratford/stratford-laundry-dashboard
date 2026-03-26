@@ -4,6 +4,8 @@ import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
 import '../../models/admin_user.dart';
 import '../../providers/admin_provider.dart';
+import '../../services/sync_service.dart';
+import '../../widgets/sync_indicator.dart';
 
 class AdminLoginScreen extends ConsumerStatefulWidget {
   const AdminLoginScreen({super.key});
@@ -14,7 +16,7 @@ class AdminLoginScreen extends ConsumerStatefulWidget {
 
 // Distinct avatar colours for each admin user
 const _adminColors = [
-  Color(0xFF1B2A4A), // Navy
+  Color(0xFF384845), // Dark Teal
   Color(0xFFC9A84C), // Gold
   Color(0xFF2E7D32), // Green
   Color(0xFFC62828), // Red
@@ -37,18 +39,30 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
 
   Color _colorForIndex(int index) => _adminColors[index % _adminColors.length];
 
+  late final _syncSub = SyncService.instance.onReferenceDataSynced.listen((_) {
+    _loadAdmins();
+  });
+
   @override
   void initState() {
     super.initState();
     _loadAdmins();
   }
 
+  @override
+  void dispose() {
+    _syncSub.cancel();
+    super.dispose();
+  }
+
   Future<void> _loadAdmins() async {
     final admins = await ref.read(adminProvider.notifier).getAdminUsers();
-    setState(() {
-      _admins = admins;
-      _isLoading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _admins = admins;
+        _isLoading = false;
+      });
+    }
   }
 
   void _onPinDigit(String digit) {
@@ -112,6 +126,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
           ],
         ),
         centerTitle: true,
+        actions: const [SyncIndicatorCompact()],
         elevation: 2,
         shadowColor: AppColors.navyDark.withValues(alpha: 0.3),
       ),

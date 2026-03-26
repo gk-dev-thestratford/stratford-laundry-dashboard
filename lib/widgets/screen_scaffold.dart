@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../theme/app_theme.dart';
+import 'sync_indicator.dart';
 
 /// Shared scaffold for all non-home screens.
 /// Provides a consistent app bar with back button, title, and optional subtitle.
-class ScreenScaffold extends StatelessWidget {
+/// Includes a compact sync indicator in the app bar actions.
+class ScreenScaffold extends ConsumerWidget {
   final String title;
   final String? subtitle;
   final Widget child;
@@ -23,7 +26,12 @@ class ScreenScaffold extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final allActions = [
+      ...?actions,
+      const SyncIndicatorCompact(),
+    ];
+
     return Scaffold(
       backgroundColor: AppColors.offWhite,
       appBar: AppBar(
@@ -66,7 +74,7 @@ class ScreenScaffold extends StatelessWidget {
           ],
         ),
         centerTitle: true,
-        actions: actions,
+        actions: allActions,
         elevation: 2,
         shadowColor: AppColors.navyDark.withValues(alpha: 0.3),
       ),

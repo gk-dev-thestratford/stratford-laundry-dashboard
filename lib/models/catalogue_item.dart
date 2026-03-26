@@ -26,16 +26,17 @@ class CatalogueItem {
 
   factory CatalogueItem.fromMap(Map<String, dynamic> map) {
     final category = map['category'] as String? ?? 'uniform';
+    final name = map['name'] as String;
     return CatalogueItem(
       id: map['id'] as String,
       code: map['code'] as String? ?? '',
-      name: map['name'] as String,
+      name: name,
       category: category,
       price: (map['price'] as num?)?.toDouble(),
       departmentId: map['department_id'] as String?,
       sortOrder: (map['sort_order'] as int?) ?? 0,
       isActive: (map['is_active'] == 1 || map['is_active'] == true),
-      icon: _defaultIconForCategory(category),
+      icon: iconForItemName(name, category),
     );
   }
 
@@ -48,6 +49,65 @@ class CatalogueItem {
       default:
         return Icons.checkroom;
     }
+  }
+
+  /// Returns a specific icon for each item name (used when items come from DB).
+  /// Each item gets a unique, visually distinct icon.
+  static IconData iconForItemName(String name, String category) {
+    final lower = name.toLowerCase();
+
+    // ── Uniform items (from Supabase) ──
+    if (lower.contains('t-shirt') || lower.contains('polo shirt'))  return MdiIcons.polo;          // Polo collar shirt
+    if (lower.contains('shirt') && !lower.contains('chef'))          return MdiIcons.tshirtCrewOutline; // Crew-neck shirt
+    if (lower.contains('blouse'))                                     return MdiIcons.tshirtVOutline;   // V-neck blouse
+    if (lower.contains('chef') && lower.contains('trouser'))         return MdiIcons.chefHat;          // Chef uniform bottom
+    if (lower.contains('trouser') || lower.contains('jean'))         return MdiIcons.humanMaleHeight;  // Standing figure (trousers/full-length)
+    if (lower.contains('dress'))                                      return MdiIcons.humanFemale;      // Female silhouette (dress shape)
+    if (lower.contains('chef') && lower.contains('jacket'))          return MdiIcons.chefHat;          // Chef hat
+    if (lower.contains('jacket') || lower.contains('blazer'))        return MdiIcons.hanger;           // Jacket on hanger
+    if (lower.contains('apron'))                                      return Icons.restaurant_menu;     // Service/kitchen
+    if (lower.contains('waistcoat') || lower.contains('vest'))       return MdiIcons.bowTie;           // Formal vest
+    if (lower.contains('suit'))                                       return MdiIcons.tie;              // Necktie = formal suit
+    if (lower.contains('hoody') || lower.contains('hoodie') || lower.contains('jumper')) return MdiIcons.tshirtCrew; // Heavy crew-neck
+    if (lower.contains('coat'))                                       return MdiIcons.coatRack;         // Coat on rack
+    if (lower.contains('pullover') || lower.contains('sweater'))     return MdiIcons.tshirtV;          // V-neck knitwear
+
+    // ── HSK linen items ──
+    if (lower.contains('curtain'))                                    return Icons.curtains;
+    if (lower.contains('duvet cover'))                                return Icons.bed_outlined;
+    if (lower.contains('duvet'))                                      return Icons.bed;
+    if (lower.contains('bathrobe') || lower.contains('robe'))        return MdiIcons.bathtubOutline;
+    if (lower.contains('bath towel'))                                 return Icons.dry;
+    if (lower.contains('hand towel'))                                 return Icons.dry_outlined;
+    if (lower.contains('bath mat'))                                   return MdiIcons.scaleBathroom;
+    if (lower.contains('bed sheet') || lower.contains('sheet'))      return Icons.single_bed;
+    if (lower.contains('pillowcase') || lower.contains('pillow'))    return Icons.airline_seat_individual_suite;
+
+    // ── F&B linen items ──
+    if (lower.contains('runner'))                                     return Icons.table_bar;
+    if (lower.contains('tablecloth') || lower.contains('table cloth')) return Icons.table_restaurant;
+    if (lower.contains('napkin'))                                      return Icons.dining;
+
+    // Fallback
+    return _defaultIconForCategory(category);
+  }
+
+  /// Returns a background color for the icon circle — blue fill for all categories
+  static Color iconBackgroundColor(String category, {bool selected = false}) {
+    if (selected) return const Color(0xFF384845); // Solid dark teal when selected
+    return const Color(0xFF384845).withValues(alpha: 0.12); // Teal tint
+  }
+
+  /// Returns the icon color — gold for all categories
+  static Color iconAccentColor(String category, {bool selected = false}) {
+    if (selected) return const Color(0xFFD4AF37); // Gold
+    return const Color(0xFFD4AF37); // Gold always
+  }
+
+  /// Returns the border color for the icon circle
+  static Color iconBorderColor(String category, {bool selected = false}) {
+    if (selected) return const Color(0xFFD4AF37).withValues(alpha: 0.5);
+    return const Color(0xFF384845).withValues(alpha: 0.3); // Teal border
   }
 
   /// Uniform items — prices TBC by Georgi

@@ -15,6 +15,10 @@ class OrderTypeScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // Reset any stale order state when entering the type selection screen
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(orderProvider.notifier).reset();
+    });
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
 
     return ScreenScaffold(

@@ -29,11 +29,11 @@ class AppRadius {
 /// Typography scale — tablet-optimised for 10" screens
 class AppTextStyles {
   // Font sizes — bumped for tablet readability & accessibility
-  static const double headingSize = 30;
-  static const double titleSize = 22;
-  static const double bodySize = 18;
-  static const double labelSize = 16;
-  static const double captionSize = 14;
+  static const double headingSize = 34;
+  static const double titleSize = 25;
+  static const double bodySize = 20;
+  static const double labelSize = 18;
+  static const double captionSize = 16;
 
   // Weights — only 3
   static const FontWeight bold = FontWeight.w700;
@@ -43,13 +43,13 @@ class AppTextStyles {
 
 /// Standard touch target & button sizes — tablet-optimised
 class AppSizes {
-  static const double minTouchTarget = 52;
-  static const double buttonHeightLg = 58;
-  static const double buttonHeightMd = 52;
-  static const double buttonHeightSm = 46;
-  static const double iconSizeLg = 28;
-  static const double iconSizeMd = 24;
-  static const double iconSizeSm = 20;
+  static const double minTouchTarget = 56;
+  static const double buttonHeightLg = 62;
+  static const double buttonHeightMd = 56;
+  static const double buttonHeightSm = 48;
+  static const double iconSizeLg = 30;
+  static const double iconSizeMd = 26;
+  static const double iconSizeSm = 22;
 }
 
 // ──────────────────────────────────────────────
@@ -57,13 +57,13 @@ class AppSizes {
 // ──────────────────────────────────────────────
 
 class AppColors {
-  // Primary brand colors
-  static const navy = Color(0xFF1B2A4A);
-  static const navyLight = Color(0xFF2A3D66);
-  static const navyDark = Color(0xFF111D35);
-  static const gold = Color(0xFFC9A84C);
-  static const goldLight = Color(0xFFDCC06E);
-  static const goldDark = Color(0xFFA88B3A);
+  // Primary brand colors — dark teal/sage
+  static const navy = Color(0xFF384845);
+  static const navyLight = Color(0xFF4A5D5A);
+  static const navyDark = Color(0xFF2B3836);
+  static const gold = Color(0xFFD4AF37);
+  static const goldLight = Color(0xFFE2C76E);
+  static const goldDark = Color(0xFFB8943A);
 
   // Neutrals
   static const white = Color(0xFFFFFFFF);

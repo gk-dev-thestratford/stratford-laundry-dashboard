@@ -120,20 +120,20 @@ class _ItemCard extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Container(
-                  width: 48,
-                  height: 48,
+                  width: 58,
+                  height: 58,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: isSelected ? AppColors.gold.withValues(alpha: 0.12) : AppColors.navy.withValues(alpha: 0.06),
+                    color: CatalogueItem.iconBackgroundColor(item.category, selected: isSelected),
                     border: Border.all(
-                      color: isSelected ? AppColors.gold.withValues(alpha: 0.3) : AppColors.navy.withValues(alpha: 0.1),
-                      width: 1.5,
+                      color: CatalogueItem.iconBorderColor(item.category, selected: isSelected),
+                      width: 2,
                     ),
                   ),
                   child: Icon(
                     item.icon,
-                    size: 24,
-                    color: isSelected ? AppColors.gold : AppColors.navy.withValues(alpha: 0.6),
+                    size: 29,
+                    color: CatalogueItem.iconAccentColor(item.category, selected: isSelected),
                   ),
                 ),
                 const SizedBox(height: AppSpacing.sm),

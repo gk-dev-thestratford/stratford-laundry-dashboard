@@ -9,11 +9,20 @@ class ConnectivityService {
   ConnectivityService._();
 
   final _connectivity = Connectivity();
+  // Use a regular controller + replay the last value manually for late subscribers
   final _controller = StreamController<ConnectivityStatus>.broadcast();
 
-  Stream<ConnectivityStatus> get statusStream => _controller.stream;
   ConnectivityStatus _currentStatus = ConnectivityStatus.offline;
   ConnectivityStatus get currentStatus => _currentStatus;
+
+  /// Stream that always replays the current status to new listeners,
+  /// then emits future changes.
+  Stream<ConnectivityStatus> get statusStream async* {
+    // Immediately yield current status so late subscribers get it
+    yield _currentStatus;
+    // Then forward all future changes
+    yield* _controller.stream;
+  }
 
   Future<void> initialize() async {
     final results = await _connectivity.checkConnectivity();
@@ -23,8 +32,11 @@ class ConnectivityService {
 
   void _updateStatus(List<ConnectivityResult> results) {
     final isConnected = results.any((r) => r != ConnectivityResult.none);
-    _currentStatus = isConnected ? ConnectivityStatus.online : ConnectivityStatus.offline;
-    _controller.add(_currentStatus);
+    final newStatus = isConnected ? ConnectivityStatus.online : ConnectivityStatus.offline;
+    if (newStatus != _currentStatus || _currentStatus == ConnectivityStatus.offline) {
+      _currentStatus = newStatus;
+      _controller.add(_currentStatus);
+    }
   }
 
   void dispose() {
@@ -32,7 +44,7 @@ class ConnectivityService {
   }
 }
 
-/// Riverpod provider for connectivity status
+/// Riverpod provider for connectivity status — always has the current value
 final connectivityProvider = StreamProvider<ConnectivityStatus>((ref) {
   return ConnectivityService.instance.statusStream;
 });

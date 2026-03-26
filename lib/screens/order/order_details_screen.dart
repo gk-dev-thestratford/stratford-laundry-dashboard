@@ -20,27 +20,32 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
   final _docketController = TextEditingController();
   final _nameController = TextEditingController();
   final _notesController = TextEditingController();
+  final _emailController = TextEditingController();
   final _roomController = TextEditingController();
 
   String? _selectedDepartmentId;
   String? _selectedLinenType; // 'hsk_linen' or 'fnb_linen'
-  String? _selectedFnbSubDept; // 'Lounge', 'Events', 'Kitchen'
   String? _selectedGuestType; // 'Hotel' or 'Loft'
   int _bagCount = 1;
+  bool _notesExpanded = false;
 
-  static const _fnbSubDepartments = ['Lounge', 'Events', 'Kitchen'];
 
   @override
   void dispose() {
     _docketController.dispose();
     _nameController.dispose();
     _notesController.dispose();
+    _emailController.dispose();
     _roomController.dispose();
     super.dispose();
   }
 
   bool get _isGuestOrder => ref.read(orderProvider).orderType == 'guest_laundry';
-  bool get _isLinenOrder => ref.read(orderProvider).orderType == 'linen';
+  bool get _isLinenOrder {
+    final type = ref.read(orderProvider).orderType;
+    return type == 'linen' || type == 'hsk_linen' || type == 'fnb_linen';
+  }
+  bool get _isUniformOrder => ref.read(orderProvider).orderType == 'uniform';
 
   String get _stepSubtitle {
     if (_isGuestOrder) return 'Step 2 of 3 — Guest Details';
@@ -50,16 +55,16 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
   void _onNext() {
     if (!_formKey.currentState!.validate()) return;
 
-    if (_isLinenOrder && _selectedLinenType == null) {
+    if (!_isGuestOrder && _selectedDepartmentId == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select a linen type')),
+        const SnackBar(content: Text('Please select a department')),
       );
       return;
     }
 
-    if (_isLinenOrder && _selectedLinenType == 'fnb_linen' && _selectedFnbSubDept == null) {
+    if (_isLinenOrder && _selectedLinenType == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select an F&B sub-department')),
+        const SnackBar(content: Text('Please select a department')),
       );
       return;
     }
@@ -69,10 +74,9 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     final dept = departments.where((d) => d.id == _selectedDepartmentId).firstOrNull;
 
     if (_isLinenOrder) {
-      notifier.setOrderType(_selectedLinenType!);
-      final deptName = _selectedLinenType == 'fnb_linen'
-          ? 'F&B — $_selectedFnbSubDept'
-          : 'Housekeeping';
+      // Find the department name from our linen departments list
+      final linenDept = _linenDepartments.where((d) => d['id'] == _selectedDepartmentId).firstOrNull;
+      final deptName = linenDept?['name'] as String? ?? 'Housekeeping';
       notifier.updateDetails(
         docketNumber: _docketController.text.trim(),
         departmentId: _selectedDepartmentId,
@@ -80,6 +84,8 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         staffName: _nameController.text.trim(),
         notes: _notesController.text.trim().isEmpty ? null : _notesController.text.trim(),
       );
+      // Set the specific linen type (hsk_linen or fnb_linen) without resetting draft
+      notifier.updateOrderType(_selectedLinenType!);
     } else if (_isGuestOrder) {
       if (_selectedGuestType == null) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -104,6 +110,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         departmentId: _selectedDepartmentId,
         departmentName: dept?.name,
         staffName: _nameController.text.trim(),
+        email: _emailController.text.trim().isEmpty ? null : _emailController.text.trim(),
         notes: _notesController.text.trim().isEmpty ? null : _notesController.text.trim(),
       );
     }
@@ -118,30 +125,53 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
   @override
   Widget build(BuildContext context) {
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    final showSideDepts = !_isGuestOrder;
 
     return ScreenScaffold(
       title: 'Order Details',
       subtitle: _stepSubtitle,
       child: SingleChildScrollView(
         padding: EdgeInsets.symmetric(
-          horizontal: isLandscape ? 80 : AppSpacing.lg,
+          horizontal: isLandscape ? AppSpacing.xl : AppSpacing.lg,
           vertical: AppSpacing.lg,
         ),
         child: Center(
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 700),
-            child: Form(
-              key: _formKey,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_isGuestOrder) ..._buildGuestFields(),
-                  if (!_isGuestOrder) ..._buildStaffFields(),
-                  const SizedBox(height: AppSpacing.xl),
-                  _buildNextButton(),
-                  const SizedBox(height: AppSpacing.lg),
+            constraints: const BoxConstraints(maxWidth: 900),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Left side: form fields
+                Expanded(
+                  flex: showSideDepts ? 3 : 1,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 550),
+                    child: Form(
+                      key: _formKey,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (_isGuestOrder) ..._buildGuestFields(),
+                          if (!_isGuestOrder) ..._buildStaffFields(),
+                          const SizedBox(height: AppSpacing.xl),
+                          _buildNextButton(),
+                          const SizedBox(height: AppSpacing.lg),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                // Right side: department selector
+                if (showSideDepts) ...[
+                  const SizedBox(width: AppSpacing.lg),
+                  Expanded(
+                    flex: 2,
+                    child: _isLinenOrder
+                        ? _buildSideLinenDepartmentList()
+                        : _buildSideDepartmentList(),
+                  ),
                 ],
-              ),
+              ],
             ),
           ),
         ),
@@ -171,35 +201,6 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
       ),
       const SizedBox(height: AppSpacing.lg),
 
-      if (_isLinenOrder) ...[
-        _buildSectionLabel('Linen Type'),
-        const SizedBox(height: AppSpacing.sm),
-        _buildLinenTypeSelector(),
-        if (_selectedLinenType == 'fnb_linen') ...[
-          const SizedBox(height: AppSpacing.md),
-          _buildSectionLabel('F&B Sub-Department'),
-          const SizedBox(height: AppSpacing.sm),
-          _buildFnbSubDeptChips(),
-        ],
-        const SizedBox(height: AppSpacing.lg),
-      ],
-
-      if (!_isLinenOrder) ...[
-        _buildSectionLabel('Department'),
-        const SizedBox(height: AppSpacing.sm),
-        DropdownButtonFormField<String>(
-          initialValue: _selectedDepartmentId,
-          decoration: const InputDecoration(
-            hintText: 'Select department',
-            prefixIcon: Icon(Icons.business),
-          ),
-          items: _getDepartmentItems(),
-          onChanged: (v) => setState(() => _selectedDepartmentId = v),
-          validator: (v) => v == null ? 'Please select a department' : null,
-        ),
-        const SizedBox(height: AppSpacing.lg),
-      ],
-
       _buildSectionLabel('Staff Name'),
       const SizedBox(height: AppSpacing.sm),
       TextFormField(
@@ -216,21 +217,18 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
           return null;
         },
       ),
+
+      // Email field — optional, uniform orders only
       const SizedBox(height: AppSpacing.lg),
 
-      _buildSectionLabel('Notes'),
+      // Optional section — email (uniform only) + notes
+      _buildSectionLabel('Optional'),
       const SizedBox(height: AppSpacing.sm),
-      TextFormField(
-        controller: _notesController,
-        maxLines: 3,
-        decoration: const InputDecoration(
-          hintText: 'Optional notes (e.g. special instructions)',
-          prefixIcon: Padding(
-            padding: EdgeInsets.only(bottom: 48),
-            child: Icon(Icons.notes),
-          ),
-        ),
-      ),
+      if (_isUniformOrder)
+        _buildCollapsibleEmail(),
+      if (_isUniformOrder)
+        const SizedBox(height: AppSpacing.sm),
+      _buildCollapsibleNotes(),
     ];
   }
 
@@ -261,42 +259,78 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
       ),
       const SizedBox(height: AppSpacing.lg),
 
-      _buildSectionLabel('Guest Name'),
+      _buildSectionLabel('Guest Name & Bags'),
       const SizedBox(height: AppSpacing.sm),
-      TextFormField(
-        controller: _nameController,
-        textCapitalization: TextCapitalization.words,
-        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]'))],
-        decoration: const InputDecoration(
-          hintText: 'Enter guest name',
-          prefixIcon: Icon(Icons.person),
-        ),
-        validator: (v) {
-          if (v == null || v.trim().isEmpty) return 'Guest name is required';
-          if (v.trim().length < 2) return 'Please enter the full name';
-          return null;
-        },
-      ),
-      const SizedBox(height: AppSpacing.lg),
-
-      _buildSectionLabel('Number of Bags'),
-      const SizedBox(height: AppSpacing.sm),
-      _buildBagCounter(),
-      const SizedBox(height: AppSpacing.lg),
-
-      _buildSectionLabel('Notes'),
-      const SizedBox(height: AppSpacing.sm),
-      TextFormField(
-        controller: _notesController,
-        maxLines: 3,
-        decoration: const InputDecoration(
-          hintText: 'e.g. needs repair, delicate items',
-          prefixIcon: Padding(
-            padding: EdgeInsets.only(bottom: 48),
-            child: Icon(Icons.notes),
+      Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // Guest Name — left side
+          Expanded(
+            flex: 3,
+            child: TextFormField(
+              controller: _nameController,
+              textCapitalization: TextCapitalization.words,
+              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z\s]'))],
+              decoration: const InputDecoration(
+                hintText: 'Enter guest name',
+                prefixIcon: Icon(Icons.person),
+              ),
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) return 'Guest name is required';
+                if (v.trim().length < 2) return 'Please enter the full name';
+                return null;
+              },
+            ),
           ),
-        ),
+          const SizedBox(width: AppSpacing.md),
+          // Number of Bags — right side, same height as text field
+          Container(
+            height: 60,
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+            decoration: BoxDecoration(
+              border: Border.all(color: AppColors.grey300),
+              borderRadius: AppRadius.mediumBR,
+              color: AppColors.white,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  onPressed: _bagCount > 1 ? () => setState(() => _bagCount--) : null,
+                  icon: const Icon(Icons.remove_circle_outline),
+                  color: AppColors.navy,
+                  iconSize: 28,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
+                  child: Text(
+                    '$_bagCount',
+                    style: TextStyle(fontFamily: 'Inter', fontSize: 24, fontWeight: AppTextStyles.bold, color: AppColors.navy),
+                  ),
+                ),
+                Text(
+                  _bagCount == 1 ? 'bag' : 'bags',
+                  style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, color: AppColors.grey600),
+                ),
+                const SizedBox(width: AppSpacing.xs),
+                IconButton(
+                  onPressed: () => setState(() => _bagCount++),
+                  icon: const Icon(Icons.add_circle_outline),
+                  color: AppColors.navy,
+                  iconSize: 28,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
+      const SizedBox(height: AppSpacing.lg),
+
+      _buildCollapsibleNotes(),
     ];
   }
 
@@ -351,127 +385,178 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     );
   }
 
-  Widget _buildFnbSubDeptChips() {
-    return Wrap(
-      spacing: AppSpacing.md,
-      children: _fnbSubDepartments.map((name) {
-        final selected = _selectedFnbSubDept == name;
-        return ChoiceChip(
-          label: Text(name),
-          selected: selected,
-          onSelected: (_) => setState(() => _selectedFnbSubDept = name),
-          selectedColor: AppColors.gold,
-          backgroundColor: AppColors.white,
-          side: BorderSide(color: selected ? AppColors.gold : AppColors.grey300),
-          labelStyle: TextStyle(fontFamily: 'Inter',
-            fontSize: AppTextStyles.bodySize,
-            fontWeight: AppTextStyles.medium,
-            color: selected ? AppColors.navy : AppColors.grey700,
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-        );
-      }).toList(),
-    );
+  static IconData _iconForDepartment(String code) {
+    return switch (code.toUpperCase()) {
+      'HSK' => Icons.bed_rounded,
+      'FNB' => Icons.restaurant_rounded,
+      'FOH' => Icons.desk_rounded,
+      'KIT' => Icons.soup_kitchen_rounded,
+      'MNT' => Icons.build_rounded,
+      'SPA' => Icons.spa_rounded,
+      'MGT' => Icons.business_center_rounded,
+      'SEC' => Icons.security_rounded,
+      'GST' => Icons.hotel_rounded,
+      'LFT' => Icons.apartment_rounded,
+      'KEF' => Icons.restaurant_rounded,
+      'LNG' => Icons.weekend_rounded,
+      'EVT' => Icons.celebration_rounded,
+      'SMK' => Icons.campaign_rounded,
+      'HRS' => Icons.people_rounded,
+      'ACC' => Icons.account_balance_rounded,
+      'RSV' => Icons.book_online_rounded,
+      'GMT' => Icons.admin_panel_settings_rounded,
+      _ => Icons.business_rounded,
+    };
   }
 
-  Widget _buildLinenTypeSelector() {
-    return Row(
+  Widget _buildSideDepartmentList() {
+    final departments = ref.watch(departmentsProvider).valueOrNull ?? Department.seedData;
+    final filtered = departments.where((d) => d.canSubmitUniforms).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Expanded(
-          child: _LinenTypeOption(
-            label: 'Housekeeping',
-            subtitle: 'Sheets, towels, duvets',
-            icon: Icons.bed_rounded,
-            selected: _selectedLinenType == 'hsk_linen',
-            onTap: () => setState(() {
-              _selectedLinenType = 'hsk_linen';
-              _selectedDepartmentId = 'hsk';
-            }),
+        Text(
+          'Department',
+          style: TextStyle(
+            fontFamily: 'Inter',
+            color: AppColors.navy,
+            fontSize: AppTextStyles.bodySize,
+            fontWeight: AppTextStyles.medium,
           ),
         ),
-        const SizedBox(width: AppSpacing.md),
-        Expanded(
-          child: _LinenTypeOption(
-            label: 'F&B',
-            subtitle: 'Tablecloths, napkins, runners',
-            icon: Icons.restaurant_rounded,
-            selected: _selectedLinenType == 'fnb_linen',
-            onTap: () => setState(() {
-              _selectedLinenType = 'fnb_linen';
-              _selectedDepartmentId = 'fnb';
-            }),
-          ),
-        ),
+        const SizedBox(height: AppSpacing.sm),
+        ...filtered.map((dept) {
+          final selected = _selectedDepartmentId == dept.id;
+          final icon = _iconForDepartment(dept.code);
+          return Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+            child: Material(
+              color: selected ? AppColors.gold : AppColors.white,
+              borderRadius: AppRadius.smallBR,
+              elevation: selected ? 2 : 0,
+              shadowColor: AppColors.gold.withValues(alpha: 0.3),
+              child: InkWell(
+                onTap: () => setState(() => _selectedDepartmentId = dept.id),
+                borderRadius: AppRadius.smallBR,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.base,
+                    vertical: AppSpacing.md,
+                  ),
+                  decoration: BoxDecoration(
+                    borderRadius: AppRadius.smallBR,
+                    border: Border.all(
+                      color: selected ? AppColors.gold : AppColors.grey300,
+                      width: selected ? 2 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(icon, size: AppSizes.iconSizeMd,
+                          color: selected ? AppColors.navy : AppColors.grey500),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Text(
+                          dept.name,
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: AppTextStyles.labelSize,
+                            fontWeight: selected ? AppTextStyles.bold : AppTextStyles.regular,
+                            color: selected ? AppColors.navy : AppColors.grey700,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }),
       ],
     );
   }
 
-  Widget _buildBagCounter() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
-      decoration: BoxDecoration(
-        border: Border.all(color: AppColors.grey300),
-        borderRadius: AppRadius.mediumBR,
-        color: AppColors.white,
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          IconButton(
-            onPressed: _bagCount > 1 ? () => setState(() => _bagCount--) : null,
-            icon: const Icon(Icons.remove_circle_outline),
-            color: AppColors.navy,
-            iconSize: 32,
-            constraints: const BoxConstraints(
-              minWidth: AppSizes.minTouchTarget,
-              minHeight: AppSizes.minTouchTarget,
-            ),
-          ),
-          const SizedBox(width: AppSpacing.lg),
-          Text(
-            '$_bagCount',
-            style: TextStyle(fontFamily: 'Inter',
-              fontSize: 32,
-              fontWeight: AppTextStyles.bold,
-              color: AppColors.navy,
-            ),
-          ),
-          const SizedBox(width: AppSpacing.sm),
-          Text(
-            _bagCount == 1 ? 'bag' : 'bags',
-            style: TextStyle(fontFamily: 'Inter',
-              fontSize: AppTextStyles.titleSize,
-              color: AppColors.grey600,
-            ),
-          ),
-          const SizedBox(width: AppSpacing.lg),
-          IconButton(
-            onPressed: () => setState(() => _bagCount++),
-            icon: const Icon(Icons.add_circle_outline),
-            color: AppColors.navy,
-            iconSize: 32,
-            constraints: const BoxConstraints(
-              minWidth: AppSizes.minTouchTarget,
-              minHeight: AppSizes.minTouchTarget,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  /// Hardcoded linen departments: Housekeeping = hsk_linen, rest = fnb_linen
+  static const _linenDepartments = [
+    {'id': 'hsk', 'name': 'Housekeeping', 'type': 'hsk_linen', 'icon': Icons.bed_rounded},
+    {'id': 'lounge', 'name': 'Lounge', 'type': 'fnb_linen', 'icon': Icons.weekend_rounded},
+    {'id': 'events', 'name': 'Events', 'type': 'fnb_linen', 'icon': Icons.celebration_rounded},
+    {'id': 'kef', 'name': 'Kitchen E20 Front', 'type': 'fnb_linen', 'icon': Icons.restaurant_rounded},
+  ];
 
-  List<DropdownMenuItem<String>> _getDepartmentItems() {
-    final departments = ref.read(departmentsProvider).valueOrNull ?? Department.seedData;
-    if (_isLinenOrder) {
-      return departments
-          .where((d) => d.hasLinenItems)
-          .map((d) => DropdownMenuItem(value: d.id, child: Text(d.name)))
-          .toList();
-    }
-    return departments
-        .where((d) => d.canSubmitUniforms)
-        .map((d) => DropdownMenuItem(value: d.id, child: Text(d.name)))
-        .toList();
+  Widget _buildSideLinenDepartmentList() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          'Department',
+          style: TextStyle(
+            fontFamily: 'Inter',
+            color: AppColors.navy,
+            fontSize: AppTextStyles.bodySize,
+            fontWeight: AppTextStyles.medium,
+          ),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        ..._linenDepartments.map((dept) {
+          final id = dept['id'] as String;
+          final name = dept['name'] as String;
+          final icon = dept['icon'] as IconData;
+          final selected = _selectedDepartmentId == id;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+            child: Material(
+              color: selected ? AppColors.gold : AppColors.white,
+              borderRadius: AppRadius.smallBR,
+              elevation: selected ? 2 : 0,
+              shadowColor: AppColors.gold.withValues(alpha: 0.3),
+              child: InkWell(
+                onTap: () => setState(() {
+                  _selectedDepartmentId = id;
+                  _selectedLinenType = dept['type'] as String;
+                }),
+                borderRadius: AppRadius.smallBR,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.base,
+                    vertical: AppSpacing.md,
+                  ),
+                  decoration: BoxDecoration(
+                    borderRadius: AppRadius.smallBR,
+                    border: Border.all(
+                      color: selected ? AppColors.gold : AppColors.grey300,
+                      width: selected ? 2 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(icon, size: AppSizes.iconSizeMd,
+                          color: selected ? AppColors.navy : AppColors.grey500),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Text(
+                          name,
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: AppTextStyles.labelSize,
+                            fontWeight: selected ? AppTextStyles.bold : AppTextStyles.regular,
+                            color: selected ? AppColors.navy : AppColors.grey700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }),
+      ],
+    );
   }
 
   Widget _buildNextButton() {
@@ -498,6 +583,155 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     );
   }
 
+  bool _emailExpanded = false;
+
+  Widget _buildCollapsibleEmail() {
+    return Material(
+      color: AppColors.white,
+      borderRadius: AppRadius.mediumBR,
+      child: Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: _emailExpanded ? AppColors.navy : AppColors.grey300),
+          borderRadius: AppRadius.mediumBR,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            InkWell(
+              onTap: () => setState(() => _emailExpanded = !_emailExpanded),
+              borderRadius: _emailExpanded
+                  ? BorderRadius.vertical(top: Radius.circular(AppRadius.md))
+                  : AppRadius.mediumBR,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
+                child: Row(
+                  children: [
+                    Icon(Icons.email_outlined, color: AppColors.grey600, size: AppSizes.iconSizeMd),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Text(
+                        _emailExpanded ? 'Email' : 'Add email (optional)',
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: AppTextStyles.bodySize,
+                          color: _emailExpanded ? AppColors.navy : AppColors.grey500,
+                          fontWeight: _emailExpanded ? AppTextStyles.medium : AppTextStyles.regular,
+                        ),
+                      ),
+                    ),
+                    Icon(
+                      _emailExpanded ? Icons.expand_less : Icons.expand_more,
+                      color: AppColors.grey500,
+                      size: AppSizes.iconSizeMd,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_emailExpanded) ...[
+              Divider(height: 1, color: AppColors.grey200),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(AppSpacing.md, 0, AppSpacing.md, AppSpacing.md),
+                child: TextFormField(
+                  controller: _emailController,
+                  keyboardType: TextInputType.emailAddress,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  autofillHints: const [],
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    hintText: 'For order status updates',
+                    border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
+                    contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.sm),
+                  ),
+                  validator: (v) {
+                    if (v == null || v.trim().isEmpty) return null;
+                    final emailRegex = RegExp(r'^[\w\.\-\+]+@[\w\.\-]+\.\w{2,}$');
+                    if (!emailRegex.hasMatch(v.trim())) return 'Please enter a valid email';
+                    return null;
+                  },
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCollapsibleNotes() {
+    return Material(
+      color: AppColors.white,
+      borderRadius: AppRadius.mediumBR,
+      child: InkWell(
+        onTap: _notesExpanded ? null : () => setState(() => _notesExpanded = true),
+        borderRadius: AppRadius.mediumBR,
+        child: Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: _notesExpanded ? AppColors.navy : AppColors.grey300),
+            borderRadius: AppRadius.mediumBR,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              InkWell(
+                onTap: () => setState(() => _notesExpanded = !_notesExpanded),
+                borderRadius: _notesExpanded
+                    ? BorderRadius.vertical(top: Radius.circular(AppRadius.md))
+                    : AppRadius.mediumBR,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
+                  child: Row(
+                    children: [
+                      Icon(Icons.notes, color: AppColors.grey600, size: AppSizes.iconSizeMd),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Text(
+                          _notesExpanded ? 'Notes' : 'Add notes (optional)',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: AppTextStyles.bodySize,
+                            color: _notesExpanded ? AppColors.navy : AppColors.grey500,
+                            fontWeight: _notesExpanded ? AppTextStyles.medium : AppTextStyles.regular,
+                          ),
+                        ),
+                      ),
+                      Icon(
+                        _notesExpanded ? Icons.expand_less : Icons.expand_more,
+                        color: AppColors.grey500,
+                        size: AppSizes.iconSizeMd,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (_notesExpanded) ...[
+                Divider(height: 1, color: AppColors.grey200),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(AppSpacing.md, 0, AppSpacing.md, AppSpacing.md),
+                  child: TextFormField(
+                    controller: _notesController,
+                    maxLines: 3,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'e.g. special instructions',
+                      border: InputBorder.none,
+                      enabledBorder: InputBorder.none,
+                      focusedBorder: InputBorder.none,
+                      contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.sm),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildSectionLabel(String text) {
     return Text(
       text,
@@ -510,67 +744,3 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
   }
 }
 
-class _LinenTypeOption extends StatelessWidget {
-  final String label;
-  final String subtitle;
-  final IconData icon;
-  final bool selected;
-  final VoidCallback onTap;
-
-  const _LinenTypeOption({
-    required this.label,
-    required this.subtitle,
-    required this.icon,
-    required this.selected,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: selected ? AppColors.navy.withValues(alpha: 0.08) : AppColors.white,
-      borderRadius: AppRadius.mediumBR,
-      elevation: selected ? 2 : 1,
-      shadowColor: AppColors.navy.withValues(alpha: 0.1),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: AppRadius.mediumBR,
-        child: Container(
-          padding: const EdgeInsets.symmetric(
-            vertical: AppSpacing.base,
-            horizontal: AppSpacing.md,
-          ),
-          decoration: BoxDecoration(
-            borderRadius: AppRadius.mediumBR,
-            border: Border.all(
-              color: selected ? AppColors.navy : AppColors.grey300,
-              width: selected ? 2 : 1,
-            ),
-          ),
-          child: Column(
-            children: [
-              Icon(icon, color: selected ? AppColors.navy : AppColors.grey600, size: 34),
-              const SizedBox(height: AppSpacing.sm),
-              Text(
-                label,
-                style: TextStyle(fontFamily: 'Inter',
-                  fontWeight: AppTextStyles.medium,
-                  color: selected ? AppColors.navy : AppColors.grey700,
-                  fontSize: AppTextStyles.bodySize,
-                ),
-              ),
-              Text(
-                subtitle,
-                style: TextStyle(fontFamily: 'Inter',
-                  color: AppColors.grey600,
-                  fontSize: AppTextStyles.labelSize,
-                ),
-                textAlign: TextAlign.center,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}

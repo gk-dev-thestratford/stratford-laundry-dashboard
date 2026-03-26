@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -7,6 +8,7 @@ import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
+import '../../services/sync_service.dart';
 
 class AdminOrderDetailScreen extends ConsumerStatefulWidget {
   final String orderId;
@@ -85,6 +87,11 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       'created_at': DateTime.now().toIso8601String(),
     });
 
+    // Queue for Supabase sync
+    await db.addToSyncQueue('orders', widget.orderId, 'update',
+        jsonEncode({'id': widget.orderId, 'status': newStatus}));
+    SyncService.instance.pushPendingNow();
+
     await _loadOrder();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -154,9 +161,10 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     // Save received quantities on original order
     await db.updateReceivedQuantities(widget.orderId, received);
 
+    String? newOrderId;
     if (hasOutstanding) {
       // Create new ticket with outstanding quantities
-      final newOrderId = await db.createOutstandingOrder(
+      newOrderId = await db.createOutstandingOrder(
         originalOrderId: widget.orderId,
         receivedQuantities: received,
       );
@@ -196,6 +204,18 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     // Mark original as completed
     await db.updateOrderStatus(widget.orderId, AppConstants.statusCompleted);
+
+    // Queue for Supabase sync
+    await db.addToSyncQueue('orders', widget.orderId, 'update',
+        jsonEncode({'id': widget.orderId, 'status': AppConstants.statusCompleted}));
+    if (hasOutstanding && newOrderId != null) {
+      final outstandingOrder = await db.getOrder(newOrderId);
+      if (outstandingOrder != null) {
+        await db.addToSyncQueue('orders', newOrderId, 'insert',
+            jsonEncode(outstandingOrder));
+      }
+    }
+    SyncService.instance.pushPendingNow();
 
     await _loadOrder();
     if (mounted) {
@@ -493,6 +513,12 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
         actions.add(_actionButton('Mark In Processing', Icons.settings, AppColors.statusInProcessing, () => _confirmAction('Mark as In Processing', AppConstants.statusInProcessing)));
       case AppConstants.statusInProcessing:
         actions.add(_actionButton('Receive Items', Icons.inventory, AppColors.statusReceived, _receiveItems));
+      case AppConstants.statusRejected:
+        actions.addAll([
+          _actionButton('Reinstate', Icons.undo_rounded, AppColors.statusSubmitted, () => _confirmAction('Reinstate to Pending', AppConstants.statusSubmitted)),
+          SizedBox(width: AppSpacing.md),
+          _actionButton('Delete Order', Icons.delete_forever, AppColors.error, _confirmDelete),
+        ]);
     }
 
     if (actions.isEmpty) return const SizedBox.shrink();
@@ -547,6 +573,38 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     );
     if (confirmed == true) {
       await _changeStatus(newStatus);
+    }
+  }
+
+  Future<void> _confirmDelete() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Order?'),
+        content: const Text('This will permanently delete this order and all its items. This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      final db = DatabaseService.instance;
+      await db.deleteOrder(widget.orderId);
+      // Queue delete for Supabase sync
+      await db.addToSyncQueue('orders', widget.orderId, 'delete',
+          jsonEncode({'id': widget.orderId}));
+      SyncService.instance.pushPendingNow();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Order deleted')),
+        );
+        context.pop();
+      }
     }
   }
 

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -7,6 +8,8 @@ import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
+import '../../services/sync_service.dart';
+import '../../widgets/sync_indicator.dart';
 
 class AdminDashboardScreen extends ConsumerStatefulWidget {
   const AdminDashboardScreen({super.key});
@@ -27,14 +30,22 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   String? _allTabDateFilter;
   String? _allTabTypeFilter;
 
-  static const _tabs = ['Pending', 'Approved', 'In Progress', 'Rejected', 'Completed', 'All'];
+  // Tab indices — use these constants instead of hardcoded numbers
+  static const _kPending = 0;
+  static const _kApproved = 1;
+  static const _kInProgress = 2;
+  static const _kCompleted = 3;
+  static const _kAll = 4;
+  static const _kRejected = 5;
+
+  static const _tabs = ['Pending', 'Approved', 'In Progress', 'Completed', 'All', 'Rejected'];
   static const _statusFilters = [
     AppConstants.statusSubmitted,
     AppConstants.statusApproved,
     null, // In Progress = collected + in_processing
-    AppConstants.statusRejected,
     AppConstants.statusCompleted,
     null, // All
+    AppConstants.statusRejected,
   ];
 
   @override
@@ -82,12 +93,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final tabIndex = _tabController.index;
     List<Map<String, dynamic>> orders;
 
-    if (tabIndex == 2) {
+    if (tabIndex == _kInProgress) {
       // In Progress = collected + in_processing
       final c = await DatabaseService.instance.getOrders(status: AppConstants.statusCollected, searchQuery: _searchQuery);
       final p = await DatabaseService.instance.getOrders(status: AppConstants.statusInProcessing, searchQuery: _searchQuery);
       orders = [...c, ...p];
-    } else if (tabIndex == 5) {
+    } else if (tabIndex == _kAll) {
       // All tab: search-first — only load when search or filters are active
       final hasFilters = _searchQuery.isNotEmpty || _allTabDateFilter != null || _allTabTypeFilter != null;
       if (!hasFilters) {
@@ -117,7 +128,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Load item summaries for In Progress tab
     Map<String, String> summaries = {};
-    if (tabIndex == 2 && orders.isNotEmpty) {
+    if (tabIndex == _kInProgress && orders.isNotEmpty) {
       summaries = await DatabaseService.instance.getOrderItemSummaries(
         orders.map((o) => o['id'] as String).toList(),
       );
@@ -125,7 +136,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Load partial receipt order IDs for Completed / All tabs
     Set<String> partialIds = {};
-    if (tabIndex == 4 || tabIndex == 5) {
+    if (tabIndex == _kCompleted || tabIndex == _kAll) {
       partialIds = await DatabaseService.instance.getPartialReceiptOrderIds();
     }
 
@@ -144,10 +155,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     context.go('/');
   }
 
-  bool get _isPendingTab => _tabController.index == 0;
-  bool get _isApprovedTab => _tabController.index == 1;
-  bool get _isInProgressTab => _tabController.index == 2;
-  bool get _isCompletedTab => _tabController.index == 4;
+  bool get _isPendingTab => _tabController.index == _kPending;
+  bool get _isApprovedTab => _tabController.index == _kApproved;
+  bool get _isInProgressTab => _tabController.index == _kInProgress;
+  bool get _isCompletedTab => _tabController.index == _kCompleted;
+  bool get _isRejectedTab => _tabController.index == _kRejected;
 
   Future<void> _quickAction(String orderId, String newStatus, {String? reason}) async {
     final admin = ref.read(adminProvider).currentAdmin;
@@ -163,6 +175,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'reason': reason,
       'created_at': DateTime.now().toIso8601String(),
     });
+
+    // Queue status change for Supabase sync
+    await db.addToSyncQueue('orders', orderId, 'update',
+        jsonEncode({'id': orderId, 'status': newStatus}));
+    SyncService.instance.pushPendingNow();
 
     await _loadData();
     if (mounted) {
@@ -248,7 +265,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         'changed_by_name': admin?.name,
         'created_at': DateTime.now().toIso8601String(),
       });
+      // Queue each status change for Supabase sync
+      await db.addToSyncQueue('orders', orderId, 'update',
+          jsonEncode({'id': orderId, 'status': AppConstants.statusCollected}));
     }
+    SyncService.instance.pushPendingNow();
 
     _selectedOrderIds.clear();
     await _loadData();
@@ -285,7 +306,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     await _quickAction(orderId, AppConstants.statusPickedUp);
   }
 
-  bool get _isAllTab => _tabController.index == 5;
+  bool get _isAllTab => _tabController.index == _kAll;
   bool get _allTabHasFilters =>
       _searchQuery.isNotEmpty || _allTabDateFilter != null || _allTabTypeFilter != null;
 
@@ -371,8 +392,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     // Save received quantities
     await db.updateReceivedQuantities(orderId, result);
 
+    String? newOrderId;
     if (hasOutstanding) {
-      final newOrderId = await db.createOutstandingOrder(
+      newOrderId = await db.createOutstandingOrder(
         originalOrderId: orderId,
         receivedQuantities: result,
       );
@@ -407,6 +429,20 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     }
 
     await db.updateOrderStatus(orderId, AppConstants.statusCompleted);
+
+    // Queue completion for sync
+    await db.addToSyncQueue('orders', orderId, 'update',
+        jsonEncode({'id': orderId, 'status': AppConstants.statusCompleted}));
+    if (hasOutstanding && newOrderId != null) {
+      // Queue the new outstanding order for sync
+      final outstandingOrder = await db.getOrder(newOrderId);
+      if (outstandingOrder != null) {
+        await db.addToSyncQueue('orders', newOrderId, 'insert',
+            jsonEncode(outstandingOrder));
+      }
+    }
+    SyncService.instance.pushPendingNow();
+
     await _loadData();
 
     if (mounted) {
@@ -457,6 +493,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         ),
         centerTitle: true,
         actions: [
+          const SyncIndicator(),
+          const SizedBox(width: AppSpacing.sm),
           IconButton(
             icon: const Icon(Icons.refresh_rounded, color: AppColors.white, size: 26),
             onPressed: _loadData,
@@ -469,19 +507,39 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         ],
         elevation: 2,
         shadowColor: AppColors.navyDark.withValues(alpha: 0.3),
-        bottom: TabBar(
-          controller: _tabController,
-          isScrollable: true,
-          indicatorColor: AppColors.gold,
-          indicatorWeight: 3,
-          labelColor: AppColors.white,
-          unselectedLabelColor: AppColors.white.withValues(alpha: 0.6),
-          labelStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.medium),
-          unselectedLabelStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.regular),
-          tabs: _tabs.map((t) {
-            final count = _getTabCount(t);
-            return Tab(text: count > 0 ? '$t ($count)' : t);
-          }).toList(),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(52),
+          child: Container(
+            color: AppColors.navyDark,
+            child: TabBar(
+              controller: _tabController,
+              isScrollable: true,
+              indicatorColor: AppColors.gold,
+              indicatorWeight: 4,
+              indicatorSize: TabBarIndicatorSize.tab,
+              dividerColor: Colors.transparent,
+              labelColor: AppColors.gold,
+              unselectedLabelColor: AppColors.white.withValues(alpha: 0.55),
+              labelStyle: TextStyle(fontFamily: 'Inter', fontSize: 17, fontWeight: AppTextStyles.bold),
+              unselectedLabelStyle: TextStyle(fontFamily: 'Inter', fontSize: 16, fontWeight: AppTextStyles.regular),
+              labelPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+              tabs: _tabs.asMap().entries.map((entry) {
+                final t = entry.value;
+                final count = _getTabCount(t);
+                // Add extra spacing before Rejected (last tab) to push it right
+                final isRejected = t == 'Rejected';
+                return Tab(
+                  height: 48,
+                  child: Row(
+                    children: [
+                      if (isRejected) const SizedBox(width: 40),
+                      Text(count > 0 ? '$t ($count)' : t),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
         ),
       ),
       body: Column(
@@ -640,7 +698,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       showActions: _isPendingTab,
       showCheckbox: _isApprovedTab,
       isSelected: _selectedOrderIds.contains(orderId),
-      showReturnToPending: _isApprovedTab,
+      showReturnToPending: _isApprovedTab || _isRejectedTab,
       showReceiveAction: _isInProgressTab,
       showCollectedAction: _isCompletedTab,
       onTap: () {
@@ -676,8 +734,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'Pending' => _counts[AppConstants.statusSubmitted] ?? 0,
       'Approved' => _counts[AppConstants.statusApproved] ?? 0,
       'In Progress' => (_counts[AppConstants.statusCollected] ?? 0) + (_counts[AppConstants.statusInProcessing] ?? 0),
-      'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       'Completed' => _counts[AppConstants.statusCompleted] ?? 0,
+      'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       _ => _counts.values.fold(0, (a, b) => a + b),
     };
   }

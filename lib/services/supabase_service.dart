@@ -37,7 +37,7 @@ class SupabaseService {
 
   Future<void> pushStatusLog(Map<String, dynamic> log) async {
     if (!isInitialized) return;
-    await _client!.from('order_status_log').insert(log);
+    await _client!.from('order_status_log').upsert(log);
   }
 
   Future<List<Map<String, dynamic>>> fetchOrders({DateTime? since}) async {

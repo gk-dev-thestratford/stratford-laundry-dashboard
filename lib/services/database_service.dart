@@ -554,4 +554,63 @@ class DatabaseService {
     await batch.commit(noResult: true);
     return orders.length;
   }
+
+  // ── Data Cleanup ──
+
+  /// Permanently delete expired orders older than [daysAfterExpiry] days.
+  /// ON DELETE CASCADE handles order_items and order_status_log.
+  Future<int> purgeExpiredOrders({int daysAfterExpiry = 30}) async {
+    final db = await database;
+    final cutoff = DateTime.now().subtract(Duration(days: daysAfterExpiry)).toIso8601String();
+
+    final expired = await db.query('orders',
+      columns: ['id'],
+      where: "status = 'expired' AND updated_at < ?",
+      whereArgs: [cutoff],
+    );
+
+    if (expired.isEmpty) return 0;
+
+    for (final order in expired) {
+      final id = order['id'] as String;
+      await db.delete('order_status_log', where: 'order_id = ?', whereArgs: [id]);
+      await db.delete('order_items', where: 'order_id = ?', whereArgs: [id]);
+      await db.delete('orders', where: 'id = ?', whereArgs: [id]);
+    }
+
+    return expired.length;
+  }
+
+  /// Remove sync queue entries that have already been synced and are older than [days] days.
+  Future<int> cleanSyncQueue({int days = 7}) async {
+    final db = await database;
+    final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
+
+    return db.delete(
+      'sync_queue',
+      where: 'synced = 1 AND created_at < ?',
+      whereArgs: [cutoff],
+    );
+  }
+
+  /// Returns counts of data that can be cleaned up for display in admin UI.
+  Future<Map<String, int>> getCleanupStats() async {
+    final db = await database;
+    final cutoffExpired = DateTime.now().subtract(const Duration(days: 30)).toIso8601String();
+    final cutoffSync = DateTime.now().subtract(const Duration(days: 7)).toIso8601String();
+
+    final expiredResult = await db.rawQuery(
+      "SELECT COUNT(*) as count FROM orders WHERE status = 'expired' AND updated_at < ?",
+      [cutoffExpired],
+    );
+    final syncResult = await db.rawQuery(
+      "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 1 AND created_at < ?",
+      [cutoffSync],
+    );
+
+    return {
+      'expired_orders': (expiredResult.first['count'] as int?) ?? 0,
+      'old_sync_entries': (syncResult.first['count'] as int?) ?? 0,
+    };
+  }
 }
