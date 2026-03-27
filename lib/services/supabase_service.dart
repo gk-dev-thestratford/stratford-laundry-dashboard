@@ -76,6 +76,6 @@ class SupabaseService {
 
   Future<List<Map<String, dynamic>>> fetchAdminUsers() async {
     if (!isInitialized) return [];
-    return await _client!.from('admin_users').select('id, name, pin_hash, is_active');
+    return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders');
   }
 }

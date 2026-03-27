@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/admin_user.dart';
 import '../services/database_service.dart';
+import '../services/supabase_service.dart';
 
 class AdminState {
   final AdminUser? currentAdmin;
@@ -41,11 +42,28 @@ class AdminNotifier extends StateNotifier<AdminState> {
     return rows.map((r) => AdminUser.fromMap(r)).toList();
   }
 
-  Future<bool> login(String adminId, String adminName, String pin) async {
+  Future<bool> login(String adminId, String adminName, String pin, {bool canDeleteOrders = false}) async {
     final valid = await DatabaseService.instance.verifyPin(adminId, pin);
     if (valid) {
+      // Try to fetch fresh permission from Supabase (with timeout so login isn't blocked)
+      bool deletePermission = canDeleteOrders;
+      try {
+        final remoteAdmins = await SupabaseService.instance
+            .fetchAdminUsers()
+            .timeout(const Duration(seconds: 3));
+        final match = remoteAdmins.where((a) => a['id'] == adminId).toList();
+        if (match.isNotEmpty) {
+          deletePermission = match.first['can_delete_orders'] == true;
+          // Successfully fetched fresh permission
+          // Also update local DB while we have fresh data
+          await DatabaseService.instance.syncAdminUsers(remoteAdmins);
+        }
+      } catch (e) {
+        // Supabase unavailable, fall back to local value
+      }
+
       state = AdminState(
-        currentAdmin: AdminUser(id: adminId, name: adminName),
+        currentAdmin: AdminUser(id: adminId, name: adminName, canDeleteOrders: deletePermission),
         isAuthenticated: true,
         lastActivity: DateTime.now(),
       );

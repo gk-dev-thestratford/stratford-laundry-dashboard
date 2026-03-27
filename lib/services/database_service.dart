@@ -21,7 +21,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 2,
+      version: 3,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -30,6 +30,9 @@ class DatabaseService {
   Future<void> _upgradeTables(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
       await db.execute('ALTER TABLE orders ADD COLUMN parent_order_id TEXT');
+    }
+    if (oldVersion < 3) {
+      await db.execute('ALTER TABLE admin_users ADD COLUMN can_delete_orders INTEGER NOT NULL DEFAULT 0');
     }
   }
 
@@ -63,7 +66,8 @@ class DatabaseService {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         pin_hash TEXT NOT NULL,
-        is_active INTEGER NOT NULL DEFAULT 1
+        is_active INTEGER NOT NULL DEFAULT 1,
+        can_delete_orders INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -441,6 +445,7 @@ class DatabaseService {
           'name': admin['name'],
           'pin_hash': admin['pin_hash'],
           'is_active': admin['is_active'] == true ? 1 : 0,
+          'can_delete_orders': admin['can_delete_orders'] == true ? 1 : 0,
         });
       }
     });

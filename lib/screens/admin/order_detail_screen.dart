@@ -8,6 +8,7 @@ import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
+import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
 
 class AdminOrderDetailScreen extends ConsumerStatefulWidget {
@@ -24,6 +25,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
   List<Map<String, dynamic>> _items = [];
   List<Map<String, dynamic>> _statusLog = [];
   bool _isLoading = true;
+  bool _canDelete = false;
   final _reasonController = TextEditingController();
 
   // For received quantities
@@ -36,6 +38,34 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       ref.read(adminProvider.notifier).refreshActivity();
     });
     _loadOrder();
+    _checkDeletePermission();
+  }
+
+  Future<void> _checkDeletePermission() async {
+    final adminId = ref.read(adminProvider).currentAdmin?.id;
+    if (adminId == null) return;
+
+    // First check local
+    final localAdmin = ref.read(adminProvider).currentAdmin;
+    if (localAdmin?.canDeleteOrders == true) {
+      setState(() => _canDelete = true);
+      return;
+    }
+
+    // Try Supabase directly
+    try {
+      final remoteAdmins = await SupabaseService.instance
+          .fetchAdminUsers()
+          .timeout(const Duration(seconds: 5));
+      final match = remoteAdmins.where((a) => a['id'] == adminId).toList();
+      if (match.isNotEmpty && match.first['can_delete_orders'] == true) {
+        if (mounted) setState(() => _canDelete = true);
+      }
+      // Update local DB with fresh data
+      await DatabaseService.instance.syncAdminUsers(remoteAdmins);
+    } catch (e) {
+      // Supabase unavailable, fall back to local/provider value
+    }
   }
 
   @override
@@ -514,11 +544,15 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       case AppConstants.statusInProcessing:
         actions.add(_actionButton('Receive Items', Icons.inventory, AppColors.statusReceived, _receiveItems));
       case AppConstants.statusRejected:
-        actions.addAll([
+        actions.add(
           _actionButton('Reinstate', Icons.undo_rounded, AppColors.statusSubmitted, () => _confirmAction('Reinstate to Pending', AppConstants.statusSubmitted)),
-          SizedBox(width: AppSpacing.md),
-          _actionButton('Delete Order', Icons.delete_forever, AppColors.error, _confirmDelete),
-        ]);
+        );
+        if (_canDelete) {
+          actions.addAll([
+            SizedBox(width: AppSpacing.md),
+            _actionButton('Delete Order', Icons.delete_forever, AppColors.error, _confirmDelete),
+          ]);
+        }
     }
 
     if (actions.isEmpty) return const SizedBox.shrink();

@@ -32,6 +32,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
   List<AdminUser> _admins = [];
   String? _selectedAdminId;
   String? _selectedAdminName;
+  bool _selectedCanDelete = false;
   Color _selectedAdminColor = _adminColors[0];
   String _pin = '';
   bool _isLoading = true;
@@ -90,6 +91,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
       _selectedAdminId!,
       _selectedAdminName!,
       _pin,
+      canDeleteOrders: _selectedCanDelete,
     );
     if (success) {
       if (mounted) context.go('/admin/dashboard');
@@ -175,6 +177,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
               onTap: () => setState(() {
                 _selectedAdminId = admin.id;
                 _selectedAdminName = admin.name;
+                _selectedCanDelete = admin.canDeleteOrders;
                 _selectedAdminColor = color;
                 _pin = '';
                 _error = null;
