@@ -19,7 +19,10 @@ class AppConstants {
   static const String statusPickedUp = 'picked_up';
   static const String statusExpired = 'expired';
 
-  // Completed order auto-expiry
+  // Completed order auto-collect (mark as picked_up after N days)
+  static const int autoCollectDays = 21;
+
+  // Completed order auto-expiry (archive after N days)
   static const int completedExpiryDays = 20;
   static const int completedExpiryWarningDays = 5;
 

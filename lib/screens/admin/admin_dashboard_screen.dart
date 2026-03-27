@@ -56,11 +56,21 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(adminProvider.notifier).refreshActivity();
     });
+    // Pull latest reference data from Supabase on screen open
+    SyncService.instance.fullSync();
     _loadData();
+    // Re-sync when app returns to foreground
+    WidgetsBinding.instance.addObserver(_lifecycleObserver);
   }
+
+  late final _lifecycleObserver = _AppLifecycleObserver(onResume: () {
+    SyncService.instance.fullSync();
+    _loadData();
+  });
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(_lifecycleObserver);
     _tabController.dispose();
     super.dispose();
   }
@@ -76,6 +86,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   }
 
   Future<void> _loadData() async {
+    await DatabaseService.instance.autoCollectCompletedOrders(
+      days: AppConstants.autoCollectDays,
+    );
     await DatabaseService.instance.autoExpireCompletedOrders(
       days: AppConstants.completedExpiryDays,
     );
@@ -136,7 +149,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Load partial receipt order IDs for Completed / All tabs
     Set<String> partialIds = {};
-    if (tabIndex == _kCompleted || tabIndex == _kAll) {
+    if (tabIndex == _kCompleted || tabIndex == _kAll || tabIndex == _kInProgress) {
       partialIds = await DatabaseService.instance.getPartialReceiptOrderIds();
     }
 
@@ -516,10 +529,6 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                         const SyncIndicator(),
                         const SizedBox(width: AppSpacing.xs),
                         IconButton(
-                          icon: const Icon(Icons.refresh_rounded, color: AppColors.white, size: 24),
-                          onPressed: _loadData,
-                        ),
-                        IconButton(
                           icon: const Icon(Icons.logout_rounded, color: AppColors.white, size: 24),
                           onPressed: _logout,
                           tooltip: 'Logout',
@@ -718,7 +727,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                   SizedBox(width: AppSpacing.sm),
                   Text(
                     _selectedOrderIds.isEmpty
-                        ? 'Select All'
+                        ? 'Select All for Collected'
                         : '${_selectedOrderIds.length} selected',
                     style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: AppColors.grey700),
                   ),
@@ -975,15 +984,25 @@ class _OrderCard extends StatelessWidget {
                         ),
                         if (isOutstanding) ...[
                           SizedBox(width: AppSpacing.sm),
-                          Container(
-                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
-                            decoration: BoxDecoration(
-                              color: AppColors.error.withValues(alpha: 0.12),
-                              borderRadius: AppRadius.smallBR,
-                            ),
-                            child: Text('Outstanding',
-                                style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.bold, color: AppColors.error)),
-                          ),
+                          () {
+                            final isResolved = status == AppConstants.statusCompleted ||
+                                status == AppConstants.statusPickedUp ||
+                                status == AppConstants.statusExpired;
+                            return Container(
+                              padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                              decoration: BoxDecoration(
+                                color: isResolved
+                                    ? AppColors.success.withValues(alpha: 0.12)
+                                    : AppColors.error.withValues(alpha: 0.12),
+                                borderRadius: AppRadius.smallBR,
+                              ),
+                              child: Text(
+                                isResolved ? 'Outstanding Resolved' : 'Outstanding',
+                                style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.bold,
+                                    color: isResolved ? AppColors.success : AppColors.error),
+                              ),
+                            );
+                          }(),
                         ],
                       ],
                     ),
@@ -1003,6 +1022,28 @@ class _OrderCard extends StatelessWidget {
                       Text(itemSummary!,
                           style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.navy.withValues(alpha: 0.7)),
                           overflow: TextOverflow.ellipsis, maxLines: 1),
+                    // Return to Pending button — inside card content
+                    if (showReturnToPending) ...[
+                      SizedBox(height: AppSpacing.sm),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: SizedBox(
+                          height: 36,
+                          child: OutlinedButton.icon(
+                            onPressed: onReturnToPending,
+                            icon: Icon(Icons.undo_rounded, size: 16),
+                            label: const Text('Return to Pending'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppColors.statusSubmitted,
+                              side: BorderSide(color: AppColors.statusSubmitted.withValues(alpha: 0.5)),
+                              padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                              textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium),
+                              shape: RoundedRectangleBorder(borderRadius: AppRadius.largeBR),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1041,22 +1082,6 @@ class _OrderCard extends StatelessWidget {
                   ),
                 ),
               ] else if (showReturnToPending) ...[
-                SizedBox(
-                  height: AppSizes.buttonHeightSm,
-                  child: OutlinedButton.icon(
-                    onPressed: onReturnToPending,
-                    icon: Icon(Icons.undo_rounded, size: AppSizes.iconSizeSm),
-                    label: const Text('Return'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: AppColors.statusSubmitted,
-                      side: BorderSide(color: AppColors.statusSubmitted),
-                      padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                      textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
-                      shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
-                    ),
-                  ),
-                ),
-                SizedBox(width: AppSpacing.sm),
                 Container(
                   padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
                   decoration: BoxDecoration(
@@ -1317,5 +1342,18 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
         ),
       ],
     );
+  }
+}
+
+/// Observes app lifecycle to trigger sync when returning to foreground.
+class _AppLifecycleObserver extends WidgetsBindingObserver {
+  final VoidCallback onResume;
+  _AppLifecycleObserver({required this.onResume});
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      onResume();
+    }
   }
 }

@@ -560,6 +560,54 @@ class DatabaseService {
     return orders.length;
   }
 
+  /// Auto-collects completed orders older than [days] days.
+  /// Marks them as picked_up with a system status log.
+  Future<int> autoCollectCompletedOrders({int days = 21}) async {
+    final db = await database;
+    final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
+    final now = DateTime.now().toIso8601String();
+
+    final orders = await db.query('orders',
+      where: "status = 'completed' AND updated_at < ?",
+      whereArgs: [cutoff],
+    );
+
+    if (orders.isEmpty) return 0;
+
+    final uuid = const Uuid();
+    final batch = db.batch();
+    for (final order in orders) {
+      final orderId = order['id'] as String;
+      batch.update(
+        'orders',
+        {'status': 'picked_up', 'updated_at': now},
+        where: 'id = ?',
+        whereArgs: [orderId],
+      );
+      batch.insert('order_status_log', {
+        'id': uuid.v4(),
+        'order_id': orderId,
+        'status': 'picked_up',
+        'changed_by_name': 'System',
+        'reason': 'Automatic Rule — Collected after $days days',
+        'created_at': now,
+      });
+    }
+    await batch.commit(noResult: true);
+    return orders.length;
+  }
+
+  /// Returns a set of parent order IDs where the outstanding (child) order
+  /// has been completed/received, meaning the outstanding is resolved.
+  Future<Set<String>> getResolvedOutstandingOrderIds() async {
+    final db = await database;
+    final result = await db.rawQuery(
+      "SELECT DISTINCT parent_order_id FROM orders "
+      "WHERE parent_order_id IS NOT NULL AND status IN ('completed', 'picked_up', 'expired')",
+    );
+    return result.map((r) => r['parent_order_id'] as String).toSet();
+  }
+
   // ── Data Cleanup ──
 
   /// Permanently delete expired orders older than [daysAfterExpiry] days.

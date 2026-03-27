@@ -68,6 +68,12 @@ class SyncService {
     _pushPending();
   }
 
+  /// Force a full sync — pull reference data + push pending items.
+  /// Can be called from UI (e.g. refresh button).
+  Future<void> fullSync() async {
+    return _fullSync();
+  }
+
   /// Full sync: pull reference data + push pending items.
   /// Called on connectivity restore and on first initialize.
   Future<void> _fullSync() async {
@@ -105,6 +111,7 @@ class SyncService {
     if (_lastCleanup == null || now.difference(_lastCleanup!) > const Duration(hours: 1)) {
       _lastCleanup = now;
       try {
+        await DatabaseService.instance.autoCollectCompletedOrders(days: 21);
         await DatabaseService.instance.autoExpireCompletedOrders(days: 20);
         await DatabaseService.instance.purgeExpiredOrders(daysAfterExpiry: 30);
         await DatabaseService.instance.cleanSyncQueue(days: 7);
@@ -120,27 +127,36 @@ class SyncService {
 
     try {
       final remoteDepts = await SupabaseService.instance.fetchDepartments();
+      debugPrint('[Sync] Pulled ${remoteDepts.length} departments');
       if (remoteDepts.isNotEmpty) {
         await DatabaseService.instance.syncDepartments(remoteDepts);
         didSync = true;
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync departments: $e');
+    }
 
     try {
       final remoteItems = await SupabaseService.instance.fetchCatalogueItems();
+      debugPrint('[Sync] Pulled ${remoteItems.length} catalogue items');
       if (remoteItems.isNotEmpty) {
         await DatabaseService.instance.syncCatalogueItems(remoteItems);
         didSync = true;
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync catalogue items: $e');
+    }
 
     try {
       final remoteAdmins = await SupabaseService.instance.fetchAdminUsers();
+      debugPrint('[Sync] Pulled ${remoteAdmins.length} admin users');
       if (remoteAdmins.isNotEmpty) {
         await DatabaseService.instance.syncAdminUsers(remoteAdmins);
         didSync = true;
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync admin users: $e');
+    }
 
     _lastRefPull = DateTime.now();
 
