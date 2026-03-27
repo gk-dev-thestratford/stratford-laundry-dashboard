@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Package, Building2, Plus, Pencil, Trash2, Save, X } from 'lucide-react'
+import { Package, Building2, Plus, Pencil, Trash2, Save, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import type { CatalogueItem, Department } from '../types'
 
@@ -22,7 +22,7 @@ interface ItemForm {
   name: string
   category: string
   price: string
-  department_id: string
+  department_ids: string[]
   sort_order: string
 }
 
@@ -33,7 +33,7 @@ interface DeptForm {
   has_linen_items: boolean
 }
 
-const emptyItemForm: ItemForm = { code: '', name: '', category: 'uniform', price: '', department_id: '', sort_order: '0' }
+const emptyItemForm: ItemForm = { code: '', name: '', category: 'uniform', price: '', department_ids: [], sort_order: '0' }
 const emptyDeptForm: DeptForm = { code: '', name: '', can_submit_uniforms: true, has_linen_items: false }
 
 export default function Catalogue() {
@@ -44,10 +44,13 @@ export default function Catalogue() {
   const [departments, setDepartments] = useState<Department[]>([])
   const [loadingItems, setLoadingItems] = useState(true)
   const [loadingDepts, setLoadingDepts] = useState(true)
-  const [showItemForm, setShowItemForm] = useState(false)
   const [editingItemId, setEditingItemId] = useState<string | null>(null)
+  const [addingItem, setAddingItem] = useState(false)
   const [itemForm, setItemForm] = useState<ItemForm>(emptyItemForm)
   const [savingItem, setSavingItem] = useState(false)
+
+  // Multi-department mapping: item_id -> department_id[]
+  const [itemDeptMap, setItemDeptMap] = useState<Record<string, string[]>>({})
 
   // Departments state
   const [showDeptForm, setShowDeptForm] = useState(false)
@@ -75,6 +78,20 @@ export default function Catalogue() {
     setLoadingItems(false)
   }, [])
 
+  const fetchItemDeptMap = useCallback(async () => {
+    const { data } = await supabase
+      .from('item_department_access')
+      .select('item_id, department_id')
+    if (data) {
+      const map: Record<string, string[]> = {}
+      for (const row of data) {
+        if (!map[row.item_id]) map[row.item_id] = []
+        map[row.item_id].push(row.department_id)
+      }
+      setItemDeptMap(map)
+    }
+  }, [])
+
   const fetchDepartments = useCallback(async () => {
     setLoadingDepts(true)
     const { data } = await supabase
@@ -88,39 +105,62 @@ export default function Catalogue() {
   useEffect(() => {
     fetchItems()
     fetchDepartments()
-  }, [fetchItems, fetchDepartments])
+    fetchItemDeptMap()
+  }, [fetchItems, fetchDepartments, fetchItemDeptMap])
 
   function clearNotifications() {
     setError('')
     setSuccess('')
   }
 
+  // ── Helpers ──
+  function getDeptNames(itemId: string, fallbackDeptId: string | null): string {
+    const deptIds = itemDeptMap[itemId]
+    if (deptIds && deptIds.length > 0) {
+      return deptIds.map((id) => departments.find((d) => d.id === id)?.name || '?').join(', ')
+    }
+    if (fallbackDeptId) {
+      return departments.find((d) => d.id === fallbackDeptId)?.name || '—'
+    }
+    return 'All Departments'
+  }
+
   // ── Item CRUD ──
   function handleAddItem() {
     clearNotifications()
     setEditingItemId(null)
+    setAddingItem(true)
     setItemForm(emptyItemForm)
-    setShowItemForm(true)
   }
 
   function handleEditItem(item: CatalogueItem) {
     clearNotifications()
+    setAddingItem(false)
     setEditingItemId(item.id)
+    const existingDeptIds = itemDeptMap[item.id] || []
     setItemForm({
       code: item.code,
       name: item.name,
       category: item.category,
       price: item.price != null ? String(item.price) : '',
-      department_id: item.department_id || '',
+      department_ids: existingDeptIds.length > 0 ? existingDeptIds : (item.department_id ? [item.department_id] : []),
       sort_order: String(item.sort_order),
     })
-    setShowItemForm(true)
   }
 
   function handleCancelItem() {
-    setShowItemForm(false)
+    setAddingItem(false)
     setEditingItemId(null)
     setItemForm(emptyItemForm)
+  }
+
+  function toggleDeptInForm(deptId: string) {
+    setItemForm((prev) => {
+      const ids = prev.department_ids.includes(deptId)
+        ? prev.department_ids.filter((id) => id !== deptId)
+        : [...prev.department_ids, deptId]
+      return { ...prev, department_ids: ids }
+    })
   }
 
   async function handleSaveItem(e: React.FormEvent) {
@@ -138,9 +178,11 @@ export default function Catalogue() {
       name: itemForm.name.trim(),
       category: itemForm.category,
       price: itemForm.price ? parseFloat(itemForm.price) : null,
-      department_id: itemForm.department_id || null,
+      department_id: itemForm.department_ids.length === 1 ? itemForm.department_ids[0] : null,
       sort_order: parseInt(itemForm.sort_order) || 0,
     }
+
+    let itemId = editingItemId
 
     if (editingItemId) {
       const { error: err } = await supabase
@@ -149,23 +191,39 @@ export default function Catalogue() {
         .eq('id', editingItemId)
       if (err) {
         setError(err.message)
-      } else {
-        setSuccess(`"${payload.name}" updated`)
-        handleCancelItem()
-        fetchItems()
+        setSavingItem(false)
+        return
       }
     } else {
-      const { error: err } = await supabase
+      const { data, error: err } = await supabase
         .from('item_catalogue')
         .insert(payload)
+        .select('id')
+        .single()
       if (err) {
         setError(err.message)
-      } else {
-        setSuccess(`"${payload.name}" created`)
-        handleCancelItem()
-        fetchItems()
+        setSavingItem(false)
+        return
+      }
+      itemId = data.id
+    }
+
+    // Update junction table
+    if (itemId) {
+      await supabase.from('item_department_access').delete().eq('item_id', itemId)
+      if (itemForm.department_ids.length > 0) {
+        const rows = itemForm.department_ids.map((deptId) => ({
+          item_id: itemId!,
+          department_id: deptId,
+        }))
+        await supabase.from('item_department_access').insert(rows)
       }
     }
+
+    setSuccess(`"${payload.name}" ${editingItemId ? 'updated' : 'created'}`)
+    handleCancelItem()
+    fetchItems()
+    fetchItemDeptMap()
     setSavingItem(false)
   }
 
@@ -195,6 +253,7 @@ export default function Catalogue() {
     } else {
       setSuccess(`"${item.name}" deleted`)
       fetchItems()
+      fetchItemDeptMap()
     }
   }
 
@@ -302,21 +361,140 @@ export default function Catalogue() {
     }
   }
 
-  // ── Helpers ──
-  function getDeptName(id: string | null) {
-    if (!id) return 'All Departments'
-    return departments.find((d) => d.id === id)?.name || '—'
-  }
-
   const filteredItems = items.filter((item) => {
     if (categoryFilter && item.category !== categoryFilter) return false
-    if (deptFilter && item.department_id !== deptFilter) return false
+    if (deptFilter) {
+      const deptIds = itemDeptMap[item.id]
+      const matchesJunction = deptIds && deptIds.includes(deptFilter)
+      const matchesLegacy = item.department_id === deptFilter
+      if (!matchesJunction && !matchesLegacy) return false
+    }
     if (searchText) {
       const s = searchText.toLowerCase()
       if (!item.name.toLowerCase().includes(s) && !item.code.toLowerCase().includes(s)) return false
     }
     return true
   })
+
+  // ── Item Form Component ──
+  function renderItemForm() {
+    return (
+      <form onSubmit={handleSaveItem} className="p-6 space-y-4 bg-navy/[0.02]">
+        <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+          {editingItemId ? <Pencil className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+          {editingItemId ? 'Edit Item' : 'Add New Item'}
+        </h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Code *</label>
+            <input
+              type="text"
+              value={itemForm.code}
+              onChange={(e) => setItemForm({ ...itemForm, code: e.target.value })}
+              required
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
+              placeholder="e.g. UNI-011"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Name *</label>
+            <input
+              type="text"
+              value={itemForm.name}
+              onChange={(e) => setItemForm({ ...itemForm, name: e.target.value })}
+              required
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
+              placeholder="e.g. Polo Shirt"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Category *</label>
+            <select
+              value={itemForm.category}
+              onChange={(e) => setItemForm({ ...itemForm, category: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold bg-white"
+            >
+              {CATEGORY_OPTIONS.map((c) => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Price per unit (excl. VAT)</label>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-gray-400">&pound;</span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                value={itemForm.price}
+                onChange={(e) => setItemForm({ ...itemForm, price: e.target.value })}
+                className="w-full pl-7 pr-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
+                placeholder="0.00"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Sort Order</label>
+            <input
+              type="number"
+              min="0"
+              value={itemForm.sort_order}
+              onChange={(e) => setItemForm({ ...itemForm, sort_order: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
+            />
+          </div>
+        </div>
+
+        {/* Multi-department checkboxes */}
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Visible to departments
+            <span className="font-normal text-gray-400 ml-2">(none selected = visible to all)</span>
+          </label>
+          <div className="flex flex-wrap gap-3">
+            {departments.filter((d) => d.is_active).map((dept) => (
+              <label
+                key={dept.id}
+                className={`flex items-center gap-2 px-3 py-2 text-sm rounded-lg border cursor-pointer transition-colors ${
+                  itemForm.department_ids.includes(dept.id)
+                    ? 'bg-navy/10 border-navy/30 text-navy font-medium'
+                    : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={itemForm.department_ids.includes(dept.id)}
+                  onChange={() => toggleDeptInForm(dept.id)}
+                  className="w-4 h-4 rounded border-gray-300 text-navy focus:ring-gold"
+                />
+                {dept.name}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex gap-2 pt-2">
+          <button
+            type="submit"
+            disabled={savingItem}
+            className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light disabled:opacity-50"
+          >
+            <Save className="w-4 h-4" />
+            {savingItem ? 'Saving...' : editingItemId ? 'Update Item' : 'Create Item'}
+          </button>
+          <button
+            type="button"
+            onClick={handleCancelItem}
+            className="flex items-center gap-2 px-4 py-2 text-sm text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50"
+          >
+            <X className="w-4 h-4" />
+            Cancel
+          </button>
+        </div>
+      </form>
+    )
+  }
 
   // ── Render ──
   return (
@@ -369,107 +547,10 @@ export default function Catalogue() {
       {/* ── Items Tab ── */}
       {tab === 'items' && (
         <>
-          {/* Add/Edit Item Form */}
-          {showItemForm && (
-            <div className="bg-white rounded-xl border border-gray-200 p-6">
-              <h2 className="text-sm font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                {editingItemId ? <Pencil className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-                {editingItemId ? 'Edit Item' : 'Add New Item'}
-              </h2>
-              <form onSubmit={handleSaveItem} className="space-y-4">
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Code *</label>
-                    <input
-                      type="text"
-                      value={itemForm.code}
-                      onChange={(e) => setItemForm({ ...itemForm, code: e.target.value })}
-                      required
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
-                      placeholder="e.g. UNI-011"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Name *</label>
-                    <input
-                      type="text"
-                      value={itemForm.name}
-                      onChange={(e) => setItemForm({ ...itemForm, name: e.target.value })}
-                      required
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
-                      placeholder="e.g. Polo Shirt"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Category *</label>
-                    <select
-                      value={itemForm.category}
-                      onChange={(e) => setItemForm({ ...itemForm, category: e.target.value })}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold bg-white"
-                    >
-                      {CATEGORY_OPTIONS.map((c) => (
-                        <option key={c.value} value={c.value}>{c.label}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Price per unit (excl. VAT)</label>
-                    <div className="relative">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-gray-400">&pound;</span>
-                      <input
-                        type="number"
-                        step="0.01"
-                        min="0"
-                        value={itemForm.price}
-                        onChange={(e) => setItemForm({ ...itemForm, price: e.target.value })}
-                        className="w-full pl-7 pr-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
-                        placeholder="0.00"
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Department</label>
-                    <select
-                      value={itemForm.department_id}
-                      onChange={(e) => setItemForm({ ...itemForm, department_id: e.target.value })}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold bg-white"
-                    >
-                      <option value="">All Departments</option>
-                      {departments.filter((d) => d.is_active).map((d) => (
-                        <option key={d.id} value={d.id}>{d.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Sort Order</label>
-                    <input
-                      type="number"
-                      min="0"
-                      value={itemForm.sort_order}
-                      onChange={(e) => setItemForm({ ...itemForm, sort_order: e.target.value })}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold"
-                    />
-                  </div>
-                </div>
-                <div className="flex gap-2 pt-2">
-                  <button
-                    type="submit"
-                    disabled={savingItem}
-                    className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light disabled:opacity-50"
-                  >
-                    <Save className="w-4 h-4" />
-                    {savingItem ? 'Saving...' : editingItemId ? 'Update Item' : 'Create Item'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleCancelItem}
-                    className="flex items-center gap-2 px-4 py-2 text-sm text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50"
-                  >
-                    <X className="w-4 h-4" />
-                    Cancel
-                  </button>
-                </div>
-              </form>
+          {/* Add New Item Form (top, only for new items) */}
+          {addingItem && (
+            <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+              {renderItemForm()}
             </div>
           )}
 
@@ -525,57 +606,78 @@ export default function Catalogue() {
                       <th className="px-6 py-3 text-left font-medium text-gray-600">Code</th>
                       <th className="px-6 py-3 text-left font-medium text-gray-600">Name</th>
                       <th className="px-6 py-3 text-left font-medium text-gray-600">Category</th>
-                      <th className="px-6 py-3 text-left font-medium text-gray-600">Department</th>
+                      <th className="px-6 py-3 text-left font-medium text-gray-600">Departments</th>
                       <th className="px-6 py-3 text-right font-medium text-gray-600">Price (excl. VAT)</th>
                       <th className="px-6 py-3 text-center font-medium text-gray-600">Status</th>
                       <th className="px-6 py-3 text-right font-medium text-gray-600">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredItems.map((item) => (
-                      <tr key={item.id} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
-                        <td className="px-6 py-3 font-mono text-xs text-gray-500">{item.code}</td>
-                        <td className="px-6 py-3 font-medium text-gray-900">{item.name}</td>
-                        <td className="px-6 py-3">
-                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
-                            {CATEGORY_LABELS[item.category] || item.category}
-                          </span>
-                        </td>
-                        <td className="px-6 py-3 text-gray-600">{getDeptName(item.department_id)}</td>
-                        <td className="px-6 py-3 text-right font-medium text-gray-900">
-                          {item.price != null ? `\u00A3${Number(item.price).toFixed(2)}` : '—'}
-                        </td>
-                        <td className="px-6 py-3 text-center">
-                          <button
-                            onClick={() => handleToggleItem(item)}
-                            className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium cursor-pointer transition-colors ${
-                              item.is_active
-                                ? 'bg-green-100 text-green-800 hover:bg-green-200'
-                                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                            }`}
-                          >
-                            {item.is_active ? 'Active' : 'Inactive'}
-                          </button>
-                        </td>
-                        <td className="px-6 py-3 text-right">
-                          <div className="flex items-center justify-end gap-2">
-                            <button
-                              onClick={() => handleEditItem(item)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-navy bg-navy/5 hover:bg-navy/10 border border-navy/10 rounded-lg transition-colors"
-                            >
-                              <Pencil className="w-3 h-3" />
-                              Edit
-                            </button>
-                            <button
-                              onClick={() => handleDeleteItem(item)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                    {filteredItems.map((item) => {
+                      const isEditing = editingItemId === item.id
+                      return (
+                        <>
+                          {/* Item row */}
+                          <tr key={item.id} className={`border-b border-gray-100 last:border-0 transition-colors ${isEditing ? 'bg-navy/[0.03]' : 'hover:bg-gray-50'}`}>
+                            <td className="px-6 py-3 font-mono text-xs text-gray-500">{item.code}</td>
+                            <td className="px-6 py-3 font-medium text-gray-900">{item.name}</td>
+                            <td className="px-6 py-3">
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                                {CATEGORY_LABELS[item.category] || item.category}
+                              </span>
+                            </td>
+                            <td className="px-6 py-3 text-gray-600 text-xs">
+                              {getDeptNames(item.id, item.department_id)}
+                            </td>
+                            <td className="px-6 py-3 text-right font-medium text-gray-900">
+                              {item.price != null ? `\u00A3${Number(item.price).toFixed(2)}` : '—'}
+                            </td>
+                            <td className="px-6 py-3 text-center">
+                              <button
+                                onClick={() => handleToggleItem(item)}
+                                className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium cursor-pointer transition-colors ${
+                                  item.is_active
+                                    ? 'bg-green-100 text-green-800 hover:bg-green-200'
+                                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                                }`}
+                              >
+                                {item.is_active ? 'Active' : 'Inactive'}
+                              </button>
+                            </td>
+                            <td className="px-6 py-3 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  onClick={() => isEditing ? handleCancelItem() : handleEditItem(item)}
+                                  className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg transition-colors ${
+                                    isEditing
+                                      ? 'text-gold bg-gold/10 hover:bg-gold/20 border border-gold/30'
+                                      : 'text-navy bg-navy/5 hover:bg-navy/10 border border-navy/10'
+                                  }`}
+                                >
+                                  {isEditing ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                  {isEditing ? 'Close' : 'Edit'}
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteItem(item)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+
+                          {/* Inline edit form below the row */}
+                          {isEditing && (
+                            <tr key={`${item.id}-edit`}>
+                              <td colSpan={7} className="p-0 border-b border-navy/10">
+                                {renderItemForm()}
+                              </td>
+                            </tr>
+                          )}
+                        </>
+                      )
+                    })}
                     {filteredItems.length === 0 && (
                       <tr>
                         <td colSpan={7} className="px-6 py-12 text-center text-gray-500">
