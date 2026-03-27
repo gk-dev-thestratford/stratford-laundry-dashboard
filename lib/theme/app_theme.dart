@@ -17,13 +17,29 @@ class AppSpacing {
 
 /// Consistent border radii
 class AppRadius {
-  static const double sm = 10;
-  static const double md = 14;
-  static const double lg = 26;
+  static const double sm = 12;
+  static const double md = 18;
+  static const double lg = 28;
+  static const double xl = 36;
 
   static BorderRadius get smallBR => BorderRadius.circular(sm);
   static BorderRadius get mediumBR => BorderRadius.circular(md);
   static BorderRadius get largeBR => BorderRadius.circular(lg);
+  static BorderRadius get xlBR => BorderRadius.circular(xl);
+}
+
+/// Reusable soft shadow presets
+class AppShadows {
+  static List<BoxShadow> get soft => [
+    BoxShadow(color: Color(0x0A000000), blurRadius: 10, offset: Offset(0, 2)),
+    BoxShadow(color: Color(0x05000000), blurRadius: 20, offset: Offset(0, 4)),
+  ];
+  static List<BoxShadow> get card => [
+    BoxShadow(color: Color(0x0D000000), blurRadius: 12, offset: Offset(0, 3)),
+  ];
+  static List<BoxShadow> get elevated => [
+    BoxShadow(color: Color(0x14000000), blurRadius: 20, offset: Offset(0, 6)),
+  ];
 }
 
 /// Typography scale — tablet-optimised for 10" screens

@@ -192,7 +192,6 @@ function buildStaffEmail(order: any, status: string, statusLabel: string, reason
 
       <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
         The Stratford Hotel — Laundry Management System<br>
-        Powered by Laundrevo Limited<br>
         <span style="color:#bbb">This is an automated notification — please do not reply to this email.</span>
       </div>
     </div>

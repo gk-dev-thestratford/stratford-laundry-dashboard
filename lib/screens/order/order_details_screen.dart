@@ -68,7 +68,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     final type = ref.read(orderProvider).orderType;
     return type == 'linen' || type == 'hsk_linen' || type == 'fnb_linen';
   }
-  bool get _isUniformOrder => ref.read(orderProvider).orderType == 'uniform';
+
 
   String get _stepSubtitle {
     if (_isGuestOrder) return 'Step 2 of 3 — Guest Details';
@@ -127,6 +127,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         staffName: _nameController.text.trim(),
         roomNumber: room,
         bagCount: _bagCount,
+        email: _emailController.text.trim().isEmpty ? null : _emailController.text.trim(),
         notes: _notesController.text.trim().isEmpty ? null : _notesController.text.trim(),
       );
     } else {
@@ -135,7 +136,6 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         departmentId: _selectedDepartmentId,
         departmentName: dept?.name,
         staffName: _nameController.text.trim(),
-        email: _emailController.text.trim().isEmpty ? null : _emailController.text.trim(),
         notes: _notesController.text.trim().isEmpty ? null : _notesController.text.trim(),
       );
     }
@@ -243,16 +243,31 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         },
       ),
 
-      // Email field — optional, uniform orders only
+      // Email — uniform orders only (for status update notifications)
+      if (!_isLinenOrder) ...[
+        const SizedBox(height: AppSpacing.lg),
+        _buildSectionLabel('Email (for order updates)'),
+        const SizedBox(height: AppSpacing.sm),
+        TextFormField(
+          controller: _emailController,
+          keyboardType: TextInputType.emailAddress,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: const InputDecoration(
+            hintText: 'Enter your email address',
+            prefixIcon: Icon(Icons.email_outlined),
+          ),
+          validator: (v) {
+            if (v == null || v.trim().isEmpty) return null;
+            final emailRegex = RegExp(r'^[\w\.\-\+]+@[\w\.\-]+\.\w{2,}$');
+            if (!emailRegex.hasMatch(v.trim())) return 'Please enter a valid email';
+            return null;
+          },
+        ),
+      ],
       const SizedBox(height: AppSpacing.lg),
 
-      // Optional section — email (uniform only) + notes
-      _buildSectionLabel('Optional'),
-      const SizedBox(height: AppSpacing.sm),
-      if (_isUniformOrder)
-        _buildCollapsibleEmail(),
-      if (_isUniformOrder)
-        const SizedBox(height: AppSpacing.sm),
+      // Notes — all staff order types
       _buildCollapsibleNotes(),
     ];
   }
@@ -608,83 +623,6 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     );
   }
 
-  bool _emailExpanded = false;
-
-  Widget _buildCollapsibleEmail() {
-    return Material(
-      color: AppColors.white,
-      borderRadius: AppRadius.mediumBR,
-      child: Container(
-        decoration: BoxDecoration(
-          border: Border.all(color: _emailExpanded ? AppColors.navy : AppColors.grey300),
-          borderRadius: AppRadius.mediumBR,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            InkWell(
-              onTap: () => setState(() => _emailExpanded = !_emailExpanded),
-              borderRadius: _emailExpanded
-                  ? BorderRadius.vertical(top: Radius.circular(AppRadius.md))
-                  : AppRadius.mediumBR,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
-                child: Row(
-                  children: [
-                    Icon(Icons.email_outlined, color: AppColors.grey600, size: AppSizes.iconSizeMd),
-                    const SizedBox(width: AppSpacing.md),
-                    Expanded(
-                      child: Text(
-                        _emailExpanded ? 'Email' : 'Add email (optional)',
-                        style: TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: AppTextStyles.bodySize,
-                          color: _emailExpanded ? AppColors.navy : AppColors.grey500,
-                          fontWeight: _emailExpanded ? AppTextStyles.medium : AppTextStyles.regular,
-                        ),
-                      ),
-                    ),
-                    Icon(
-                      _emailExpanded ? Icons.expand_less : Icons.expand_more,
-                      color: AppColors.grey500,
-                      size: AppSizes.iconSizeMd,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            if (_emailExpanded) ...[
-              Divider(height: 1, color: AppColors.grey200),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(AppSpacing.md, 0, AppSpacing.md, AppSpacing.md),
-                child: TextFormField(
-                  controller: _emailController,
-                  keyboardType: TextInputType.emailAddress,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  autofillHints: const [],
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    hintText: 'For order status updates',
-                    border: InputBorder.none,
-                    enabledBorder: InputBorder.none,
-                    focusedBorder: InputBorder.none,
-                    contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.sm),
-                  ),
-                  validator: (v) {
-                    if (v == null || v.trim().isEmpty) return null;
-                    final emailRegex = RegExp(r'^[\w\.\-\+]+@[\w\.\-]+\.\w{2,}$');
-                    if (!emailRegex.hasMatch(v.trim())) return 'Please enter a valid email';
-                    return null;
-                  },
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
 
   Widget _buildCollapsibleNotes() {
     return Material(

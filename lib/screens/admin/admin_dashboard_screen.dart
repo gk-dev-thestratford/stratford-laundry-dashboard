@@ -473,100 +473,208 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     return Scaffold(
       backgroundColor: AppColors.offWhite,
-      appBar: AppBar(
-        backgroundColor: AppColors.navy,
-        toolbarHeight: 68,
-        leading: IconButton(
-          icon: const Icon(Icons.home_rounded, color: AppColors.white, size: 26),
-          onPressed: () => context.go('/'),
-        ),
-        title: Column(
-          children: [
-            Text('Admin Dashboard',
-                style: TextStyle(fontFamily: 'Inter', color: AppColors.white, fontSize: AppTextStyles.titleSize, fontWeight: AppTextStyles.medium)),
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text('Logged in as ${admin.currentAdmin?.name ?? "Admin"}',
-                  style: TextStyle(fontFamily: 'Inter', color: AppColors.gold, fontSize: AppTextStyles.captionSize)),
-            ),
-          ],
-        ),
-        centerTitle: true,
-        actions: [
-          const SyncIndicator(),
-          const SizedBox(width: AppSpacing.sm),
-          IconButton(
-            icon: const Icon(Icons.refresh_rounded, color: AppColors.white, size: 26),
-            onPressed: _loadData,
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout_rounded, color: AppColors.white, size: 26),
-            onPressed: _logout,
-            tooltip: 'Logout',
-          ),
-        ],
-        elevation: 2,
-        shadowColor: AppColors.navyDark.withValues(alpha: 0.3),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(52),
-          child: Container(
-            color: AppColors.navyDark,
-            child: TabBar(
-              controller: _tabController,
-              isScrollable: true,
-              indicatorColor: AppColors.gold,
-              indicatorWeight: 4,
-              indicatorSize: TabBarIndicatorSize.tab,
-              dividerColor: Colors.transparent,
-              labelColor: AppColors.gold,
-              unselectedLabelColor: AppColors.white.withValues(alpha: 0.55),
-              labelStyle: TextStyle(fontFamily: 'Inter', fontSize: 17, fontWeight: AppTextStyles.bold),
-              unselectedLabelStyle: TextStyle(fontFamily: 'Inter', fontSize: 16, fontWeight: AppTextStyles.regular),
-              labelPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
-              tabs: _tabs.asMap().entries.map((entry) {
-                final t = entry.value;
-                final count = _getTabCount(t);
-                // Add extra spacing before Rejected (last tab) to push it right
-                final isRejected = t == 'Rejected';
-                return Tab(
-                  height: 48,
-                  child: Row(
-                    children: [
-                      if (isRejected) const SizedBox(width: 40),
-                      Text(count > 0 ? '$t ($count)' : t),
-                    ],
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-        ),
-      ),
       body: Column(
         children: [
+          // ── Custom gradient header ──
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [AppColors.navy, AppColors.navyLight],
+              ),
+              borderRadius: const BorderRadius.vertical(bottom: Radius.circular(28)),
+              boxShadow: [
+                BoxShadow(color: AppColors.navy.withValues(alpha: 0.25), blurRadius: 16, offset: const Offset(0, 4)),
+              ],
+            ),
+            child: SafeArea(
+              bottom: false,
+              child: Column(
+                children: [
+                  // Top row: home, title, actions
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(AppSpacing.sm, AppSpacing.sm, AppSpacing.sm, 0),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.home_rounded, color: AppColors.white, size: 26),
+                          onPressed: () => context.go('/'),
+                        ),
+                        const SizedBox(width: AppSpacing.sm),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Admin Dashboard',
+                                  style: TextStyle(fontFamily: 'Inter', color: AppColors.white, fontSize: AppTextStyles.titleSize, fontWeight: AppTextStyles.bold)),
+                              Text(admin.currentAdmin?.name ?? 'Admin',
+                                  style: TextStyle(fontFamily: 'Inter', color: AppColors.gold, fontSize: AppTextStyles.captionSize)),
+                            ],
+                          ),
+                        ),
+                        const SyncIndicator(),
+                        const SizedBox(width: AppSpacing.xs),
+                        IconButton(
+                          icon: const Icon(Icons.refresh_rounded, color: AppColors.white, size: 24),
+                          onPressed: _loadData,
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.logout_rounded, color: AppColors.white, size: 24),
+                          onPressed: _logout,
+                          tooltip: 'Logout',
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Status filter pills
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(AppSpacing.base, AppSpacing.md, AppSpacing.base, AppSpacing.lg),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: _tabs.asMap().entries.map((entry) {
+                          final idx = entry.key;
+                          final label = entry.value;
+                          final count = _getTabCount(label);
+                          final isActive = _tabController.index == idx;
+
+                          return Padding(
+                            padding: EdgeInsets.only(right: label == 'Rejected' ? 0 : AppSpacing.sm, left: label == 'Rejected' ? AppSpacing.lg : 0),
+                            child: GestureDetector(
+                              onTap: () => _tabController.animateTo(idx),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 200),
+                                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
+                                decoration: BoxDecoration(
+                                  color: isActive
+                                      ? AppColors.white
+                                      : AppColors.white.withValues(alpha: 0.12),
+                                  borderRadius: AppRadius.largeBR,
+                                  border: Border.all(
+                                    color: isActive ? AppColors.white : AppColors.white.withValues(alpha: 0.2),
+                                    width: 1.5,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      _tabIcon(label),
+                                      size: 20,
+                                      color: isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.8),
+                                    ),
+                                    const SizedBox(width: AppSpacing.sm),
+                                    Text(
+                                      label,
+                                      style: TextStyle(
+                                        fontFamily: 'Inter',
+                                        fontSize: AppTextStyles.captionSize,
+                                        fontWeight: isActive ? AppTextStyles.bold : AppTextStyles.medium,
+                                        color: isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.85),
+                                      ),
+                                    ),
+                                    if (count > 0) ...[
+                                      const SizedBox(width: AppSpacing.sm),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.2),
+                                          borderRadius: BorderRadius.circular(12),
+                                        ),
+                                        child: Text(
+                                          '$count',
+                                          style: TextStyle(
+                                            fontFamily: 'Inter',
+                                            fontSize: 13,
+                                            fontWeight: AppTextStyles.bold,
+                                            color: isActive ? AppColors.white : AppColors.white.withValues(alpha: 0.9),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          // ── Body content ──
+          ..._buildBodyContent(isLandscape),
+        ],
+      ),
+    );
+  }
+
+  IconData _tabIcon(String tab) {
+    return switch (tab) {
+      'Pending' => Icons.schedule_rounded,
+      'Approved' => Icons.check_circle_outline_rounded,
+      'In Progress' => Icons.local_shipping_rounded,
+      'Completed' => Icons.done_all_rounded,
+      'All' => Icons.list_alt_rounded,
+      'Rejected' => Icons.cancel_outlined,
+      _ => Icons.circle_outlined,
+    };
+  }
+
+  List<Widget> _buildBodyContent(bool isLandscape) {
+    return [
           // Search bar
           Padding(
-            padding: EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.base, AppSpacing.lg, AppSpacing.sm),
-            child: TextField(
-              decoration: InputDecoration(
-                hintText: 'Search by docket number, name...',
-                hintStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize),
-                prefixIcon: Icon(Icons.search, size: AppSizes.iconSizeLg),
-                suffixIcon: _searchQuery.isNotEmpty
-                    ? IconButton(
-                        icon: Icon(Icons.clear, size: AppSizes.iconSizeMd),
-                        onPressed: () {
-                          setState(() => _searchQuery = '');
-                          _loadOrders();
-                        },
-                      )
-                    : null,
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
+            child: Container(
+              decoration: BoxDecoration(
+                color: AppColors.white,
+                borderRadius: AppRadius.largeBR,
+                boxShadow: AppShadows.soft,
               ),
-              onChanged: (v) {
-                ref.read(adminProvider.notifier).refreshActivity();
-                _searchQuery = v;
-                _loadOrders();
-              },
+              child: TextField(
+                decoration: InputDecoration(
+                  hintText: 'Search by docket number, name...',
+                  hintStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, color: AppColors.grey400),
+                  prefixIcon: Padding(
+                    padding: const EdgeInsets.only(left: AppSpacing.base, right: AppSpacing.sm),
+                    child: Icon(Icons.search_rounded, size: AppSizes.iconSizeLg, color: AppColors.grey500),
+                  ),
+                  suffixIcon: _searchQuery.isNotEmpty
+                      ? IconButton(
+                          icon: Icon(Icons.clear_rounded, size: AppSizes.iconSizeMd, color: AppColors.grey400),
+                          onPressed: () {
+                            setState(() => _searchQuery = '');
+                            _loadOrders();
+                          },
+                        )
+                      : null,
+                  border: OutlineInputBorder(
+                    borderRadius: AppRadius.largeBR,
+                    borderSide: BorderSide.none,
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: AppRadius.largeBR,
+                    borderSide: BorderSide.none,
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: AppRadius.largeBR,
+                    borderSide: BorderSide(color: AppColors.navy.withValues(alpha: 0.3), width: 1.5),
+                  ),
+                  filled: true,
+                  fillColor: AppColors.white,
+                  contentPadding: const EdgeInsets.symmetric(vertical: AppSpacing.base),
+                ),
+                onChanged: (v) {
+                  ref.read(adminProvider.notifier).refreshActivity();
+                  _searchQuery = v;
+                  _loadOrders();
+                },
+              ),
             ),
           ),
           // All tab: filter chips
@@ -676,9 +784,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                               ),
                       ),
           ),
-        ],
-      ),
-    );
+        ];
   }
 
   Widget _buildOrderCard(int index) {
@@ -792,13 +898,22 @@ class _OrderCard extends StatelessWidget {
     final isGuest = orderType == AppConstants.orderTypeGuestLaundry;
     final isOutstanding = order['parent_order_id'] != null;
 
-    return Card(
-      margin: EdgeInsets.symmetric(vertical: AppSpacing.xs + 1),
-      child: InkWell(
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs + 2),
+      decoration: BoxDecoration(
+        color: AppColors.white,
+        borderRadius: AppRadius.mediumBR,
+        boxShadow: AppShadows.card,
+        border: Border.all(color: AppColors.grey200.withValues(alpha: 0.6), width: 1),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: AppRadius.mediumBR,
+        child: InkWell(
         onTap: onTap,
         borderRadius: AppRadius.mediumBR,
         child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.md),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.base),
           child: Row(
             children: [
               // Checkbox for Approved tab selection
@@ -1031,6 +1146,7 @@ class _OrderCard extends StatelessWidget {
             ],
           ),
         ),
+      ),
       ),
     );
   }
