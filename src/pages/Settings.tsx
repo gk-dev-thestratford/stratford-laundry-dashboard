@@ -9,6 +9,7 @@ interface AdminUser {
   pin_hash: string
   is_active: boolean
   can_delete_orders: boolean
+  can_reject_orders: boolean
 }
 
 interface SettingsProps {
@@ -120,6 +121,21 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
       setError(error.message)
     } else {
       setSuccess(`"${admin.name}" ${newVal ? 'can now delete orders' : 'can no longer delete orders'}`)
+      fetchAdmins()
+    }
+  }
+
+  async function handleToggleCanReject(admin: AdminUser) {
+    const newVal = !admin.can_reject_orders
+    const { error } = await supabase
+      .from('admin_users')
+      .update({ can_reject_orders: newVal })
+      .eq('id', admin.id)
+
+    if (error) {
+      setError(error.message)
+    } else {
+      setSuccess(`"${admin.name}" ${newVal ? 'can now reject orders' : 'can no longer reject orders'}`)
       fetchAdmins()
     }
   }
@@ -237,6 +253,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
                 <th className="px-6 py-3 text-left font-medium text-gray-600">Name</th>
                 <th className="px-6 py-3 text-left font-medium text-gray-600">Status</th>
                 <th className="px-6 py-3 text-center font-medium text-gray-600">Can Delete Orders</th>
+                <th className="px-6 py-3 text-center font-medium text-gray-600">Can Reject Orders</th>
                 <th className="px-6 py-3 text-right font-medium text-gray-600">Actions</th>
               </tr>
             </thead>
@@ -288,6 +305,21 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
                       />
                     </button>
                   </td>
+                  <td className="px-6 py-3 text-center">
+                    <button
+                      onClick={() => handleToggleCanReject(admin)}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        admin.can_reject_orders ? 'bg-red-500' : 'bg-gray-300'
+                      }`}
+                      title={admin.can_reject_orders ? 'Click to revoke reject permission' : 'Click to grant reject permission'}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${
+                          admin.can_reject_orders ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </td>
                   <td className="px-6 py-3 text-right">
                     <div className="flex items-center justify-end gap-2">
                       <button
@@ -309,7 +341,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
               ))}
               {admins.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="px-6 py-12 text-center text-gray-500">No admin users found</td>
+                  <td colSpan={5} className="px-6 py-12 text-center text-gray-500">No admin users found</td>
                 </tr>
               )}
             </tbody>
