@@ -171,7 +171,10 @@ export function useOrders() {
   }, [fetchOrders])
 
   /** Bulk save: docket numbers + item prices in one go */
-  const bulkSaveEdits = useCallback(async (edits: BulkEdits) => {
+  const bulkSaveEdits = useCallback(async (
+    edits: BulkEdits,
+    onProgress?: (done: number, total: number) => void,
+  ) => {
     const promises: PromiseLike<unknown>[] = []
 
     for (const [orderId, updates] of Object.entries(edits.orders)) {
@@ -194,7 +197,9 @@ export function useOrders() {
       if (upd.order_id) affectedOrderIds.add(upd.order_id)
     }
 
-    for (const orderId of affectedOrderIds) {
+    const orderIdList = Array.from(affectedOrderIds)
+    for (let i = 0; i < orderIdList.length; i++) {
+      const orderId = orderIdList[i]
       const { data: items } = await supabase
         .from('order_items')
         .select('quantity_sent, price_at_time')
@@ -205,6 +210,7 @@ export function useOrders() {
           await supabase.from('orders').update({ total_price: Number(total.toFixed(2)) }).eq('id', orderId)
         }
       }
+      onProgress?.(i + 1, orderIdList.length)
     }
 
     await fetchOrders()

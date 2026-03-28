@@ -64,7 +64,9 @@ export default function Orders() {
   async function saveBulkEdits() {
     if (editCount === 0) return
     setSaving(true)
-    await bulkSaveEdits(bulkEdits)
+    setBulkProgress({ done: 0, total: editCount })
+    await bulkSaveEdits(bulkEdits, (done, total) => setBulkProgress({ done, total }))
+    setBulkProgress(null)
     setBulkEdits(EMPTY_EDITS)
     setBulkEdit(false)
     setSaving(false)
@@ -344,7 +346,7 @@ export default function Orders() {
         <div className="bg-navy/5 border border-navy/10 rounded-lg px-4 py-3">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium text-navy">
-              Updating orders... {bulkProgress.done} of {bulkProgress.total}
+              {saving ? 'Saving changes' : 'Updating orders'}... {bulkProgress.done} of {bulkProgress.total}
             </span>
             <span className="text-xs text-gray-500">
               {Math.round((bulkProgress.done / bulkProgress.total) * 100)}%
