@@ -98,7 +98,7 @@ export default function CreateOrderModal({ departments, onClose, onCreated }: Cr
       const { data: { user: authUser } } = await supabase.auth.getUser()
       if (authUser) {
         const { data: du } = await supabase.from('dashboard_users').select('name, email').eq('id', authUser.id).single()
-        userName = du?.name || du?.email || 'Dashboard'
+        userName = `Dashboard / ${du?.name || du?.email || 'Unknown'}`
       }
 
       await supabase.from('order_status_log').insert({

@@ -16,7 +16,8 @@ async function getDashboardUserName(): Promise<string> {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return 'Dashboard'
   const { data } = await supabase.from('dashboard_users').select('name, email').eq('id', user.id).single()
-  return data?.name || data?.email || 'Dashboard'
+  const name = data?.name || data?.email || 'Unknown'
+  return `Dashboard / ${name}`
 }
 
 export function useOrders() {
