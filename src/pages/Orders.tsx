@@ -21,7 +21,7 @@ function computeCost(o: Order): number {
 }
 
 export default function Orders() {
-  const { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits } = useOrders()
+  const { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus } = useOrders()
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [detailOrder, setDetailOrder] = useState<Order | null>(null)
   const [showCreate, setShowCreate] = useState(false)
@@ -31,6 +31,9 @@ export default function Orders() {
   const [bulkEdit, setBulkEdit] = useState(false)
   const [bulkEdits, setBulkEdits] = useState<BulkEdits>(EMPTY_EDITS)
   const [saving, setSaving] = useState(false)
+
+  // Bulk status progress
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null)
 
   const editCount = Object.keys(bulkEdits.orders).length + Object.keys(bulkEdits.items).length
 
@@ -77,9 +80,13 @@ export default function Orders() {
   async function handleBulkStatus() {
     if (!bulkStatus || selectedIds.size === 0) return
     if (!window.confirm(`Update ${selectedIds.size} order(s) to "${ORDER_STATUS_LABELS[bulkStatus]}"?`)) return
-    for (const id of selectedIds) {
-      await updateOrderStatus(id, bulkStatus)
-    }
+    setBulkProgress({ done: 0, total: selectedIds.size })
+    await bulkUpdateStatus(
+      Array.from(selectedIds),
+      bulkStatus,
+      (done, total) => setBulkProgress({ done, total }),
+    )
+    setBulkProgress(null)
     setSelectedIds(new Set())
     setBulkStatus('')
   }
@@ -332,8 +339,28 @@ export default function Orders() {
       {/* Filters */}
       <Filters filters={filters} departments={departments} onChange={setFilters} />
 
+      {/* Bulk progress bar */}
+      {bulkProgress && (
+        <div className="bg-navy/5 border border-navy/10 rounded-lg px-4 py-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-navy">
+              Updating orders... {bulkProgress.done} of {bulkProgress.total}
+            </span>
+            <span className="text-xs text-gray-500">
+              {Math.round((bulkProgress.done / bulkProgress.total) * 100)}%
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-2">
+            <div
+              className="bg-navy h-2 rounded-full transition-all duration-300"
+              style={{ width: `${(bulkProgress.done / bulkProgress.total) * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Bulk actions (when not in bulk edit) */}
-      {!bulkEdit && selectedIds.size > 0 && (
+      {!bulkEdit && !bulkProgress && selectedIds.size > 0 && (
         <div className="flex items-center gap-3 bg-navy/5 border border-navy/10 rounded-lg px-4 py-3">
           <span className="text-sm font-medium text-navy">{selectedIds.size} selected</span>
           <div className="h-4 w-px bg-gray-300" />

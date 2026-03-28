@@ -210,5 +210,49 @@ export function useOrders() {
     await fetchOrders()
   }, [fetchOrders])
 
-  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits }
+  /** Bulk status update — processes all orders without refreshing in between, calls progress callback */
+  const bulkUpdateStatus = useCallback(async (
+    orderIds: string[],
+    status: OrderStatus,
+    onProgress?: (done: number, total: number) => void,
+  ) => {
+    const total = orderIds.length
+    for (let i = 0; i < total; i++) {
+      const orderId = orderIds[i]
+
+      await supabase.from('orders').update({ status }).eq('id', orderId)
+
+      await supabase.from('order_status_log').insert({
+        order_id: orderId,
+        status,
+        changed_by_name: 'Dashboard',
+      })
+
+      // Auto-fill quantity_received when marking received/completed
+      if (status === 'received' || status === 'completed') {
+        const { data: items } = await supabase
+          .from('order_items')
+          .select('id, quantity_sent, quantity_received')
+          .eq('order_id', orderId)
+        if (items) {
+          const toUpdate = items.filter(i => !i.quantity_received)
+          if (toUpdate.length > 0) {
+            await Promise.all(
+              toUpdate.map(i =>
+                supabase.from('order_items')
+                  .update({ quantity_received: i.quantity_sent })
+                  .eq('id', i.id)
+              )
+            )
+          }
+        }
+      }
+
+      onProgress?.(i + 1, total)
+    }
+
+    await fetchOrders()
+  }, [fetchOrders])
+
+  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus }
 }
