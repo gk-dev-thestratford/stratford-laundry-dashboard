@@ -67,3 +67,46 @@ body {
 .dark .hover\:bg-gray-100:hover {
   background-color: #374151;
 }
+
+/* ── Sidebar cutout effect ── */
+.nav-item-active {
+  position: relative;
+  background: #f9fafb;
+  color: #1B2A4A;
+  border-radius: 1.5rem 0 0 1.5rem;
+  margin-right: 0;
+}
+
+.dark .nav-item-active {
+  background: #111827;
+  color: #C9A84C;
+}
+
+/* Concave curves above and below the active nav item */
+.nav-item-active::before,
+.nav-item-active::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  width: 24px;
+  height: 24px;
+  pointer-events: none;
+}
+
+.nav-item-active::before {
+  bottom: 100%;
+  background: radial-gradient(circle at 0% 100%, transparent 24px, #f9fafb 24px);
+}
+
+.nav-item-active::after {
+  top: 100%;
+  background: radial-gradient(circle at 0% 0%, transparent 24px, #f9fafb 24px);
+}
+
+.dark .nav-item-active::before {
+  background: radial-gradient(circle at 0% 100%, transparent 24px, #111827 24px);
+}
+
+.dark .nav-item-active::after {
+  background: radial-gradient(circle at 0% 0%, transparent 24px, #111827 24px);
+}

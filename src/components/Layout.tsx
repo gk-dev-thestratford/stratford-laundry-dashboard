@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, Clock, LogOut, Menu, X, Sun, Moon } from 'lucide-react'
+import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, Clock, LogOut, Menu, X, Sun, Moon, UtensilsCrossed } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import type { DashboardUser } from '../types'
 
@@ -10,6 +10,7 @@ interface LayoutProps {
 
 const navItems = [
   { to: '/', icon: BarChart3, label: 'Reports' },
+  { to: '/linen-pool', icon: UtensilsCrossed, label: 'Linen Pool' },
   { to: '/orders', icon: ClipboardList, label: 'Orders' },
   { to: '/user-management', icon: Users, label: 'User Management' },
   { to: '/catalogue', icon: Package, label: 'Catalogue' },
@@ -63,18 +64,17 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
           </button>
         </div>
 
-        <nav className="flex-1 p-4 space-y-1">
+        <nav className="flex-1 pt-6 pl-4 space-y-1">
           {navItems.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
               to={to}
+              end={to === '/'}
               onClick={() => setSidebarOpen(false)}
               className={({ isActive }) =>
-                `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-gold/20 text-gold'
-                    : 'text-gray-300 hover:bg-white/5 hover:text-white'
-                }`
+                isActive
+                  ? 'nav-item-active flex items-center gap-3 px-4 py-2.5 text-sm font-semibold'
+                  : 'flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium text-gray-300 hover:bg-white/5 hover:text-white mr-4 transition-colors'
               }
             >
               <Icon className="w-5 h-5" />
@@ -104,9 +104,9 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 bg-gray-50 dark:bg-gray-900 lg:rounded-tl-[2rem]">
         {/* Top bar */}
-        <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center gap-3">
+        <header className="bg-white/60 dark:bg-gray-800/60 backdrop-blur-sm border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center gap-3 lg:rounded-tl-[2rem]">
           <button className="lg:hidden" onClick={() => setSidebarOpen(true)}>
             <Menu className="w-6 h-6 text-gray-600 dark:text-gray-300" />
           </button>

@@ -21,6 +21,7 @@ export default function Reports() {
   const [month, setMonth] = useState(0) // 0 = all
   const [expandedOrders, setExpandedOrders] = useState<Set<string>>(new Set())
   const [discrepancyFilter, setDiscrepancyFilter] = useState<'all' | 'discrepancies'>('all')
+  const [outstandingExpanded, setOutstandingExpanded] = useState(false)
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -217,7 +218,7 @@ export default function Reports() {
           <button onClick={() => fetchData()} className="p-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" title="Refresh">
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
-          <button onClick={exportReport} className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light">
+          <button onClick={exportReport} className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-navy rounded-xl hover:bg-navy-light shadow-sm transition-colors">
             <Download className="w-4 h-4" />
             Export Report
           </button>
@@ -252,24 +253,27 @@ export default function Reports() {
 
       {/* KPI cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-        <KpiCard icon={<ClipboardList className="w-4 h-4" />} label="Total Orders" value={kpis.orders.toLocaleString()} />
-        <KpiCard icon={<Package className="w-4 h-4" />} label="Items Sent" value={kpis.sent.toLocaleString()} />
-        <KpiCard icon={<Package className="w-4 h-4" />} label="Items Received" value={kpis.received.toLocaleString()} />
+        <KpiCard icon={<ClipboardList className="w-5 h-5" />} label="Total Orders" value={kpis.orders.toLocaleString()} color="navy" />
+        <KpiCard icon={<Package className="w-5 h-5" />} label="Items Sent" value={kpis.sent.toLocaleString()} color="gold" />
+        <KpiCard icon={<Package className="w-5 h-5" />} label="Items Received" value={kpis.received.toLocaleString()} color="emerald" />
         <KpiCard
-          icon={<AlertTriangle className="w-4 h-4" />}
+          icon={<AlertTriangle className="w-5 h-5" />}
           label="Outstanding"
           value={kpis.outstanding.toLocaleString()}
           alert={kpis.outstanding > 0}
+          color="amber"
         />
         <KpiCard
-          icon={<TrendingUp className="w-4 h-4" />}
+          icon={<TrendingUp className="w-5 h-5" />}
           label="Cost (ex VAT)"
-          value={kpis.cost > 0 ? `\u00a3${kpis.cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '\u2014'}
+          value={kpis.cost > 0 ? `£${kpis.cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+          color="navy"
         />
         <KpiCard
-          icon={<TrendingUp className="w-4 h-4" />}
+          icon={<TrendingUp className="w-5 h-5" />}
           label="Cost (inc VAT)"
-          value={kpis.cost > 0 ? `\u00a3${(kpis.cost * 1.2).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '\u2014'}
+          value={kpis.cost > 0 ? `£${(kpis.cost * 1.2).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+          color="gold"
         />
       </div>
 
@@ -285,13 +289,17 @@ export default function Reports() {
       )}
 
       {/* Outstanding & Discrepancies */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2 flex-wrap">
-          <AlertTriangle className={`w-4 h-4 flex-shrink-0 ${discrepancies.length > 0 ? 'text-amber-500' : 'text-gray-400'}`} />
-          <h3 className="text-sm font-semibold text-gray-900">Outstanding Items</h3>
-          <span className="text-xs text-gray-400">
-            ({discrepancies.reduce((s, o) => s + o.totalOutstanding, 0)} items across {discrepancies.length} orders)
-          </span>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100 flex items-center gap-2 flex-wrap">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${discrepancies.length > 0 ? 'bg-amber-50 text-amber-500' : 'bg-gray-100 text-gray-400'}`}>
+            <AlertTriangle className="w-4 h-4" />
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-gray-900">Outstanding Items</h3>
+            <span className="text-[11px] text-gray-400">
+              {discrepancies.reduce((s, o) => s + o.totalOutstanding, 0)} items across {discrepancies.length} orders
+            </span>
+          </div>
           <div className="flex gap-1 ml-auto">
             <button
               onClick={() => setDiscrepancyFilter('all')}
@@ -315,82 +323,96 @@ export default function Reports() {
         {visibleDiscrepancies.length === 0 ? (
           <div className="px-5 py-8 text-center text-sm text-gray-400">
             {discrepancies.length === 0
-              ? 'All items accounted for \u2014 no outstanding discrepancies'
+              ? 'All items accounted for — no outstanding discrepancies'
               : 'No discrepancies found (items still in progress are filtered out)'}
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-200 bg-gray-50">
-                  <th className="px-4 py-2 text-left font-medium text-gray-600 w-8" />
-                  <th className="px-4 py-2 text-left font-medium text-gray-600">Docket</th>
-                  <th className="px-4 py-2 text-left font-medium text-gray-600">Department</th>
-                  <th className="px-4 py-2 text-left font-medium text-gray-600">Type</th>
-                  <th className="px-4 py-2 text-left font-medium text-gray-600">Date</th>
-                  <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
-                  <th className="px-4 py-2 text-right font-medium text-gray-600">Sent</th>
-                  <th className="px-4 py-2 text-right font-medium text-gray-600">Received</th>
-                  <th className="px-4 py-2 text-right font-medium text-gray-600">Outstanding</th>
-                  <th className="px-4 py-2 text-right font-medium text-gray-600">Value (\u00a3)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleDiscrepancies.map(o => (
-                  <Fragment key={o.id}>
-                    <tr
-                      onClick={() => toggleExpand(o.id)}
-                      className="border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
-                    >
-                      <td className="px-4 py-2.5">
-                        {expandedOrders.has(o.id)
-                          ? <ChevronDown className="w-4 h-4 text-gray-400" />
-                          : <ChevronRight className="w-4 h-4 text-gray-400" />}
-                      </td>
-                      <td className="px-4 py-2.5 font-mono text-xs">{o.docket}</td>
-                      <td className="px-4 py-2.5">{o.department}</td>
-                      <td className="px-4 py-2.5 text-xs">{o.type}</td>
-                      <td className="px-4 py-2.5 text-xs text-gray-500">{format(new Date(o.date), 'dd MMM')}</td>
-                      <td className="px-4 py-2.5">
-                        <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${ORDER_STATUS_COLORS[o.status as OrderStatus] || 'bg-gray-100 text-gray-600'}`}>
-                          {ORDER_STATUS_LABELS[o.status as OrderStatus] || o.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2.5 text-right">{o.totalSent}</td>
-                      <td className="px-4 py-2.5 text-right">{o.totalReceived}</td>
-                      <td className="px-4 py-2.5 text-right font-semibold text-amber-600">{o.totalOutstanding}</td>
-                      <td className="px-4 py-2.5 text-right font-semibold text-amber-600">
-                        {(() => {
-                          const val = o.items.reduce((s, i) => s + (i.price_at_time ?? 0) * i.outstanding, 0)
-                          return val > 0 ? `\u00a3${val.toFixed(2)}` : '\u2014'
-                        })()}
-                      </td>
-                    </tr>
-                    {expandedOrders.has(o.id) && o.items.map((item, idx) => (
-                      <tr key={`${o.id}-${idx}`} className="bg-amber-50/50 border-b border-amber-100/50">
-                        <td />
-                        <td colSpan={5} className="px-4 py-1.5 text-xs text-gray-600 pl-12">{item.item_name}</td>
-                        <td className="px-4 py-1.5 text-right text-xs">{item.quantity_sent}</td>
-                        <td className="px-4 py-1.5 text-right text-xs">{item.quantity_received ?? 0}</td>
-                        <td className="px-4 py-1.5 text-right text-xs font-medium text-amber-600">-{item.outstanding}</td>
-                        <td className="px-4 py-1.5 text-right text-xs text-amber-600">
-                          {item.price_at_time ? `\u00a3${(item.price_at_time * item.outstanding).toFixed(2)}` : '\u2014'}
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-200 bg-gray-50">
+                    <th className="px-4 py-2 text-left font-medium text-gray-600 w-8" />
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Docket</th>
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Department</th>
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Type</th>
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Date</th>
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Sent</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Received</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Outstanding</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Value (£)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(outstandingExpanded ? visibleDiscrepancies : visibleDiscrepancies.slice(0, 3)).map(o => (
+                    <Fragment key={o.id}>
+                      <tr
+                        onClick={() => toggleExpand(o.id)}
+                        className="border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
+                      >
+                        <td className="px-4 py-2.5">
+                          {expandedOrders.has(o.id)
+                            ? <ChevronDown className="w-4 h-4 text-gray-400" />
+                            : <ChevronRight className="w-4 h-4 text-gray-400" />}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-xs">{o.docket}</td>
+                        <td className="px-4 py-2.5">{o.department}</td>
+                        <td className="px-4 py-2.5 text-xs">{o.type}</td>
+                        <td className="px-4 py-2.5 text-xs text-gray-500">{format(new Date(o.date), 'dd MMM')}</td>
+                        <td className="px-4 py-2.5">
+                          <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${ORDER_STATUS_COLORS[o.status as OrderStatus] || 'bg-gray-100 text-gray-600'}`}>
+                            {ORDER_STATUS_LABELS[o.status as OrderStatus] || o.status}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 text-right">{o.totalSent}</td>
+                        <td className="px-4 py-2.5 text-right">{o.totalReceived}</td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-amber-600">{o.totalOutstanding}</td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-amber-600">
+                          {(() => {
+                            const val = o.items.reduce((s, i) => s + (i.price_at_time ?? 0) * i.outstanding, 0)
+                            return val > 0 ? `£${val.toFixed(2)}` : '—'
+                          })()}
                         </td>
                       </tr>
-                    ))}
-                  </Fragment>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                      {expandedOrders.has(o.id) && o.items.map((item, idx) => (
+                        <tr key={`${o.id}-${idx}`} className="bg-amber-50/50 border-b border-amber-100/50">
+                          <td />
+                          <td colSpan={5} className="px-4 py-1.5 text-xs text-gray-600 pl-12">{item.item_name}</td>
+                          <td className="px-4 py-1.5 text-right text-xs">{item.quantity_sent}</td>
+                          <td className="px-4 py-1.5 text-right text-xs">{item.quantity_received ?? 0}</td>
+                          <td className="px-4 py-1.5 text-right text-xs font-medium text-amber-600">-{item.outstanding}</td>
+                          <td className="px-4 py-1.5 text-right text-xs text-amber-600">
+                            {item.price_at_time ? `£${(item.price_at_time * item.outstanding).toFixed(2)}` : '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {visibleDiscrepancies.length > 3 && (
+              <button
+                onClick={() => setOutstandingExpanded(prev => !prev)}
+                className="w-full py-2.5 text-sm font-medium text-navy hover:text-gold border-t border-gray-100 transition-colors flex items-center justify-center gap-1"
+              >
+                {outstandingExpanded ? (
+                  <>Show less <ChevronDown className="w-4 h-4 rotate-180" /></>
+                ) : (
+                  <>See {visibleDiscrepancies.length - 3} more orders <ChevronDown className="w-4 h-4" /></>
+                )}
+              </button>
+            )}
+          </>
         )}
       </div>
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Monthly Orders */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Orders ({year})</h3>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Orders ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
             <BarChart data={monthlyData} barSize={20}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
@@ -407,8 +429,8 @@ export default function Reports() {
         </div>
 
         {/* Monthly Cost inc VAT */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Monthly Cost inc VAT ({year})</h3>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Cost inc VAT ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
             <BarChart data={monthlyData} barSize={20}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
@@ -428,8 +450,8 @@ export default function Reports() {
         </div>
 
         {/* Orders by Department */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Orders by Department</h3>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Orders by Department</h3>
           {deptChartData.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(180, deptChartData.length * 36)}>
               <BarChart data={deptChartData} layout="vertical" barSize={16}>
@@ -450,8 +472,8 @@ export default function Reports() {
         </div>
 
         {/* Cost by Department inc VAT */}
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">Cost by Department inc VAT</h3>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Cost by Department inc VAT</h3>
           {deptCostChartData.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(180, deptCostChartData.length * 36)}>
               <BarChart data={deptCostChartData} layout="vertical" barSize={16}>
@@ -476,9 +498,11 @@ export default function Reports() {
       </div>
 
       {/* Department Breakdown */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
-          <Building2 className="w-4 h-4 text-gray-500" />
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-navy/10 flex items-center justify-center">
+            <Building2 className="w-4 h-4 text-navy" />
+          </div>
           <h3 className="text-sm font-semibold text-gray-900">Department Breakdown</h3>
         </div>
         <div className="overflow-x-auto">
@@ -542,9 +566,11 @@ export default function Reports() {
       </div>
 
       {/* Yearly Summary */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
-          <TrendingUp className="w-4 h-4 text-gray-500" />
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-gold/15 flex items-center justify-center">
+            <TrendingUp className="w-4 h-4 text-gold-dark" />
+          </div>
           <h3 className="text-sm font-semibold text-gray-900">Yearly Summary \u2014 {year}</h3>
         </div>
         <div className="overflow-x-auto">
@@ -627,16 +653,26 @@ interface DiscrepancyOrder {
 
 // ── KPI Card ──
 
-function KpiCard({ icon, label, value, alert }: {
-  icon: React.ReactNode; label: string; value: string | number; alert?: boolean
+function KpiCard({ icon, label, value, alert, color = 'navy' }: {
+  icon: React.ReactNode; label: string; value: string | number; alert?: boolean; color?: 'navy' | 'gold' | 'emerald' | 'amber'
 }) {
+  const colorMap = {
+    navy: 'bg-navy/10 text-navy',
+    gold: 'bg-gold/15 text-gold-dark',
+    emerald: 'bg-emerald-50 text-emerald-600',
+    amber: 'bg-amber-50 text-amber-600',
+  }
   return (
-    <div className={`bg-white rounded-xl border p-4 ${alert ? 'border-amber-200 bg-amber-50/50' : 'border-gray-200'}`}>
-      <div className="flex items-center gap-1.5 text-gray-500 mb-1">
-        {icon}
-        <span className="text-xs font-medium">{label}</span>
+    <div className={`bg-white rounded-2xl border p-4 shadow-sm hover:shadow-md transition-shadow ${alert ? 'border-amber-200 ring-1 ring-amber-100' : 'border-gray-100'}`}>
+      <div className="flex items-center gap-3">
+        <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${alert ? 'bg-amber-50 text-amber-600' : colorMap[color]}`}>
+          {icon}
+        </div>
+        <div className="min-w-0">
+          <p className={`text-xl font-bold ${alert ? 'text-amber-600' : 'text-gray-900'}`}>{value}</p>
+          <p className="text-[11px] font-medium text-gray-400 uppercase tracking-wide">{label}</p>
+        </div>
       </div>
-      <p className={`text-xl font-semibold ${alert ? 'text-amber-600' : 'text-gray-900'}`}>{value}</p>
     </div>
   )
 }
