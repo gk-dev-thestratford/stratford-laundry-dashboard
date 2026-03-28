@@ -12,6 +12,13 @@ export interface Filters {
   outstanding: boolean // true = only show orders with outstanding items
 }
 
+async function getDashboardUserName(): Promise<string> {
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return 'Dashboard'
+  const { data } = await supabase.from('dashboard_users').select('name, email').eq('id', user.id).single()
+  return data?.name || data?.email || 'Dashboard'
+}
+
 export function useOrders() {
   const [orders, setOrders] = useState<Order[]>([])
   const [departments, setDepartments] = useState<Department[]>([])
@@ -112,11 +119,12 @@ export function useOrders() {
       .eq('id', orderId)
 
     if (!error) {
+      const userName = await getDashboardUserName()
       await supabase.from('order_status_log').insert({
         order_id: orderId,
         status,
         reason,
-        changed_by_name: 'Dashboard',
+        changed_by_name: userName,
       })
 
       // When marking received/completed, auto-fill quantity_received for items
@@ -225,6 +233,7 @@ export function useOrders() {
     onProgress?: (done: number, total: number) => void,
   ) => {
     const total = orderIds.length
+    const userName = await getDashboardUserName()
     for (let i = 0; i < total; i++) {
       const orderId = orderIds[i]
 
@@ -233,7 +242,7 @@ export function useOrders() {
       await supabase.from('order_status_log').insert({
         order_id: orderId,
         status,
-        changed_by_name: 'Dashboard',
+        changed_by_name: userName,
       })
 
       // Auto-fill quantity_received when marking received/completed

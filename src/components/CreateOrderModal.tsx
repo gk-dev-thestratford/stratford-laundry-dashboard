@@ -93,10 +93,18 @@ export default function CreateOrderModal({ departments, onClose, onCreated }: Cr
         if (itemsError) throw itemsError
       }
 
+      // Get current user name for status log
+      let userName = 'Dashboard'
+      const { data: { user: authUser } } = await supabase.auth.getUser()
+      if (authUser) {
+        const { data: du } = await supabase.from('dashboard_users').select('name, email').eq('id', authUser.id).single()
+        userName = du?.name || du?.email || 'Dashboard'
+      }
+
       await supabase.from('order_status_log').insert({
         order_id: order.id,
         status: 'submitted',
-        changed_by_name: 'Dashboard',
+        changed_by_name: userName,
       })
 
       onCreated()
