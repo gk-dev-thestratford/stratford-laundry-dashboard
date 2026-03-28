@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Clock, Upload } from 'lucide-react'
+import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { format } from 'date-fns'
+import { utils, writeFile } from 'xlsx'
 
 interface SavedReconciliation {
   id: string
@@ -19,6 +20,7 @@ interface SavedReconciliation {
   mismatch_count: number
   not_found_count: number
   missing_count: number
+  invoice_file_path: string | null
   department_breakdown: {
     departmentName: string
     orderCount: number
@@ -46,6 +48,50 @@ export default function ReconciliationHistory() {
   }, [])
 
   useEffect(() => { loadHistory() }, [loadHistory])
+
+  async function downloadInvoice(h: SavedReconciliation) {
+    if (!h.invoice_file_path) return
+    const { data } = await supabase.storage.from('reconciliations').download(h.invoice_file_path)
+    if (data) {
+      const url = URL.createObjectURL(data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `invoice-${h.invoice_number || 'unknown'}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+    }
+  }
+
+  function exportExcel(h: SavedReconciliation) {
+    const summarySheet = [{
+      'Invoice Number': h.invoice_number,
+      'Invoice Date': h.invoice_date,
+      'Invoice Period': h.invoice_period,
+      'Reconciled On': format(new Date(h.created_at), 'dd/MM/yyyy HH:mm'),
+      'Reconciled By': h.created_by,
+      'Invoice NET (\u00a3)': h.invoice_net,
+      'Invoice Gross (\u00a3)': h.invoice_gross,
+      'System Total (\u00a3)': h.system_total,
+      'TopUp (\u00a3)': h.topup_total,
+      'Matched': h.matched_count,
+      'Price Mismatches': h.mismatch_count,
+      'Not Found': h.not_found_count,
+      'Missing': h.missing_count,
+    }]
+    const deptSheet = (h.department_breakdown || []).map(d => ({
+      'Department': d.departmentName,
+      'Orders': d.orderCount,
+      'Invoice NET (\u00a3)': d.invoiceNet,
+      'System Total (\u00a3)': d.systemTotal,
+      'TopUp (\u00a3)': d.allocatedTopUp,
+      'Total NET (\u00a3)': d.totalCostNet,
+      'Total inc VAT (\u00a3)': d.totalCostGross,
+    }))
+    const wb = utils.book_new()
+    utils.book_append_sheet(wb, utils.json_to_sheet(summarySheet), 'Summary')
+    if (deptSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(deptSheet), 'Department Breakdown')
+    writeFile(wb, `reconciliation-${h.invoice_number || 'report'}-${format(new Date(h.created_at), 'yyyy-MM-dd')}.xlsx`)
+  }
 
   return (
     <div className="space-y-6">
@@ -113,9 +159,31 @@ export default function ReconciliationHistory() {
                       </td>
                       <td className="px-4 py-3 text-gray-500 text-xs">{h.created_by}</td>
                     </tr>
-                    {isExpanded && h.department_breakdown && h.department_breakdown.length > 0 && (
+                    {isExpanded && (
                       <tr key={`${h.id}-detail`}>
                         <td colSpan={9} className="px-6 py-4 bg-gray-50/50">
+                          {/* Download buttons */}
+                          <div className="flex items-center gap-2 mb-4">
+                            <span className="text-xs font-semibold text-gray-500 uppercase mr-2">Documents</span>
+                            {h.invoice_file_path && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); downloadInvoice(h) }}
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-navy bg-navy/5 border border-navy/10 rounded-lg hover:bg-navy/10 transition-colors"
+                              >
+                                <FileText className="w-3.5 h-3.5" />
+                                Invoice PDF
+                              </button>
+                            )}
+                            <button
+                              onClick={(e) => { e.stopPropagation(); exportExcel(h) }}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-green-700 bg-green-50 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
+                            >
+                              <FileSpreadsheet className="w-3.5 h-3.5" />
+                              Excel Report
+                            </button>
+                          </div>
+
+                          {h.department_breakdown && h.department_breakdown.length > 0 && <>
                           <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Department Breakdown</p>
                           <table className="w-full text-xs">
                             <thead>
@@ -141,6 +209,7 @@ export default function ReconciliationHistory() {
                               ))}
                             </tbody>
                           </table>
+                          </>}
                         </td>
                       </tr>
                     )}

@@ -383,6 +383,16 @@ export default function Reconciliation() {
     setSaving(true)
     const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
     const { data: { user } } = await supabase.auth.getUser()
+    const ts = Date.now()
+
+    // Upload invoice PDF to storage if we have the file
+    let invoicePath: string | null = null
+    if (file) {
+      const path = `invoices/${ts}-${file.name}`
+      const { error: uploadErr } = await supabase.storage.from('reconciliations').upload(path, file, { contentType: 'application/pdf' })
+      if (!uploadErr) invoicePath = path
+    }
+
     await supabase.from('reconciliations').insert({
       invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
       invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
@@ -390,6 +400,7 @@ export default function Reconciliation() {
       system_total: +result.systemTotal.toFixed(2), topup_total: +totalTopUp.toFixed(2),
       matched_count: result.stats.matched, mismatch_count: result.stats.priceMismatch,
       not_found_count: result.stats.notFound, missing_count: result.stats.missing,
+      invoice_file_path: invoicePath,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
@@ -397,7 +408,7 @@ export default function Reconciliation() {
       })),
     })
     setSaving(false); setSaved(true); loadHistory()
-  }, [result, invoice, loadHistory])
+  }, [result, invoice, file, loadHistory])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
