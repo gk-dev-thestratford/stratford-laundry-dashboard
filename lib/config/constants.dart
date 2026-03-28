@@ -31,6 +31,14 @@ class AppConstants {
   static const String orderTypeHskLinen = 'hsk_linen';
   static const String orderTypeFnbLinen = 'fnb_linen';
   static const String orderTypeGuestLaundry = 'guest_laundry';
+
+  // Pool-tracked items (napkins use ledger-based tracking, not per-ticket)
+  static const String napkinItemName = 'Linen Napkins';
+  static const Set<String> poolTrackedItemNames = {'Napkin', 'Linen Napkins', 'napkin', 'linen napkins'};
+
+  /// Whether an item name is pool-tracked (napkin)
+  static bool isPoolTracked(String itemName) =>
+      itemName.toLowerCase().contains('napkin');
 }
 
 /// Labels for display

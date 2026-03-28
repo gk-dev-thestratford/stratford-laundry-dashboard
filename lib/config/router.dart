@@ -8,6 +8,7 @@ import '../screens/order/order_success_screen.dart';
 import '../screens/admin/admin_login_screen.dart';
 import '../screens/admin/admin_dashboard_screen.dart';
 import '../screens/admin/order_detail_screen.dart';
+import '../screens/admin/napkin_returns_screen.dart';
 
 class AppRouter {
   static final router = GoRouter(
@@ -63,6 +64,11 @@ class AppRouter {
         builder: (context, state) => AdminOrderDetailScreen(
           orderId: state.pathParameters['orderId']!,
         ),
+      ),
+      GoRoute(
+        path: '/admin/napkin-returns',
+        name: 'napkinReturns',
+        builder: (context, state) => const NapkinReturnsScreen(),
       ),
     ],
   );

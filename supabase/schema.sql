@@ -96,6 +96,24 @@ CREATE INDEX idx_orders_parent ON orders(parent_order_id);
 CREATE INDEX idx_order_items_order ON order_items(order_id);
 CREATE INDEX idx_status_log_order ON order_status_log(order_id);
 
+-- ── Linen Napkin Pool Ledger ──
+-- Tracks napkin quantities as a running balance (OUT = sent to laundry, IN = received back).
+-- Napkins are pool-tracked rather than per-ticket because the laundry company rounds return quantities.
+CREATE TABLE linen_ledger (
+  id TEXT PRIMARY KEY,
+  item_name TEXT NOT NULL DEFAULT 'Linen Napkins',
+  direction TEXT NOT NULL CHECK (direction IN ('out', 'in')),
+  quantity INTEGER NOT NULL,
+  order_id TEXT REFERENCES orders(id) ON DELETE SET NULL,
+  department_id TEXT REFERENCES departments(id),
+  note TEXT,
+  recorded_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_linen_ledger_direction ON linen_ledger(direction);
+CREATE INDEX idx_linen_ledger_created ON linen_ledger(created_at DESC);
+
 -- ── Row Level Security ──
 ALTER TABLE departments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE item_catalogue ENABLE ROW LEVEL SECURITY;
@@ -103,6 +121,7 @@ ALTER TABLE admin_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_status_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE linen_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dashboard_users ENABLE ROW LEVEL SECURITY;
 
 -- Anon (tablet app) can read reference data
@@ -121,6 +140,11 @@ CREATE POLICY "anon_update_orders" ON orders FOR UPDATE USING (true);
 CREATE POLICY "anon_read_order_items" ON order_items FOR SELECT USING (true);
 CREATE POLICY "anon_update_order_items" ON order_items FOR UPDATE USING (true);
 CREATE POLICY "anon_read_status_log" ON order_status_log FOR SELECT USING (true);
+CREATE POLICY "anon_update_status_log" ON order_status_log FOR UPDATE USING (true);
+
+-- Anon can insert and read linen ledger entries (tablet app)
+CREATE POLICY "anon_insert_linen_ledger" ON linen_ledger FOR INSERT WITH CHECK (true);
+CREATE POLICY "anon_read_linen_ledger" ON linen_ledger FOR SELECT USING (true);
 
 -- Authenticated dashboard users: full access
 CREATE POLICY "auth_all_orders" ON orders FOR ALL USING (auth.role() = 'authenticated');
@@ -128,6 +152,7 @@ CREATE POLICY "auth_all_items" ON order_items FOR ALL USING (auth.role() = 'auth
 CREATE POLICY "auth_all_log" ON order_status_log FOR ALL USING (auth.role() = 'authenticated');
 CREATE POLICY "auth_all_departments" ON departments FOR ALL USING (auth.role() = 'authenticated');
 CREATE POLICY "auth_all_catalogue" ON item_catalogue FOR ALL USING (auth.role() = 'authenticated');
+CREATE POLICY "auth_all_linen_ledger" ON linen_ledger FOR ALL USING (auth.role() = 'authenticated');
 CREATE POLICY "auth_read_dashboard_users" ON dashboard_users FOR SELECT USING (auth.uid() = id);
 
 -- ── Seed Data: Departments ──

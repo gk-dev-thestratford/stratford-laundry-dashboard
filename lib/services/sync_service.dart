@@ -212,18 +212,30 @@ class SyncService {
             case 'update':
               if (tableName == 'orders') {
                 final orderId = data['id'] as String;
+                final newStatus = data['status'] as String;
                 await SupabaseService.instance.updateOrderStatus(
                   orderId,
-                  data['status'] as String,
+                  newStatus,
                 );
-                // Push latest status log entry for this order
+                // Push only status logs that haven't been synced yet.
+                // We fetch all logs and check which ones exist in Supabase,
+                // but for simplicity we just INSERT new logs (not upsert)
+                // to avoid UPDATE RLS issues on order_status_log.
                 final logs = await DatabaseService.instance.getOrderStatusLog(orderId);
-                if (logs.isNotEmpty) {
-                  await SupabaseService.instance.pushStatusLog(logs.last);
+                for (final log in logs) {
+                  await SupabaseService.instance.insertStatusLog(log);
                 }
+                if (logs.isNotEmpty) debugPrint('[Push] Pushed ${logs.length} status logs');
               }
             case 'delete':
-              await SupabaseService.instance.deleteOrder(data['id'] as String);
+              if (tableName == 'orders') {
+                await SupabaseService.instance.deleteOrder(data['id'] as String);
+              }
+          }
+
+          // Handle linen_ledger entries (separate from orders switch)
+          if (tableName == 'linen_ledger' && operation == 'insert') {
+            await SupabaseService.instance.insertLedgerEntry(data);
           }
 
           await DatabaseService.instance.markSynced(item['id'] as int);

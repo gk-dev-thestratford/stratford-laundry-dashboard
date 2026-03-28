@@ -21,7 +21,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -33,6 +33,21 @@ class DatabaseService {
     }
     if (oldVersion < 3) {
       await db.execute('ALTER TABLE admin_users ADD COLUMN can_delete_orders INTEGER NOT NULL DEFAULT 0');
+    }
+    if (oldVersion < 4) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS linen_ledger (
+          id TEXT PRIMARY KEY,
+          item_name TEXT NOT NULL DEFAULT 'Linen Napkins',
+          direction TEXT NOT NULL,
+          quantity INTEGER NOT NULL,
+          order_id TEXT,
+          department_id TEXT,
+          note TEXT,
+          recorded_by TEXT,
+          created_at TEXT NOT NULL
+        )
+      ''');
     }
   }
 
@@ -116,6 +131,20 @@ class DatabaseService {
         reason TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE linen_ledger (
+        id TEXT PRIMARY KEY,
+        item_name TEXT NOT NULL DEFAULT 'Linen Napkins',
+        direction TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        order_id TEXT,
+        department_id TEXT,
+        note TEXT,
+        recorded_by TEXT,
+        created_at TEXT NOT NULL
       )
     ''');
 
@@ -665,5 +694,87 @@ class DatabaseService {
       'expired_orders': (expiredResult.first['count'] as int?) ?? 0,
       'old_sync_entries': (syncResult.first['count'] as int?) ?? 0,
     };
+  }
+
+  // ── Linen Napkin Pool Ledger ──
+
+  /// Insert a ledger entry (OUT when collected, IN when received back).
+  Future<void> insertLedgerEntry(Map<String, dynamic> entry) async {
+    final db = await database;
+    await db.insert('linen_ledger', entry);
+  }
+
+  /// Get the running pool balance (total OUT - total IN).
+  Future<int> getLedgerBalance() async {
+    final db = await database;
+    final result = await db.rawQuery('''
+      SELECT
+        COALESCE(SUM(CASE WHEN direction = 'out' THEN quantity ELSE 0 END), 0) -
+        COALESCE(SUM(CASE WHEN direction = 'in' THEN quantity ELSE 0 END), 0) AS balance
+      FROM linen_ledger
+    ''');
+    return (result.first['balance'] as int?) ?? 0;
+  }
+
+  /// Get ledger entries filtered by date range.
+  Future<List<Map<String, dynamic>>> getLedgerEntries({DateTime? since, int limit = 200}) async {
+    final db = await database;
+    if (since != null) {
+      return db.query('linen_ledger',
+        where: 'created_at >= ?',
+        whereArgs: [since.toIso8601String()],
+        orderBy: 'created_at DESC',
+        limit: limit,
+      );
+    }
+    return db.query('linen_ledger', orderBy: 'created_at DESC', limit: limit);
+  }
+
+  /// Get total OUT and total IN quantities.
+  Future<Map<String, int>> getLedgerTotals() async {
+    final db = await database;
+    final result = await db.rawQuery('''
+      SELECT
+        COALESCE(SUM(CASE WHEN direction = 'out' THEN quantity ELSE 0 END), 0) AS total_out,
+        COALESCE(SUM(CASE WHEN direction = 'in' THEN quantity ELSE 0 END), 0) AS total_in
+      FROM linen_ledger
+    ''');
+    return {
+      'total_out': (result.first['total_out'] as int?) ?? 0,
+      'total_in': (result.first['total_in'] as int?) ?? 0,
+    };
+  }
+
+  /// Check if an order contains any pool-tracked (napkin) items.
+  Future<bool> orderHasNapkins(String orderId) async {
+    final db = await database;
+    final items = await db.query('order_items',
+      where: 'order_id = ?', whereArgs: [orderId]);
+    return items.any((i) =>
+      (i['item_name'] as String? ?? '').toLowerCase().contains('napkin'));
+  }
+
+  /// Check if an order contains ONLY pool-tracked (napkin) items.
+  Future<bool> orderIsNapkinsOnly(String orderId) async {
+    final db = await database;
+    final items = await db.query('order_items',
+      where: 'order_id = ?', whereArgs: [orderId]);
+    if (items.isEmpty) return false;
+    return items.every((i) =>
+      (i['item_name'] as String? ?? '').toLowerCase().contains('napkin'));
+  }
+
+  /// Get total napkin quantity sent for an order.
+  Future<int> getNapkinQuantityForOrder(String orderId) async {
+    final db = await database;
+    final items = await db.query('order_items',
+      where: 'order_id = ?', whereArgs: [orderId]);
+    int total = 0;
+    for (final item in items) {
+      if ((item['item_name'] as String? ?? '').toLowerCase().contains('napkin')) {
+        total += (item['quantity_sent'] as int?) ?? 0;
+      }
+    }
+    return total;
   }
 }

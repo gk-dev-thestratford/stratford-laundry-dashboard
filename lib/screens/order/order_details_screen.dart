@@ -136,6 +136,7 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
         departmentId: _selectedDepartmentId,
         departmentName: dept?.name,
         staffName: _nameController.text.trim(),
+        email: _emailController.text.trim().isEmpty ? null : _emailController.text.trim(),
         notes: _notesController.text.trim().isEmpty ? null : _notesController.text.trim(),
       );
     }
@@ -367,6 +368,26 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
             ),
           ),
         ],
+      ),
+      const SizedBox(height: AppSpacing.lg),
+
+      _buildSectionLabel('Email (for order updates)'),
+      const SizedBox(height: AppSpacing.sm),
+      TextFormField(
+        controller: _emailController,
+        keyboardType: TextInputType.emailAddress,
+        autocorrect: false,
+        enableSuggestions: false,
+        decoration: const InputDecoration(
+          hintText: 'Enter guest email address',
+          prefixIcon: Icon(Icons.email_outlined),
+        ),
+        validator: (v) {
+          if (v == null || v.trim().isEmpty) return null;
+          final emailRegex = RegExp(r'^[\w\.\-\+]+@[\w\.\-]+\.\w{2,}$');
+          if (!emailRegex.hasMatch(v.trim())) return 'Please enter a valid email';
+          return null;
+        },
       ),
       const SizedBox(height: AppSpacing.lg),
 

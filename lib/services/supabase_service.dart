@@ -40,6 +40,16 @@ class SupabaseService {
     await _client!.from('order_status_log').upsert(log);
   }
 
+  /// Insert a status log — ignores duplicates (no UPDATE needed, avoids RLS issue).
+  Future<void> insertStatusLog(Map<String, dynamic> log) async {
+    if (!isInitialized) return;
+    try {
+      await _client!.from('order_status_log').insert(log);
+    } catch (_) {
+      // Ignore duplicate key errors — log was already synced
+    }
+  }
+
   Future<List<Map<String, dynamic>>> fetchOrders({DateTime? since}) async {
     if (!isInitialized) return [];
     var query = _client!.from('orders').select('*, departments(*), order_items(*, item_catalogue(*))');
@@ -77,5 +87,21 @@ class SupabaseService {
   Future<List<Map<String, dynamic>>> fetchAdminUsers() async {
     if (!isInitialized) return [];
     return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders');
+  }
+
+  // ── Linen Ledger ──
+
+  Future<void> insertLedgerEntry(Map<String, dynamic> entry) async {
+    if (!isInitialized) return;
+    try {
+      await _client!.from('linen_ledger').insert(entry);
+    } catch (_) {
+      // Ignore duplicate key errors
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchLedgerEntries() async {
+    if (!isInitialized) return [];
+    return await _client!.from('linen_ledger').select().order('created_at', ascending: false);
   }
 }

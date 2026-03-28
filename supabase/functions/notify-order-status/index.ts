@@ -12,9 +12,9 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
-// Laundrevo report emails — update these when final addresses are confirmed
-const LAUNDREVO_COLLECTED_EMAIL = "kunov.sniper@gmail.com"; // TODO: replace with Laundrevo email
-const LAUNDREVO_RECEIVED_EMAIL = "kunov.sniper@gmail.com";  // TODO: replace with final recipient
+// Report emails — daily report at 2pm + express alerts after 2pm
+const REPORT_EMAILS = ["georgi@thestratford.com", "set1000@hotmail.com"];
+const DAILY_REPORT_HOUR_UTC = 14; // 2pm GMT / 3pm BST
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -276,7 +276,7 @@ function buildCollectionReport(orders: any[]) {
 
       <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
         The Stratford Hotel — Laundry Management System<br>
-        Powered by Laundrevo Limited
+        Managed by the Housekeeping Department
       </div>
     </div>
   `;
@@ -350,7 +350,82 @@ function buildReceivedReport(orders: any[]) {
 
       <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
         The Stratford Hotel — Laundry Management System<br>
-        Powered by Laundrevo Limited
+        Managed by the Housekeeping Department
+      </div>
+    </div>
+  `;
+}
+
+// ── Helper: build express alert for after-2pm collections/returns ──
+function buildExpressAlert(order: any, status: string) {
+  const isCollected = status === "collected";
+  const label = isCollected ? "Express Collection" : "Express Return";
+  const colour = isCollected ? "#E65100" : "#00838F";
+  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+  const time = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+  const items = order.order_items || [];
+  const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
+  const totalQty = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
+
+  const orderTypeLabel: Record<string, string> = {
+    uniform: "Uniform",
+    hsk_linen: "Housekeeping Linen",
+    fnb_linen: "F&B Linen",
+    guest_laundry: "Guest Laundry",
+  };
+
+  return `
+    <div style="font-family:sans-serif;max-width:600px;margin:0 auto;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
+      <div style="background:#1B2A4A;padding:24px;text-align:center">
+        <h1 style="color:white;margin:0;font-size:22px;letter-spacing:2px">THE STRATFORD HOTEL</h1>
+        <p style="color:#C9A84C;margin:6px 0 0;font-size:12px;letter-spacing:1px">Autograph Collection</p>
+      </div>
+
+      <div style="background:${colour};padding:14px 24px;text-align:center">
+        <h2 style="color:white;margin:0;font-size:18px">${label} — After Daily Report</h2>
+      </div>
+
+      <div style="padding:24px;background:white">
+        <div style="margin:0 0 16px;padding:12px 16px;background:#FFF8E1;border-left:4px solid #C9A84C;border-radius:4px">
+          <p style="margin:0;color:#795548;font-size:13px"><strong>New item added after the 2pm daily report.</strong></p>
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;margin:0 0 20px;background:#f9f9f9;border-radius:6px">
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Docket Number</td>
+            <td style="padding:10px 16px;font-weight:bold;color:#1B2A4A;border-bottom:1px solid #eee">#${order.docket_number}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Order Type</td>
+            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${orderTypeLabel[order.order_type] || order.order_type}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Name</td>
+            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${order.staff_name || order.guest_name || "—"}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Department</td>
+            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${order.departments?.name || "—"}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Items</td>
+            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${itemsDesc || "—"}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Total Qty</td>
+            <td style="padding:10px 16px;font-weight:bold;color:#1B2A4A;border-bottom:1px solid #eee">${totalQty}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;color:#777;font-size:13px">Time</td>
+            <td style="padding:10px 16px;color:#333">${time} — ${today}</td>
+          </tr>
+        </table>
+      </div>
+
+      <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
+        The Stratford Hotel — Laundry Management System<br>
+        Managed by the Housekeeping Department
       </div>
     </div>
   `;
@@ -383,24 +458,19 @@ serve(async (req: Request) => {
       emailsSent.push(order.email);
     }
 
-    // 2. Send combined daily collection report to Laundrevo
-    if (status === "collected" && LAUNDREVO_COLLECTED_EMAIL) {
-      const todaysOrders = await fetchTodaysOrders("collected");
-      const reportHtml = buildCollectionReport(todaysOrders);
-      const today = new Date().toLocaleDateString("en-GB");
-      const reportSubject = `Daily Collection Report — ${today} (${todaysOrders.length} order${todaysOrders.length > 1 ? "s" : ""})`;
-      await sendEmail(LAUNDREVO_COLLECTED_EMAIL, reportSubject, reportHtml);
-      emailsSent.push(`laundrevo:${LAUNDREVO_COLLECTED_EMAIL}`);
-    }
-
-    // 3. Send combined daily receiving report
-    if (status === "received" && LAUNDREVO_RECEIVED_EMAIL) {
-      const todaysOrders = await fetchTodaysOrders("received");
-      const reportHtml = buildReceivedReport(todaysOrders);
-      const today = new Date().toLocaleDateString("en-GB");
-      const reportSubject = `Daily Receiving Report — ${today} (${todaysOrders.length} order${todaysOrders.length > 1 ? "s" : ""})`;
-      await sendEmail(LAUNDREVO_RECEIVED_EMAIL, reportSubject, reportHtml);
-      emailsSent.push(`report:${LAUNDREVO_RECEIVED_EMAIL}`);
+    // 2. After the daily report (2pm), send express alerts to the laundry company
+    //    for any new collections or returns that happen later in the day.
+    if ((status === "collected" || status === "received") && REPORT_EMAILS.length > 0) {
+      const nowUTC = new Date();
+      if (nowUTC.getUTCHours() >= DAILY_REPORT_HOUR_UTC) {
+        const expressHtml = buildExpressAlert(order, status);
+        const expressLabel = status === "collected" ? "Express Collection" : "Express Return";
+        const expressSubject = `${expressLabel} — Docket #${order.docket_number} (After Daily Report)`;
+        for (const email of REPORT_EMAILS) {
+          await sendEmail(email, expressSubject, expressHtml);
+          emailsSent.push(`express:${email}`);
+        }
+      }
     }
 
     if (emailsSent.length === 0) {

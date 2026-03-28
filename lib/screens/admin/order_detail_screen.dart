@@ -105,6 +105,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     final admin = ref.read(adminProvider).currentAdmin;
     final db = DatabaseService.instance;
     final uuid = const Uuid();
+    final now = DateTime.now().toIso8601String();
 
     await db.updateOrderStatus(widget.orderId, newStatus);
     await db.insertStatusLog({
@@ -114,18 +115,66 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       'changed_by': admin?.id,
       'changed_by_name': admin?.name,
       'reason': reason,
-      'created_at': DateTime.now().toIso8601String(),
+      'created_at': now,
     });
 
-    // Queue for Supabase sync
+    // When collected: log napkin OUT to ledger + auto-complete napkin-only orders
+    if (newStatus == AppConstants.statusCollected) {
+      final napkinQty = await db.getNapkinQuantityForOrder(widget.orderId);
+      if (napkinQty > 0) {
+        final order = await db.getOrder(widget.orderId);
+        final ledgerEntryId = uuid.v4();
+        await db.insertLedgerEntry({
+          'id': ledgerEntryId,
+          'item_name': 'Linen Napkins',
+          'direction': 'out',
+          'quantity': napkinQty,
+          'order_id': widget.orderId,
+          'department_id': order?['department_id'],
+          'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+          'recorded_by': admin?.name,
+          'created_at': now,
+        });
+        await db.addToSyncQueue('linen_ledger', ledgerEntryId, 'insert', jsonEncode({
+          'id': ledgerEntryId,
+          'item_name': 'Linen Napkins',
+          'direction': 'out',
+          'quantity': napkinQty,
+          'order_id': widget.orderId,
+          'department_id': order?['department_id'],
+          'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+          'recorded_by': admin?.name,
+          'created_at': now,
+        }));
+
+        // Napkin-only orders skip receiving — auto-complete
+        final isNapkinsOnly = await db.orderIsNapkinsOnly(widget.orderId);
+        if (isNapkinsOnly) {
+          await db.updateOrderStatus(widget.orderId, AppConstants.statusCompleted);
+          await db.insertStatusLog({
+            'id': uuid.v4(),
+            'order_id': widget.orderId,
+            'status': AppConstants.statusCompleted,
+            'changed_by': admin?.id,
+            'changed_by_name': admin?.name,
+            'reason': 'Napkins — pool tracked, auto-completed on collection',
+            'created_at': now,
+          });
+        }
+      }
+    }
+
+    // Queue for Supabase sync — use current order status (may have been auto-completed)
+    final currentOrder = await db.getOrder(widget.orderId);
+    final finalStatus = currentOrder?['status'] ?? newStatus;
     await db.addToSyncQueue('orders', widget.orderId, 'update',
-        jsonEncode({'id': widget.orderId, 'status': newStatus}));
+        jsonEncode({'id': widget.orderId, 'status': finalStatus}));
     SyncService.instance.pushPendingNow();
 
     await _loadOrder();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Status updated to ${AppLabels.statusLabels[newStatus]}')),
+        SnackBar(content: Text('Status updated to ${AppLabels.statusLabels[finalStatus]}')),
       );
     }
   }
@@ -137,14 +186,22 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     final db = DatabaseService.instance;
     final uuid = const Uuid();
 
-    // Collect received quantities from text fields
+    // Collect received quantities from text fields (skip pool-tracked napkin items)
     final received = <String, int>{};
     bool hasOutstanding = false;
     int totalReceived = 0;
 
     for (final item in _items) {
       final id = item['id'] as String;
+      final itemName = item['item_name'] as String? ?? '';
       final sent = item['quantity_sent'] as int;
+
+      // Napkins are pool-tracked — skip them in per-ticket receiving
+      if (AppConstants.isPoolTracked(itemName)) {
+        received[id] = 0; // Mark as 0 received (won't create outstanding)
+        continue;
+      }
+
       final controller = _receivedControllers[id];
       final qty = (controller != null && controller.text.isNotEmpty)
           ? (int.tryParse(controller.text) ?? 0)
@@ -191,6 +248,17 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     // Save received quantities on original order
     await db.updateReceivedQuantities(widget.orderId, received);
 
+    // Log "received" status so the webhook fires and user gets the email
+    await db.insertStatusLog({
+      'id': uuid.v4(),
+      'order_id': widget.orderId,
+      'status': AppConstants.statusReceived,
+      'changed_by': admin?.id,
+      'changed_by_name': admin?.name,
+      'reason': hasOutstanding ? 'Partial receipt' : null,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+
     String? newOrderId;
     if (hasOutstanding) {
       // Create new ticket with outstanding quantities
@@ -232,10 +300,10 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       });
     }
 
-    // Mark original as completed
+    // Mark original as completed (went through received → completed)
     await db.updateOrderStatus(widget.orderId, AppConstants.statusCompleted);
 
-    // Queue for Supabase sync
+    // Queue for Supabase sync — sync both the received status log and final completed status
     await db.addToSyncQueue('orders', widget.orderId, 'update',
         jsonEncode({'id': widget.orderId, 'status': AppConstants.statusCompleted}));
     if (hasOutstanding && newOrderId != null) {
@@ -402,13 +470,30 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
             ...List.generate(_items.length, (i) {
               final item = _items[i];
               final id = item['id'] as String;
+              final itemName = item['item_name'] as String;
+              final isPoolTracked = AppConstants.isPoolTracked(itemName);
               return Padding(
                 padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
                 child: Row(
                   children: [
                     Expanded(
                       flex: 3,
-                      child: Text(item['item_name'] as String, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, color: AppColors.grey800)),
+                      child: Row(
+                        children: [
+                          Flexible(child: Text(itemName, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, color: AppColors.grey800))),
+                          if (isPoolTracked) ...[
+                            const SizedBox(width: AppSpacing.sm),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: AppColors.gold.withValues(alpha: 0.15),
+                                borderRadius: AppRadius.smallBR,
+                              ),
+                              child: Text('Pool', style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold, color: AppColors.gold)),
+                            ),
+                          ],
+                        ],
+                      ),
                     ),
                     SizedBox(
                       width: 70,
@@ -418,23 +503,27 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
                     if (showReceived)
                       SizedBox(
                         width: 90,
-                        child: status == AppConstants.statusInProcessing
-                            ? SizedBox(
-                                height: 42,
-                                child: TextField(
-                                  controller: _receivedControllers[id],
-                                  keyboardType: TextInputType.number,
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize),
-                                  decoration: InputDecoration(
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.sm),
-                                    border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
-                                    hintText: '0',
-                                  ),
-                                ),
-                              )
-                            : Text('${item['quantity_received'] ?? 0}', textAlign: TextAlign.center,
-                                style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.medium)),
+                        child: isPoolTracked
+                            // Napkins are pool-tracked — no per-ticket receiving
+                            ? Text('—', textAlign: TextAlign.center,
+                                style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, color: AppColors.grey400))
+                            : status == AppConstants.statusInProcessing
+                                ? SizedBox(
+                                    height: 42,
+                                    child: TextField(
+                                      controller: _receivedControllers[id],
+                                      keyboardType: TextInputType.number,
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize),
+                                      decoration: InputDecoration(
+                                        contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.sm),
+                                        border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
+                                        hintText: '0',
+                                      ),
+                                    ),
+                                  )
+                                : Text('${item['quantity_received'] ?? 0}', textAlign: TextAlign.center,
+                                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.medium)),
                       ),
                   ],
                 ),

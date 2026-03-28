@@ -31,27 +31,29 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   String? _allTabTypeFilter;
 
   // Tab indices — use these constants instead of hardcoded numbers
-  static const _kPending = 0;
-  static const _kApproved = 1;
-  static const _kInProgress = 2;
-  static const _kCompleted = 3;
-  static const _kAll = 4;
-  static const _kRejected = 5;
+  static const _kRejected = 0;
+  static const _kPending = 1;
+  static const _kApproved = 2;
+  static const _kInProgress = 3;
+  static const _kCompleted = 4;
+  static const _kAll = 5;
+  static const _kNapkinReturns = 6;
 
-  static const _tabs = ['Pending', 'Approved', 'In Progress', 'Completed', 'All', 'Rejected'];
+  static const _tabs = ['Rejected', 'Pending', 'Approved', 'In Progress', 'Completed', 'All', 'Napkins'];
   static const _statusFilters = [
+    AppConstants.statusRejected,
     AppConstants.statusSubmitted,
     AppConstants.statusApproved,
     null, // In Progress = collected + in_processing
     AppConstants.statusCompleted,
     null, // All
-    AppConstants.statusRejected,
+    null, // Napkin Returns — navigates to separate screen
   ];
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: _tabs.length, vsync: this);
+    _tabController = TabController(length: _tabs.length, vsync: this, initialIndex: _kPending);
     _tabController.addListener(_onTabChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(adminProvider.notifier).refreshActivity();
@@ -267,6 +269,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final admin = ref.read(adminProvider).currentAdmin;
     final db = DatabaseService.instance;
     final uuid = const Uuid();
+    final now = DateTime.now().toIso8601String();
 
     for (final orderId in _selectedOrderIds.toList()) {
       await db.updateOrderStatus(orderId, AppConstants.statusCollected);
@@ -276,11 +279,17 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         'status': AppConstants.statusCollected,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
-        'created_at': DateTime.now().toIso8601String(),
+        'created_at': now,
       });
-      // Queue each status change for Supabase sync
+
+      // Log napkin OUT to ledger + auto-complete napkin-only orders
+      await _logNapkinOutAndAutoComplete(orderId, admin, db, uuid, now);
+
+      // Queue status change for Supabase sync
+      final order = await db.getOrder(orderId);
+      final finalStatus = order?['status'] ?? AppConstants.statusCollected;
       await db.addToSyncQueue('orders', orderId, 'update',
-          jsonEncode({'id': orderId, 'status': AppConstants.statusCollected}));
+          jsonEncode({'id': orderId, 'status': finalStatus}));
     }
     SyncService.instance.pushPendingNow();
 
@@ -291,6 +300,60 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('$count order(s) marked as Collected')),
       );
+    }
+  }
+
+  /// For napkin items: logs OUT to the linen ledger.
+  /// For napkin-only orders: auto-completes (skips receiving step).
+  Future<void> _logNapkinOutAndAutoComplete(
+    String orderId, dynamic admin, DatabaseService db, Uuid uuid, String now,
+  ) async {
+    final napkinQty = await db.getNapkinQuantityForOrder(orderId);
+    if (napkinQty <= 0) return;
+
+    // Get the order for department info
+    final order = await db.getOrder(orderId);
+
+    // Log OUT to linen ledger
+    final ledgerEntryId = uuid.v4();
+    await db.insertLedgerEntry({
+      'id': ledgerEntryId,
+      'item_name': 'Linen Napkins',
+      'direction': 'out',
+      'quantity': napkinQty,
+      'order_id': orderId,
+      'department_id': order?['department_id'],
+      'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+      'recorded_by': admin?.name,
+      'created_at': now,
+    });
+
+    // Queue ledger entry for Supabase sync
+    await db.addToSyncQueue('linen_ledger', ledgerEntryId, 'insert', jsonEncode({
+      'id': ledgerEntryId,
+      'item_name': 'Linen Napkins',
+      'direction': 'out',
+      'quantity': napkinQty,
+      'order_id': orderId,
+      'department_id': order?['department_id'],
+      'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+      'recorded_by': admin?.name,
+      'created_at': now,
+    }));
+
+    // If order is napkins-only, auto-complete (skip receiving)
+    final isNapkinsOnly = await db.orderIsNapkinsOnly(orderId);
+    if (isNapkinsOnly) {
+      await db.updateOrderStatus(orderId, AppConstants.statusCompleted);
+      await db.insertStatusLog({
+        'id': uuid.v4(),
+        'order_id': orderId,
+        'status': AppConstants.statusCompleted,
+        'changed_by': admin?.id,
+        'changed_by_name': admin?.name,
+        'reason': 'Napkins — pool tracked, auto-completed on collection',
+        'created_at': now,
+      });
     }
   }
 
@@ -545,23 +608,37 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                         children: _tabs.asMap().entries.map((entry) {
                           final idx = entry.key;
                           final label = entry.value;
-                          final count = _getTabCount(label);
-                          final isActive = _tabController.index == idx;
+                          final isNapkinTab = idx == _kNapkinReturns;
+                          final count = isNapkinTab ? 0 : _getTabCount(label);
+                          final isActive = !isNapkinTab && _tabController.index == idx;
 
                           return Padding(
-                            padding: EdgeInsets.only(right: label == 'Rejected' ? 0 : AppSpacing.sm, left: label == 'Rejected' ? AppSpacing.lg : 0),
+                            padding: EdgeInsets.only(
+                              right: AppSpacing.sm,
+                              left: isNapkinTab ? AppSpacing.lg : 0,
+                            ),
                             child: GestureDetector(
-                              onTap: () => _tabController.animateTo(idx),
+                              onTap: () {
+                                if (isNapkinTab) {
+                                  context.push('/admin/napkin-returns');
+                                } else {
+                                  _tabController.animateTo(idx);
+                                }
+                              },
                               child: AnimatedContainer(
                                 duration: const Duration(milliseconds: 200),
                                 padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
                                 decoration: BoxDecoration(
-                                  color: isActive
-                                      ? AppColors.white
-                                      : AppColors.white.withValues(alpha: 0.12),
+                                  color: isNapkinTab
+                                      ? AppColors.gold.withValues(alpha: 0.2)
+                                      : isActive
+                                          ? AppColors.white
+                                          : AppColors.white.withValues(alpha: 0.12),
                                   borderRadius: AppRadius.largeBR,
                                   border: Border.all(
-                                    color: isActive ? AppColors.white : AppColors.white.withValues(alpha: 0.2),
+                                    color: isNapkinTab
+                                        ? AppColors.gold.withValues(alpha: 0.5)
+                                        : isActive ? AppColors.white : AppColors.white.withValues(alpha: 0.2),
                                     width: 1.5,
                                   ),
                                 ),
@@ -571,7 +648,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                     Icon(
                                       _tabIcon(label),
                                       size: 20,
-                                      color: isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.8),
+                                      color: isNapkinTab
+                                          ? AppColors.gold
+                                          : isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.8),
                                     ),
                                     const SizedBox(width: AppSpacing.sm),
                                     Text(
@@ -579,8 +658,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                       style: TextStyle(
                                         fontFamily: 'Inter',
                                         fontSize: AppTextStyles.captionSize,
-                                        fontWeight: isActive ? AppTextStyles.bold : AppTextStyles.medium,
-                                        color: isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.85),
+                                        fontWeight: isActive || isNapkinTab ? AppTextStyles.bold : AppTextStyles.medium,
+                                        color: isNapkinTab
+                                            ? AppColors.gold
+                                            : isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.85),
                                       ),
                                     ),
                                     if (count > 0) ...[
@@ -630,6 +711,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'Completed' => Icons.done_all_rounded,
       'All' => Icons.list_alt_rounded,
       'Rejected' => Icons.cancel_outlined,
+      'Napkins' => Icons.dining,
       _ => Icons.circle_outlined,
     };
   }
