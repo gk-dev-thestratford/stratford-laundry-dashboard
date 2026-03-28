@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
-import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight } from 'lucide-react'
+import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
@@ -7,7 +7,7 @@ import {
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
 import { generateReconciliationPdf, type DepartmentDisplayRow } from '../lib/pdfReport'
-import type { Order, OrderType } from '../types'
+import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
@@ -64,6 +64,18 @@ interface SavedReconciliation {
   department_breakdown: DepartmentBreakdown[]
 }
 
+type ResolutionType = 'accepted' | 'challenged' | 'written_off' | 'deferred' | 'added_to_system'
+
+interface Resolution {
+  type: ResolutionType
+  note?: string
+}
+
+/** Unique key for a not_found invoice line */
+function notFoundKey(line: InvoiceLine): string {
+  return `${line.ticket}-${line.date}-${line.net}`
+}
+
 // ── Helpers ──
 
 function computeOrderCost(o: Order): number {
@@ -74,10 +86,6 @@ function computeOrderCost(o: Order): number {
   return o.total_price ?? 0
 }
 
-/**
- * Allocate TopUp charges to the department with the highest order volume
- * for that section type. E.g. napkins TopUp -> Kitchen E20, staff TopUp -> Main Kitchen
- */
 function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: InvoiceLine[]): DepartmentBreakdown[] {
   const deptMap = new Map<string, DepartmentBreakdown>()
 
@@ -100,7 +108,6 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
     dept.difference += row.difference
   }
 
-  // Allocate TopUp by section type -> department with most orders in that section
   if (topUpCharges.length > 0) {
     const sectionDeptCounts = new Map<string, Map<string, number>>()
     for (const row of rows) {
@@ -145,7 +152,6 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
   return Array.from(deptMap.values()).sort((a, b) => b.totalCostNet - a.totalCostNet)
 }
 
-/** Derive a human label for the regular items in a department based on the predominant order/section type */
 function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): string {
   const typeCounts = new Map<string, number>()
   for (const row of rows) {
@@ -155,7 +161,6 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
     typeCounts.set(t, (typeCounts.get(t) || 0) + 1)
   }
   if (typeCounts.size === 0) return 'Items'
-  // Pick the most common type
   let best = 'uniform'
   let max = 0
   for (const [t, c] of typeCounts) { if (c > max) { max = c; best = t } }
@@ -170,14 +175,12 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
   }
 }
 
-/** Build display rows from department breakdown + topUp, splitting items and TopUp per dept */
 function buildDepartmentDisplayRows(
   breakdown: DepartmentBreakdown[],
   allRows: ReconciliationRow[]
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
-    // Regular items row
     const label = departmentItemsLabel(allRows, dept.departmentName)
     displayRows.push({
       departmentName: dept.departmentName,
@@ -189,7 +192,6 @@ function buildDepartmentDisplayRows(
       difference: dept.difference,
       totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
     })
-    // TopUp sub-row if allocated
     if (dept.allocatedTopUp > 0) {
       displayRows.push({
         departmentName: dept.departmentName,
@@ -247,7 +249,6 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   const missingFromInvoice = orders.filter(o => {
     if (matchedOrderIds.has(o.id)) return false
     if (!invoiceOrderTypes.has(o.order_type)) return false
-    // Only flag orders within the invoice period
     if (period) {
       const orderDate = new Date(o.created_at)
       if (orderDate < period.start || orderDate > period.end) return false
@@ -288,7 +289,26 @@ export default function Reconciliation() {
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
-  const [missingResolutions, setMissingResolutions] = useState<Record<string, string>>({})
+
+  // Resolution tracking
+  const [notFoundResolutions, setNotFoundResolutions] = useState<Record<string, Resolution>>({})
+  const [missingResolutions, setMissingResolutions] = useState<Record<string, Resolution>>({})
+  const [challengedItems, setChallengedItems] = useState<Set<string>>(new Set()) // "nf:{key}" or "miss:{orderId}" or "mm:{key}"
+  const [showChallengePanel, setShowChallengePanel] = useState(false)
+  const [challengeEmail, setChallengeEmail] = useState('')
+
+  // Add to System modal
+  const [addModal, setAddModal] = useState<{ row: ReconciliationRow; index: number } | null>(null)
+  const [addModalDept, setAddModalDept] = useState('')
+  const [addModalSaving, setAddModalSaving] = useState(false)
+  const [departments, setDepartments] = useState<Department[]>([])
+
+  // Fetch departments for "Add to System" form
+  useEffect(() => {
+    supabase.from('departments').select('*').eq('is_active', true).order('name').then(({ data }) => {
+      if (data) setDepartments(data)
+    })
+  }, [])
 
   const loadHistory = useCallback(async () => {
     setLoadingHistory(true)
@@ -301,10 +321,30 @@ export default function Reconciliation() {
 
   useEffect(() => { loadHistory() }, [loadHistory])
 
+  // ── Shared re-fetch + re-reconcile helper ──
+  const refetchAndReconcile = useCallback(async () => {
+    if (!invoice) return
+    const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
+    let fetchedOrders: Order[] = []
+    if (period) {
+      const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+        .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
+        .order('created_at', { ascending: true })
+      fetchedOrders = data ?? []
+    } else {
+      const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+        .order('created_at', { ascending: false }).limit(500)
+      fetchedOrders = data ?? []
+    }
+    setOrders(fetchedOrders)
+    setResult(reconcile(invoice, fetchedOrders, period))
+  }, [invoice])
+
   async function handleFile(f: File) {
     if (!f.type.includes('pdf')) { setError('Please upload a PDF file'); return }
     setFile(f); setError(''); setParsing(true)
     setInvoice(null); setResult(null); setSaved(false); setShowHistory(false)
+    setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
     try {
       const lines = await extractPdfLines(f)
       const parsed = parseInvoice(lines)
@@ -312,7 +352,6 @@ export default function Reconciliation() {
         setError('Could not parse any invoice lines.'); setParsing(false); return
       }
       setInvoice(parsed)
-      // Try parsing the period text, fall back to deriving from invoice line dates
       const period = parseInvoicePeriod(parsed.invoicePeriod) || derivePeriodFromLines(parsed)
       let fetchedOrders: Order[] = []
       if (period) {
@@ -335,7 +374,8 @@ export default function Reconciliation() {
   function reset() {
     setFile(null); setInvoice(null); setOrders([]); setResult(null)
     setError(''); setFilter('all'); setSaved(false)
-    setUpdatingPrices(new Set()); setMissingResolutions({})
+    setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
+    setChallengedItems(new Set()); setAddModal(null)
   }
 
   const saveReconciliation = useCallback(async () => {
@@ -373,6 +413,52 @@ export default function Reconciliation() {
     return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
   }, [result])
 
+  // ── Adjusted totals considering resolutions ──
+  const adjustedTotals = useMemo(() => {
+    if (!result) return { unresolvedDiff: 0, resolvedCount: 0, acceptedTotal: 0, writtenOffTotal: 0, challengedCount: 0 }
+
+    let acceptedTotal = 0
+    let writtenOffTotal = 0
+    let resolvedCount = 0
+
+    // Not Found resolutions
+    for (const row of result.rows) {
+      if (row.status !== 'not_found') continue
+      const key = notFoundKey(row.invoiceLine)
+      const res = notFoundResolutions[key]
+      if (res) {
+        resolvedCount++
+        if (res.type === 'accepted' || res.type === 'added_to_system') {
+          acceptedTotal += row.invoiceLine.net
+        }
+      }
+    }
+
+    // Missing resolutions
+    for (const o of result.missingFromInvoice) {
+      const res = missingResolutions[o.id]
+      if (res) {
+        resolvedCount++
+        if (res.type === 'written_off' || res.type === 'deferred') {
+          writtenOffTotal += computeOrderCost(o)
+        }
+      }
+    }
+
+    // Original difference = invoiceTotal - systemTotal
+    // Accepted not-found items mean we acknowledge the charge → system effectively increases
+    // Written-off missing items mean we don't expect billing → system effectively decreases
+    const unresolvedDiff = (result.invoiceTotal - result.systemTotal) - acceptedTotal + writtenOffTotal
+
+    return {
+      unresolvedDiff: +unresolvedDiff.toFixed(2),
+      resolvedCount,
+      acceptedTotal: +acceptedTotal.toFixed(2),
+      writtenOffTotal: +writtenOffTotal.toFixed(2),
+      challengedCount: challengedItems.size,
+    }
+  }, [result, notFoundResolutions, missingResolutions, challengedItems])
+
   // ── Accounting Report Export ──
   const exportAccountingReport = useCallback(() => {
     if (!result || !invoice) return
@@ -380,7 +466,6 @@ export default function Reconciliation() {
     const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
     const grandNet = result.invoiceTotal + totalTopUp
 
-    // Sheet 1: Summary
     const summarySheet = utils.aoa_to_sheet([
       ['The Stratford \u2014 Laundry Reconciliation Report'],
       [],
@@ -399,14 +484,13 @@ export default function Reconciliation() {
       [],
       ['RECONCILIATION SUMMARY'],
       ['Matched Orders', result.stats.matched],
-      ['Price Mismatches', result.stats.priceMismatch],
-      ['Not Found in System', result.stats.notFound],
-      ['Missing from Invoice', result.stats.missing],
+      ['Price Discrepancies', result.stats.priceMismatch],
+      ['On Invoice Only', result.stats.notFound],
+      ['In System Only', result.stats.missing],
     ])
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
-    // Sheet 2: Department Breakdown (split items + TopUp rows)
     const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
@@ -432,9 +516,8 @@ export default function Reconciliation() {
     })
     utils.book_append_sheet(wb, utils.json_to_sheet(deptExcelRows), 'Department Breakdown')
 
-    // Sheet 3: Detailed Items
     utils.book_append_sheet(wb, utils.json_to_sheet(result.rows.map(r => ({
-      'Status': r.status === 'matched' ? 'Matched' : r.status === 'price_mismatch' ? 'Price Mismatch' : 'Not Found',
+      'Status': r.status === 'matched' ? 'Matched' : r.status === 'price_mismatch' ? 'Price Discrepancy' : 'On Invoice Only',
       'Department': r.order?.department?.name || 'Unallocated',
       'Date': r.invoiceLine.date, 'Docket': r.invoiceLine.ticket,
       'Type': ORDER_TYPE_LABELS[r.sectionType as OrderType] ?? r.sectionType,
@@ -443,10 +526,10 @@ export default function Reconciliation() {
       'Invoice GROSS (\u00a3)': +r.invoiceLine.gross.toFixed(2),
       'System Total (\u00a3)': r.order ? +r.systemTotal.toFixed(2) : '',
       'Difference (\u00a3)': r.order ? +r.difference.toFixed(2) : '',
+      'Resolution': r.status === 'not_found' ? (notFoundResolutions[notFoundKey(r.invoiceLine)]?.type || '') : '',
       'Staff/Guest': r.order?.staff_name || r.order?.guest_name || '',
     }))), 'Detailed Items')
 
-    // Sheet 4: TopUp Charges
     if (result.topUpCharges.length > 0) {
       const topUpRows = result.topUpCharges.map(l => ({
         'Date Range': l.date, 'Description': l.description, 'Section': l.sectionType?.replace('_', ' ') || '',
@@ -457,31 +540,32 @@ export default function Reconciliation() {
       utils.book_append_sheet(wb, utils.json_to_sheet(topUpRows), 'TopUp Charges')
     }
 
-    // Sheet 5: Discrepancies & Actions
     const discRows: Record<string, string | number>[] = []
     result.rows.filter(r => r.status === 'price_mismatch').forEach(r => discRows.push({
-      'Issue': 'Price Mismatch', 'Docket': r.invoiceLine.ticket, 'Department': r.order?.department?.name || '',
+      'Issue': 'Price Discrepancy', 'Docket': r.invoiceLine.ticket, 'Department': r.order?.department?.name || '',
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': +r.systemTotal.toFixed(2),
       'Difference (\u00a3)': +r.difference.toFixed(2), 'Description': r.invoiceLine.description,
       'Recommended Action': 'Verify pricing with Goldstar / update system prices',
     }))
     result.rows.filter(r => r.status === 'not_found').forEach(r => discRows.push({
-      'Issue': 'Invoice entry not in system', 'Docket': r.invoiceLine.ticket, 'Department': '',
+      'Issue': 'On invoice but not in system', 'Docket': r.invoiceLine.ticket, 'Department': '',
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': 0,
       'Difference (\u00a3)': +r.invoiceLine.net.toFixed(2), 'Description': r.invoiceLine.description,
-      'Recommended Action': 'Check if order was recorded / query with Goldstar',
+      'Resolution': notFoundResolutions[notFoundKey(r.invoiceLine)]?.type || 'Unresolved',
+      'Recommended Action': 'Add to system / accept charge / challenge with supplier',
     }))
     result.missingFromInvoice.forEach(o => discRows.push({
-      'Issue': 'System order not on invoice', 'Docket': o.docket_number, 'Department': o.department?.name || '',
+      'Issue': 'In system but not on invoice', 'Docket': o.docket_number, 'Department': o.department?.name || '',
       'Invoice NET (\u00a3)': 0, 'System NET (\u00a3)': +computeOrderCost(o).toFixed(2),
       'Difference (\u00a3)': +(-computeOrderCost(o)).toFixed(2),
       'Description': (o.order_items || []).map(i => `${i.quantity_sent}x ${i.item_name}`).join(', '),
-      'Recommended Action': 'Confirm with Goldstar if processed / check different invoice period',
+      'Resolution': missingResolutions[o.id]?.type || 'Unresolved',
+      'Recommended Action': 'Challenge with supplier / defer to next invoice / write off',
     }))
     if (discRows.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(discRows), 'Discrepancies & Actions')
 
     writeFile(wb, `accounting-report-${invoice.invoiceNumber || 'reconciliation'}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`)
-  }, [result, invoice])
+  }, [result, invoice, notFoundResolutions, missingResolutions])
 
   const statusIcon = (s: ReconciliationRow['status']) => {
     if (s === 'matched') return <CheckCircle className="w-4 h-4 text-green-500" />
@@ -500,7 +584,6 @@ export default function Reconciliation() {
       const invoiceNet = row.invoiceLine.net
 
       if (items.length > 0 && currentTotal > 0) {
-        // Scale each item price proportionally so total matches invoice NET
         const ratio = invoiceNet / currentTotal
         for (const item of items) {
           const oldPrice = item.price_at_time ?? 0
@@ -508,30 +591,14 @@ export default function Reconciliation() {
           await supabase.from('order_items').update({ price_at_time: newPrice }).eq('id', item.id)
         }
       }
-      // Update order total_price to invoice NET
       await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
-
-      // Re-fetch orders and re-run reconciliation
-      const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
-      let fetchedOrders: Order[] = []
-      if (period) {
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
-          .order('created_at', { ascending: true })
-        fetchedOrders = data ?? []
-      } else {
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .order('created_at', { ascending: false }).limit(500)
-        fetchedOrders = data ?? []
-      }
-      setOrders(fetchedOrders)
-      setResult(reconcile(invoice, fetchedOrders, period))
+      await refetchAndReconcile()
     } catch (e) {
       console.error('Failed to update prices:', e)
     } finally {
       setUpdatingPrices(prev => { const next = new Set(prev); next.delete(orderId); return next })
     }
-  }, [invoice])
+  }, [invoice, refetchAndReconcile])
 
   // ── Action: delete a missing order ──
   const handleDeleteOrder = useCallback(async (orderId: string) => {
@@ -540,31 +607,200 @@ export default function Reconciliation() {
     try {
       await supabase.from('order_items').delete().eq('order_id', orderId)
       await supabase.from('orders').delete().eq('id', orderId)
-      // Re-fetch and re-run
-      const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
-      let fetchedOrders: Order[] = []
-      if (period) {
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
-          .order('created_at', { ascending: true })
-        fetchedOrders = data ?? []
-      } else {
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .order('created_at', { ascending: false }).limit(500)
-        fetchedOrders = data ?? []
-      }
-      setOrders(fetchedOrders)
-      setResult(reconcile(invoice, fetchedOrders, period))
+      setMissingResolutions(prev => { const next = { ...prev }; delete next[orderId]; return next })
+      await refetchAndReconcile()
     } catch (e) {
       console.error('Failed to delete order:', e)
     }
-  }, [invoice])
+  }, [invoice, refetchAndReconcile])
+
+  // ── Action: Add invoice-only item to system ──
+  const handleAddToSystem = useCallback(async () => {
+    if (!addModal || !invoice) return
+    const { row } = addModal
+    if (!addModalDept) return
+    setAddModalSaving(true)
+    try {
+      const docket = row.invoiceLine.ticket || `INV-${Date.now()}`
+      const orderType = row.sectionType as OrderType
+
+      // Create order
+      const { data: newOrder, error: orderErr } = await supabase.from('orders').insert({
+        docket_number: docket,
+        order_type: orderType,
+        department_id: addModalDept,
+        staff_name: row.invoiceLine.guestInfo?.replace(/[()]/g, '') || null,
+        guest_name: orderType === 'guest_laundry' ? (row.invoiceLine.guestInfo?.replace(/[()]/g, '') || null) : null,
+        room_number: orderType === 'guest_laundry' ? row.invoiceLine.ticket : null,
+        status: 'completed',
+        total_price: +row.invoiceLine.net.toFixed(2),
+        notes: `Added from invoice reconciliation — ${invoice.invoiceNumber}`,
+      }).select().single()
+
+      if (orderErr) throw orderErr
+
+      // Create order items from parsed invoice line items
+      if (newOrder && row.invoiceLine.items.length > 0) {
+        const totalItemQty = row.invoiceLine.items.reduce((s, it) => s + it.quantity, 0)
+        const pricePerUnit = totalItemQty > 0 ? row.invoiceLine.net / totalItemQty : row.invoiceLine.net
+        const itemInserts = row.invoiceLine.items.map(it => ({
+          order_id: newOrder.id,
+          item_name: it.name,
+          quantity_sent: it.quantity,
+          quantity_received: it.quantity,
+          price_at_time: +(pricePerUnit).toFixed(4),
+        }))
+        await supabase.from('order_items').insert(itemInserts)
+      } else if (newOrder) {
+        // No parsed items — create a single generic item
+        await supabase.from('order_items').insert({
+          order_id: newOrder.id,
+          item_name: row.invoiceLine.description || 'Invoice item',
+          quantity_sent: 1,
+          quantity_received: 1,
+          price_at_time: +row.invoiceLine.net.toFixed(2),
+        })
+      }
+
+      // Mark as resolved
+      const key = notFoundKey(row.invoiceLine)
+      setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system' } }))
+
+      // Re-reconcile to pick up the new order
+      await refetchAndReconcile()
+      setAddModal(null)
+      setAddModalDept('')
+    } catch (e) {
+      console.error('Failed to add to system:', e)
+    } finally {
+      setAddModalSaving(false)
+    }
+  }, [addModal, addModalDept, invoice, refetchAndReconcile])
+
+  // ── Action: Accept charge (acknowledge invoice-only item as valid) ──
+  const handleAcceptCharge = useCallback((row: ReconciliationRow) => {
+    const key = notFoundKey(row.invoiceLine)
+    setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'accepted' } }))
+  }, [])
+
+  // ── Action: Challenge an item (toggle) ──
+  const handleChallenge = useCallback((itemKey: string, category: 'nf' | 'miss' | 'mm') => {
+    const fullKey = `${category}:${itemKey}`
+    setChallengedItems(prev => {
+      const next = new Set(prev)
+      const isRemoving = next.has(fullKey)
+      if (isRemoving) next.delete(fullKey)
+      else next.add(fullKey)
+
+      // Set or clear resolution accordingly
+      if (category === 'nf') {
+        if (isRemoving) {
+          setNotFoundResolutions(p => { const n = { ...p }; delete n[itemKey]; return n })
+        } else {
+          setNotFoundResolutions(p => ({ ...p, [itemKey]: { type: 'challenged' } }))
+        }
+      } else if (category === 'miss') {
+        if (isRemoving) {
+          setMissingResolutions(p => { const n = { ...p }; delete n[itemKey]; return n })
+        } else {
+          setMissingResolutions(p => ({ ...p, [itemKey]: { type: 'challenged' } }))
+        }
+      }
+
+      return next
+    })
+  }, [])
+
+  // ── Action: Write off a missing order ──
+  const handleWriteOff = useCallback((orderId: string) => {
+    setMissingResolutions(prev => ({ ...prev, [orderId]: { type: 'written_off' } }))
+  }, [])
+
+  // ── Action: Defer missing order to next invoice ──
+  const handleDefer = useCallback((orderId: string) => {
+    setMissingResolutions(prev => ({ ...prev, [orderId]: { type: 'deferred' } }))
+  }, [])
+
+  // ── Clear a resolution ──
+  const clearNotFoundResolution = useCallback((key: string) => {
+    setNotFoundResolutions(prev => { const next = { ...prev }; delete next[key]; return next })
+    setChallengedItems(prev => { const next = new Set(prev); next.delete(`nf:${key}`); return next })
+  }, [])
+
+  const clearMissingResolution = useCallback((orderId: string) => {
+    setMissingResolutions(prev => { const next = { ...prev }; delete next[orderId]; return next })
+    setChallengedItems(prev => { const next = new Set(prev); next.delete(`miss:${orderId}`); return next })
+  }, [])
+
+  // ── Generate challenge email ──
+  const generateChallengeEmail = useCallback(() => {
+    if (!result || !invoice) return
+    const lines: string[] = []
+    lines.push(`Subject: Invoice Discrepancy Query — ${invoice.invoiceNumber}`)
+    lines.push('')
+    lines.push(`Dear Supplier,`)
+    lines.push('')
+    lines.push(`We have identified the following discrepancies during reconciliation of invoice ${invoice.invoiceNumber} (Period: ${invoice.invoicePeriod}):`)
+    lines.push('')
+
+    // Challenged not-found items (on invoice but not in our system)
+    const challengedNF = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r.invoiceLine)}`))
+    if (challengedNF.length > 0) {
+      lines.push('ITEMS BILLED BUT NOT IN OUR RECORDS:')
+      for (const r of challengedNF) {
+        lines.push(`  - Docket: ${r.invoiceLine.ticket} | Date: ${r.invoiceLine.date} | Amount: £${r.invoiceLine.net.toFixed(2)} | ${r.invoiceLine.description}`)
+      }
+      lines.push('')
+    }
+
+    // Challenged missing items (in our system but not on invoice)
+    const challengedMiss = result.missingFromInvoice.filter(o => challengedItems.has(`miss:${o.id}`))
+    if (challengedMiss.length > 0) {
+      lines.push('ITEMS IN OUR RECORDS BUT NOT ON INVOICE:')
+      for (const o of challengedMiss) {
+        const items = (o.order_items || []).map(i => `${i.quantity_sent}x ${i.item_name}`).join(', ')
+        lines.push(`  - Docket: ${o.docket_number} | Dept: ${o.department?.name || 'N/A'} | Amount: £${computeOrderCost(o).toFixed(2)} | ${items}`)
+      }
+      lines.push('')
+    }
+
+    // Challenged price mismatches
+    const challengedMM = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r.invoiceLine)}`))
+    if (challengedMM.length > 0) {
+      lines.push('PRICE DISCREPANCIES:')
+      for (const r of challengedMM) {
+        lines.push(`  - Docket: ${r.invoiceLine.ticket} | Invoice: £${r.invoiceLine.net.toFixed(2)} | Our records: £${r.systemTotal.toFixed(2)} | Diff: £${r.difference.toFixed(2)}`)
+      }
+      lines.push('')
+    }
+
+    lines.push('Could you please investigate and advise?')
+    lines.push('')
+    lines.push('Kind regards,')
+    lines.push('The Stratford — Laundry Team')
+
+    const body = encodeURIComponent(lines.slice(1).join('\n'))
+    const subject = encodeURIComponent(`Invoice Discrepancy Query — ${invoice.invoiceNumber}`)
+    const mailto = `mailto:${challengeEmail}?subject=${subject}&body=${body}`
+    window.open(mailto, '_blank')
+  }, [result, invoice, challengedItems, challengeEmail])
 
   // ── PDF Report ──
   const handlePdfReport = useCallback(() => {
     if (!result || !invoice) return
     generateReconciliationPdf(invoice, result, departmentDisplayRows)
   }, [result, invoice, departmentDisplayRows])
+
+  // ── Resolution badge helper ──
+  function resolutionBadge(type: ResolutionType) {
+    switch (type) {
+      case 'accepted': return <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-700">Accepted</span>
+      case 'challenged': return <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-100 text-orange-700">Challenged</span>
+      case 'added_to_system': return <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-700">Added</span>
+      case 'written_off': return <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-200 text-gray-600">Written Off</span>
+      case 'deferred': return <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 text-purple-700">Deferred</span>
+    }
+  }
 
   // ── History view ──
   if (showHistory) return (
@@ -670,9 +906,10 @@ export default function Reconciliation() {
   const grandInvoiceNet = result.invoiceTotal + totalTopUp
   const statedNet = invoice.totals.net
   const parsedVsStatedGap = statedNet > 0 ? Math.abs(statedNet - grandInvoiceNet) : 0
+  const originalDiff = +(result.invoiceTotal - result.systemTotal).toFixed(2)
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-20">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
@@ -740,18 +977,25 @@ export default function Reconciliation() {
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <StatCard icon={<CheckCircle className="w-5 h-5 text-green-500" />} label="Matched" value={result.stats.matched} color="green" />
-        <StatCard icon={<AlertTriangle className="w-5 h-5 text-amber-500" />} label="Price Mismatch" value={result.stats.priceMismatch} color="amber" />
-        <StatCard icon={<XCircle className="w-5 h-5 text-red-500" />} label="Not in System" value={result.stats.notFound} color="red" />
-        <StatCard icon={<HelpCircle className="w-5 h-5 text-blue-500" />} label="Missing from Invoice" value={result.stats.missing} color="blue" />
+        <StatCard icon={<AlertTriangle className="w-5 h-5 text-amber-500" />} label="Price Discrepancy" value={result.stats.priceMismatch} color="amber" />
+        <StatCard icon={<XCircle className="w-5 h-5 text-red-500" />} label="On Invoice Only" value={result.stats.notFound} color="red"
+          subtitle={Object.keys(notFoundResolutions).length > 0 ? `${Object.keys(notFoundResolutions).length} resolved` : undefined} />
+        <StatCard icon={<HelpCircle className="w-5 h-5 text-blue-500" />} label="In System Only" value={result.stats.missing} color="blue"
+          subtitle={Object.keys(missingResolutions).length > 0 ? `${Object.keys(missingResolutions).length} resolved` : undefined} />
         <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <p className="text-xs text-gray-500 mb-1">Difference</p>
-          <p className={`text-xl font-bold ${Math.abs(result.invoiceTotal - result.systemTotal) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
-            {'\u00a3'}{Math.abs(result.invoiceTotal - result.systemTotal).toFixed(2)}
+          <p className="text-xs text-gray-500 mb-1">Unresolved</p>
+          <p className={`text-xl font-bold ${Math.abs(adjustedTotals.unresolvedDiff) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
+            {'\u00a3'}{Math.abs(adjustedTotals.unresolvedDiff).toFixed(2)}
           </p>
+          {adjustedTotals.resolvedCount > 0 && (
+            <p className="text-[10px] text-gray-400 mt-0.5">
+              was {'\u00a3'}{Math.abs(originalDiff).toFixed(2)} — {adjustedTotals.resolvedCount} resolved
+            </p>
+          )}
         </div>
       </div>
 
-      {/* Department Breakdown — split items + TopUp rows */}
+      {/* Department Breakdown */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
           <ChevronRight className="w-4 h-4 text-gray-500" />
@@ -799,15 +1043,15 @@ export default function Reconciliation() {
       {/* Filter tabs */}
       <div className="flex gap-1.5 bg-gray-100 rounded-lg p-1 w-fit">
         {([['all', 'All', result.rows.length], ['matched', 'Matched', result.stats.matched],
-          ['mismatch', 'Mismatches', result.stats.priceMismatch], ['not_found', 'Not Found', result.stats.notFound],
-          ['missing', 'Missing', result.stats.missing]] as [FilterTab, string, number][]).map(([key, label, count]) => (
+          ['mismatch', 'Price Discrepancy', result.stats.priceMismatch], ['not_found', 'On Invoice Only', result.stats.notFound],
+          ['missing', 'In System Only', result.stats.missing]] as [FilterTab, string, number][]).map(([key, label, count]) => (
           <button key={key} onClick={() => setFilter(key)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${filter === key ? 'bg-white text-navy shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}
           >{label} ({count})</button>
         ))}
       </div>
 
-      {/* Detail table */}
+      {/* Detail table — all tabs except missing */}
       {filter !== 'missing' ? (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden"><div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -825,8 +1069,22 @@ export default function Reconciliation() {
             <tbody>
               {filteredRows.length === 0
                 ? <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
-                : filteredRows.map((row, i) => (
-                <tr key={i} className={`border-b border-gray-100 ${row.status === 'price_mismatch' ? 'bg-amber-50/50' : row.status === 'not_found' ? 'bg-red-50/50' : ''}`}>
+                : filteredRows.map((row, i) => {
+                const nfKey = notFoundKey(row.invoiceLine)
+                const nfRes = row.status === 'not_found' ? notFoundResolutions[nfKey] : undefined
+                const isChallenged = row.status === 'not_found'
+                  ? challengedItems.has(`nf:${nfKey}`)
+                  : row.status === 'price_mismatch'
+                    ? challengedItems.has(`mm:${nfKey}`)
+                    : false
+                return (
+                <tr key={i} className={`border-b border-gray-100 ${
+                  nfRes?.type === 'accepted' ? 'bg-green-50/40' :
+                  nfRes?.type === 'added_to_system' ? 'bg-blue-50/40' :
+                  isChallenged ? 'bg-orange-50/40' :
+                  row.status === 'price_mismatch' ? 'bg-amber-50/50' :
+                  row.status === 'not_found' ? 'bg-red-50/50' : ''
+                }`}>
                   <td className="px-3 py-2.5 text-center">{statusIcon(row.status)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
@@ -840,21 +1098,69 @@ export default function Reconciliation() {
                     {row.order ? (row.difference >= 0 ? '+' : '') + `\u00a3${row.difference.toFixed(2)}` : '\u2014'}
                   </td>
                   <td className="px-3 py-2.5 text-center">
+                    {/* Matched — no action needed */}
                     {row.status === 'matched' && <CheckCircle className="w-4 h-4 text-green-500 mx-auto" />}
+
+                    {/* Price Mismatch — Update Price + Challenge */}
                     {row.status === 'price_mismatch' && row.order && (
-                      <button
-                        onClick={() => handleUpdatePrice(row)}
-                        disabled={updatingPrices.has(row.order!.id)}
-                        className="px-2 py-1 text-xs font-medium text-white bg-amber-500 rounded hover:bg-amber-600 disabled:opacity-50 whitespace-nowrap"
-                      >
-                        {updatingPrices.has(row.order!.id) ? (
-                          <RefreshCw className="w-3 h-3 animate-spin inline" />
-                        ) : 'Update Price'}
-                      </button>
+                      <div className="flex items-center gap-1 justify-center">
+                        <button
+                          onClick={() => handleUpdatePrice(row)}
+                          disabled={updatingPrices.has(row.order!.id)}
+                          className="px-2 py-1 text-xs font-medium text-white bg-amber-500 rounded hover:bg-amber-600 disabled:opacity-50 whitespace-nowrap"
+                        >
+                          {updatingPrices.has(row.order!.id) ? (
+                            <RefreshCw className="w-3 h-3 animate-spin inline" />
+                          ) : 'Update Price'}
+                        </button>
+                        <button
+                          onClick={() => handleChallenge(nfKey, 'mm')}
+                          className={`p-1 rounded hover:bg-orange-100 ${isChallenged ? 'text-orange-600 bg-orange-100' : 'text-gray-400'}`}
+                          title="Challenge this discrepancy"
+                        >
+                          <Mail className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Not Found — Add to System / Accept / Challenge */}
+                    {row.status === 'not_found' && !nfRes && (
+                      <div className="flex items-center gap-1 justify-center">
+                        <button
+                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept('') }}
+                          className="px-2 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 whitespace-nowrap"
+                          title="Add this item to our system"
+                        >
+                          <Plus className="w-3 h-3 inline mr-0.5" />Add
+                        </button>
+                        <button
+                          onClick={() => handleAcceptCharge(row)}
+                          className="px-2 py-1 text-xs font-medium text-green-700 bg-green-100 rounded hover:bg-green-200 whitespace-nowrap"
+                          title="Accept this charge as valid"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          onClick={() => handleChallenge(nfKey, 'nf')}
+                          className={`p-1 rounded hover:bg-orange-100 ${isChallenged ? 'text-orange-600 bg-orange-100' : 'text-gray-400'}`}
+                          title="Challenge this item with supplier"
+                        >
+                          <Mail className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+                    {/* Not Found — already resolved */}
+                    {row.status === 'not_found' && nfRes && (
+                      <div className="flex items-center gap-1 justify-center">
+                        {resolutionBadge(nfRes.type)}
+                        <button onClick={() => clearNotFoundResolution(nfKey)} className="p-0.5 rounded hover:bg-gray-200 text-gray-400" title="Undo">
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
                     )}
                   </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
             {filteredRows.length > 0 && <tfoot><tr className="bg-gray-50 font-medium">
               <td colSpan={5} className="px-3 py-3 text-right text-gray-700">Totals</td>
@@ -866,6 +1172,7 @@ export default function Reconciliation() {
           </table>
         </div></div>
       ) : (
+        /* ── In System Only (Missing from Invoice) ── */
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden"><div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-gray-200 bg-gray-50">
@@ -883,8 +1190,14 @@ export default function Reconciliation() {
                 ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">All system orders found on invoice</td></tr>
                 : result.missingFromInvoice.map(o => {
                 const resolution = missingResolutions[o.id]
+                const isChallenged = challengedItems.has(`miss:${o.id}`)
                 return (
-                <tr key={o.id} className={`border-b border-gray-100 ${resolution === 'Ignore' ? 'bg-gray-50/60 opacity-60' : resolution === 'Investigate' ? 'bg-yellow-50/40' : 'bg-blue-50/30'}`}>
+                <tr key={o.id} className={`border-b border-gray-100 ${
+                  resolution?.type === 'written_off' ? 'bg-gray-50/60 opacity-60' :
+                  resolution?.type === 'deferred' ? 'bg-purple-50/40' :
+                  isChallenged ? 'bg-orange-50/40' :
+                  'bg-blue-50/30'
+                }`}>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">{o.docket_number}</td>
                   <td className="px-3 py-2.5 text-gray-600">{o.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-600">{ORDER_TYPE_LABELS[o.order_type as OrderType] ?? o.order_type}</td>
@@ -893,27 +1206,44 @@ export default function Reconciliation() {
                   <td className="px-3 py-2.5 text-right font-medium">{'\u00a3'}{computeOrderCost(o).toFixed(2)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{format(new Date(o.created_at), 'dd/MM/yyyy')}</td>
                   <td className="px-3 py-2.5 text-center">
-                    <select
-                      value={resolution || ''}
-                      onChange={e => {
-                        const val = e.target.value
-                        if (val === 'Delete') {
-                          handleDeleteOrder(o.id)
-                        } else {
-                          setMissingResolutions(prev => ({ ...prev, [o.id]: val }))
-                        }
-                      }}
-                      className="text-xs border border-gray-300 rounded px-1.5 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-navy"
-                    >
-                      <option value="">-- Resolve --</option>
-                      <option value="Ignore">Ignore</option>
-                      <option value="Investigate">Investigate</option>
-                      <option value="Delete">Delete</option>
-                    </select>
-                    {resolution && resolution !== 'Delete' && (
-                      <span className={`ml-1.5 inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium ${resolution === 'Ignore' ? 'bg-gray-200 text-gray-600' : 'bg-yellow-100 text-yellow-700'}`}>
-                        {resolution}
-                      </span>
+                    {!resolution ? (
+                      <div className="flex items-center gap-1 justify-center flex-wrap">
+                        <button
+                          onClick={() => handleChallenge(o.id, 'miss')}
+                          className={`px-2 py-1 text-xs font-medium rounded whitespace-nowrap ${isChallenged ? 'text-orange-700 bg-orange-100' : 'text-orange-600 bg-orange-50 hover:bg-orange-100'}`}
+                          title="Challenge with supplier — why isn't this on the invoice?"
+                        >
+                          <Mail className="w-3 h-3 inline mr-0.5" />Challenge
+                        </button>
+                        <button
+                          onClick={() => handleDefer(o.id)}
+                          className="px-2 py-1 text-xs font-medium text-purple-700 bg-purple-50 rounded hover:bg-purple-100 whitespace-nowrap"
+                          title="Expected on next invoice"
+                        >
+                          <ArrowRightLeft className="w-3 h-3 inline mr-0.5" />Defer
+                        </button>
+                        <button
+                          onClick={() => handleWriteOff(o.id)}
+                          className="px-2 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded hover:bg-gray-200 whitespace-nowrap"
+                          title="Write off — won't be billed"
+                        >
+                          <Ban className="w-3 h-3 inline mr-0.5" />Write Off
+                        </button>
+                        <button
+                          onClick={() => handleDeleteOrder(o.id)}
+                          className="px-2 py-1 text-xs font-medium text-red-600 bg-red-50 rounded hover:bg-red-100 whitespace-nowrap"
+                          title="Delete order from system permanently"
+                        >
+                          <X className="w-3 h-3 inline mr-0.5" />Delete
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1 justify-center">
+                        {resolutionBadge(resolution.type)}
+                        <button onClick={() => clearMissingResolution(o.id)} className="p-0.5 rounded hover:bg-gray-200 text-gray-400" title="Undo">
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
                     )}
                   </td>
                 </tr>
@@ -960,29 +1290,217 @@ export default function Reconciliation() {
 
       {/* Grand totals */}
       <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-6">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-6">
           <div><p className="text-xs text-gray-500 mb-1">Invoice Total (NET)</p>
             <p className="text-lg font-bold text-gray-900">{'\u00a3'}{invoice.totals.net > 0 ? invoice.totals.net.toFixed(2) : grandInvoiceNet.toFixed(2)}</p></div>
           <div><p className="text-xs text-gray-500 mb-1">Invoice Total (GROSS)</p>
             <p className="text-lg font-bold text-gray-900">{'\u00a3'}{invoice.totals.gross > 0 ? invoice.totals.gross.toFixed(2) : (grandInvoiceNet * 1.2).toFixed(2)}</p></div>
           <div><p className="text-xs text-gray-500 mb-1">System Total (NET)</p>
             <p className="text-lg font-bold text-gray-900">{'\u00a3'}{result.systemTotal.toFixed(2)}</p></div>
-          <div><p className="text-xs text-gray-500 mb-1">Order Difference</p>
-            <p className={`text-lg font-bold ${Math.abs(result.invoiceTotal - result.systemTotal) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
-              {'\u00a3'}{(result.invoiceTotal - result.systemTotal).toFixed(2)}</p>
-            {totalTopUp > 0 && <p className="text-xs text-gray-500 mt-0.5">+ {'\u00a3'}{totalTopUp.toFixed(2)} TopUp charges</p>}
+          <div><p className="text-xs text-gray-500 mb-1">Original Difference</p>
+            <p className={`text-lg font-bold ${Math.abs(originalDiff) < 0.02 ? 'text-green-600' : 'text-gray-400 line-through'}`}>
+              {'\u00a3'}{originalDiff.toFixed(2)}</p>
+            {totalTopUp > 0 && <p className="text-xs text-gray-500 mt-0.5">+ {'\u00a3'}{totalTopUp.toFixed(2)} TopUp</p>}
+          </div>
+          <div className="bg-navy/5 rounded-lg p-3 -m-1">
+            <p className="text-xs text-navy font-medium mb-1">Unresolved Difference</p>
+            <p className={`text-xl font-bold ${Math.abs(adjustedTotals.unresolvedDiff) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
+              {'\u00a3'}{adjustedTotals.unresolvedDiff.toFixed(2)}</p>
+            {adjustedTotals.resolvedCount > 0 && (
+              <p className="text-[10px] text-gray-500 mt-0.5">
+                {adjustedTotals.acceptedTotal > 0 && `Accepted: \u00a3${adjustedTotals.acceptedTotal.toFixed(2)}`}
+                {adjustedTotals.acceptedTotal > 0 && adjustedTotals.writtenOffTotal > 0 && ' | '}
+                {adjustedTotals.writtenOffTotal > 0 && `Written off: \u00a3${adjustedTotals.writtenOffTotal.toFixed(2)}`}
+              </p>
+            )}
           </div>
         </div>
       </div>
+
+      {/* ── Challenge floating bar ── */}
+      {challengedItems.size > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 bg-orange-600 text-white shadow-lg border-t border-orange-700">
+          <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Mail className="w-5 h-5" />
+              <span className="font-medium">{challengedItems.size} item{challengedItems.size !== 1 ? 's' : ''} flagged for challenge</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => { setChallengedItems(new Set()); setNotFoundResolutions(prev => {
+                  const next = { ...prev }; for (const k of Object.keys(next)) { if (next[k].type === 'challenged') delete next[k] }; return next
+                }); setMissingResolutions(prev => {
+                  const next = { ...prev }; for (const k of Object.keys(next)) { if (next[k].type === 'challenged') delete next[k] }; return next
+                }) }}
+                className="px-3 py-1.5 text-sm text-orange-200 hover:text-white"
+              >
+                Clear All
+              </button>
+              <button
+                onClick={() => setShowChallengePanel(true)}
+                className="flex items-center gap-2 px-4 py-1.5 text-sm font-medium bg-white text-orange-600 rounded-lg hover:bg-orange-50"
+              >
+                <Send className="w-4 h-4" /> Review & Send Email
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Challenge email panel (modal) ── */}
+      {showChallengePanel && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowChallengePanel(false)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-gray-900">Challenge Discrepancies</h3>
+              <button onClick={() => setShowChallengePanel(false)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
+            </div>
+            <div className="px-6 py-4 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Recipient Email</label>
+                <input
+                  type="email"
+                  value={challengeEmail}
+                  onChange={e => setChallengeEmail(e.target.value)}
+                  placeholder="supplier@goldstar.com"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30"
+                />
+              </div>
+
+              {/* Preview challenged items */}
+              {(() => {
+                const nfItems = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r.invoiceLine)}`))
+                const missItems = result.missingFromInvoice.filter(o => challengedItems.has(`miss:${o.id}`))
+                const mmItems = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r.invoiceLine)}`))
+                return (
+                  <div className="space-y-3">
+                    {nfItems.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-red-600 uppercase mb-1">On Invoice Only ({nfItems.length})</p>
+                        <div className="bg-red-50 rounded-lg p-3 text-xs space-y-1">
+                          {nfItems.map((r, i) => (
+                            <div key={i} className="flex justify-between">
+                              <span>Docket {r.invoiceLine.ticket} — {r.invoiceLine.description}</span>
+                              <span className="font-medium">{'\u00a3'}{r.invoiceLine.net.toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {missItems.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-blue-600 uppercase mb-1">In System Only ({missItems.length})</p>
+                        <div className="bg-blue-50 rounded-lg p-3 text-xs space-y-1">
+                          {missItems.map(o => (
+                            <div key={o.id} className="flex justify-between">
+                              <span>Docket {o.docket_number} — {o.department?.name} — {(o.order_items || []).map(i => `${i.quantity_sent}x ${i.item_name}`).join(', ')}</span>
+                              <span className="font-medium">{'\u00a3'}{computeOrderCost(o).toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {mmItems.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-amber-600 uppercase mb-1">Price Discrepancies ({mmItems.length})</p>
+                        <div className="bg-amber-50 rounded-lg p-3 text-xs space-y-1">
+                          {mmItems.map((r, i) => (
+                            <div key={i} className="flex justify-between">
+                              <span>Docket {r.invoiceLine.ticket} — Invoice {'\u00a3'}{r.invoiceLine.net.toFixed(2)} vs System {'\u00a3'}{r.systemTotal.toFixed(2)}</span>
+                              <span className="font-medium text-amber-700">Diff {'\u00a3'}{r.difference.toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              <button
+                onClick={() => { generateChallengeEmail(); setShowChallengePanel(false) }}
+                disabled={!challengeEmail}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-orange-600 rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Send className="w-4 h-4" /> Send Challenge Email
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Add to System modal ── */}
+      {addModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setAddModal(null)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4" onClick={e => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-gray-900">Add to System</h3>
+              <button onClick={() => setAddModal(null)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
+            </div>
+            <div className="px-6 py-4 space-y-4">
+              <p className="text-sm text-gray-600">
+                This invoice item was not found in our system. Create an order to match it.
+              </p>
+
+              {/* Invoice item details */}
+              <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-1">
+                <div className="flex justify-between"><span className="text-gray-500">Docket:</span><span className="font-mono font-medium">{addModal.row.invoiceLine.ticket}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Date:</span><span>{addModal.row.invoiceLine.date}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Description:</span><span className="text-right max-w-[250px] truncate">{addModal.row.invoiceLine.description}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Amount (NET):</span><span className="font-bold">{'\u00a3'}{addModal.row.invoiceLine.net.toFixed(2)}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Service Type:</span><span>{ORDER_TYPE_LABELS[addModal.row.sectionType as OrderType] ?? addModal.row.sectionType}</span></div>
+                {addModal.row.invoiceLine.items.length > 0 && (
+                  <div className="pt-1 border-t border-gray-200 mt-1">
+                    <span className="text-gray-500 text-xs">Items:</span>
+                    {addModal.row.invoiceLine.items.map((it, idx) => (
+                      <div key={idx} className="text-xs text-gray-700 pl-2">{it.quantity}x {it.name}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Department selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Allocate to Department *</label>
+                <select
+                  value={addModalDept}
+                  onChange={e => setAddModalDept(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30"
+                >
+                  <option value="">Select department...</option>
+                  {departments.map(d => (
+                    <option key={d.id} value={d.id}>{d.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button onClick={() => setAddModal(null)} className="flex-1 px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+                  Cancel
+                </button>
+                <button
+                  onClick={handleAddToSystem}
+                  disabled={!addModalDept || addModalSaving}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                  {addModalSaving ? 'Adding...' : 'Add Order'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-function StatCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: number; color: string }) {
+function StatCard({ icon, label, value, color, subtitle }: { icon: React.ReactNode; label: string; value: number; color: string; subtitle?: string }) {
   return (
     <div className="bg-white rounded-xl border border-gray-200 p-4">
       <div className="flex items-center gap-2 mb-1">{icon}<span className="text-xs text-gray-500">{label}</span></div>
       <p className={`text-2xl font-bold text-${color}-600`}>{value}</p>
+      {subtitle && <p className="text-[10px] text-green-600 mt-0.5">{subtitle}</p>}
     </div>
   )
 }
