@@ -104,9 +104,9 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 flex flex-col min-w-0 bg-gray-50 dark:bg-gray-900 lg:rounded-tl-[2rem]">
+      <div className="flex-1 flex flex-col min-w-0">
         {/* Top bar */}
-        <header className="bg-white/60 dark:bg-gray-800/60 backdrop-blur-sm border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center gap-3 lg:rounded-tl-[2rem]">
+        <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center gap-3">
           <button className="lg:hidden" onClick={() => setSidebarOpen(true)}>
             <Menu className="w-6 h-6 text-gray-600 dark:text-gray-300" />
           </button>
