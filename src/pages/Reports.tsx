@@ -294,7 +294,7 @@ export default function Reports() {
       </div>
 
       {/* KPI cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <KpiCard icon={<ClipboardList className="w-5 h-5" />} label="Total Orders" value={kpis.orders.toLocaleString()} color="navy" />
         <KpiCard icon={<Package className="w-5 h-5" />} label="Items Sent" value={kpis.sent.toLocaleString()} color="gold" />
         <KpiCard icon={<Package className="w-5 h-5" />} label="Items Received" value={kpis.received.toLocaleString()} color="emerald" />
@@ -780,14 +780,14 @@ function KpiCard({ icon, label, value, alert, color = 'navy' }: {
     amber: 'bg-amber-50 text-amber-600',
   }
   return (
-    <div className={`bg-white rounded-2xl border p-4 shadow-sm hover:shadow-md transition-shadow ${alert ? 'border-amber-200 ring-1 ring-amber-100' : 'border-gray-100'}`}>
-      <div className="flex items-center gap-3">
-        <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${alert ? 'bg-amber-50 text-amber-600' : colorMap[color]}`}>
+    <div className={`bg-white rounded-2xl border p-3 lg:p-4 shadow-sm hover:shadow-md transition-shadow overflow-hidden ${alert ? 'border-amber-200 ring-1 ring-amber-100' : 'border-gray-100'}`}>
+      <div className="flex items-center gap-2 lg:gap-3">
+        <div className={`w-8 h-8 lg:w-10 lg:h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${alert ? 'bg-amber-50 text-amber-600' : colorMap[color]}`}>
           {icon}
         </div>
-        <div className="min-w-0">
-          <p className={`text-xl font-bold ${alert ? 'text-amber-600' : 'text-gray-900'}`}>{value}</p>
-          <p className="text-[11px] font-medium text-gray-400 uppercase tracking-wide">{label}</p>
+        <div className="min-w-0 flex-1">
+          <p className={`text-sm lg:text-lg font-bold truncate ${alert ? 'text-amber-600' : 'text-gray-900'}`}>{value}</p>
+          <p className="text-[10px] lg:text-[11px] font-medium text-gray-400 uppercase tracking-wide truncate">{label}</p>
         </div>
       </div>
     </div>
