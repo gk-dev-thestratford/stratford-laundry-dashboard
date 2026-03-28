@@ -212,7 +212,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   const byDocket = new Map<string, Order>()
   const byRoom = new Map<string, Order[]>()
   for (const o of orders) {
-    byDocket.set(o.docket_number, o)
+    byDocket.set(o.docket_number.trim(), o)
     if (o.room_number) {
       if (!byRoom.has(o.room_number)) byRoom.set(o.room_number, [])
       byRoom.get(o.room_number)!.push(o)
@@ -227,7 +227,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     const orderType = sectionTypeToOrderType(section.type)
     for (const line of section.lines) {
       if (line.isTopUp) { topUpCharges.push(line); continue }
-      let order = byDocket.get(line.ticket) ?? null
+      let order = byDocket.get(line.ticket.trim()) ?? null
       if (!order && section.type === 'guest' && line.ticket) {
         const candidates = byRoom.get(line.ticket) ?? []
         if (candidates.length === 1) order = candidates[0]
@@ -624,14 +624,26 @@ export default function Reconciliation() {
       const docket = row.invoiceLine.ticket || `INV-${Date.now()}`
       const orderType = row.sectionType as OrderType
 
-      // Use invoice line date or invoice period so the order falls within the reconciliation window
-      const lineDate = row.invoiceLine.date || null
+      // Set created_at within the invoice period so re-reconciliation finds this order
       const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
-      const createdAt = lineDate
-        ? new Date(`${lineDate}T12:00:00.000Z`).toISOString()
-        : period
-          ? period.start.toISOString()
-          : new Date().toISOString()
+
+      // Parse line date (dd/MM/yy or dd/MM/yyyy UK format)
+      let createdAt: string
+      const lineDate = row.invoiceLine.date
+      if (lineDate) {
+        const parts = lineDate.split('/')
+        if (parts.length === 3) {
+          const day = parts[0]
+          const month = parts[1]
+          let yr = parts[2]
+          if (yr.length === 2) yr = `20${yr}`
+          createdAt = `${yr}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00.000Z`
+        } else {
+          createdAt = period ? period.start.toISOString() : new Date().toISOString()
+        }
+      } else {
+        createdAt = period ? period.start.toISOString() : new Date().toISOString()
+      }
 
       // Create order
       const { data: newOrder, error: orderErr } = await supabase.from('orders').insert({
