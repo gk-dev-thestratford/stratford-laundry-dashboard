@@ -21,7 +21,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -48,6 +48,9 @@ class DatabaseService {
           created_at TEXT NOT NULL
         )
       ''');
+    }
+    if (oldVersion < 5) {
+      await db.execute('ALTER TABLE admin_users ADD COLUMN can_reject_orders INTEGER NOT NULL DEFAULT 0');
     }
   }
 
@@ -82,7 +85,8 @@ class DatabaseService {
         name TEXT NOT NULL,
         pin_hash TEXT NOT NULL,
         is_active INTEGER NOT NULL DEFAULT 1,
-        can_delete_orders INTEGER NOT NULL DEFAULT 0
+        can_delete_orders INTEGER NOT NULL DEFAULT 0,
+        can_reject_orders INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -475,6 +479,7 @@ class DatabaseService {
           'pin_hash': admin['pin_hash'],
           'is_active': admin['is_active'] == true ? 1 : 0,
           'can_delete_orders': admin['can_delete_orders'] == true ? 1 : 0,
+          'can_reject_orders': admin['can_reject_orders'] == true ? 1 : 0,
         });
       }
     });

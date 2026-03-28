@@ -920,10 +920,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         ref.read(adminProvider.notifier).refreshActivity();
         _quickAction(orderId, AppConstants.statusApproved);
       },
-      onReject: () {
-        ref.read(adminProvider.notifier).refreshActivity();
-        _showRejectDialog(orderId);
-      },
+      onReject: ref.read(adminProvider).currentAdmin?.canRejectOrders == true
+        ? () {
+            ref.read(adminProvider.notifier).refreshActivity();
+            _showRejectDialog(orderId);
+          }
+        : null,
       onToggleSelect: () => _toggleOrderSelection(orderId),
       onReturnToPending: () {
         ref.read(adminProvider.notifier).refreshActivity();
@@ -965,7 +967,7 @@ class _OrderCard extends StatelessWidget {
   final bool showCollectedAction;
   final VoidCallback onTap;
   final VoidCallback onApprove;
-  final VoidCallback onReject;
+  final VoidCallback? onReject;
   final VoidCallback? onToggleSelect;
   final VoidCallback? onReturnToPending;
   final VoidCallback? onReceive;
@@ -984,7 +986,7 @@ class _OrderCard extends StatelessWidget {
     this.showCollectedAction = false,
     required this.onTap,
     required this.onApprove,
-    required this.onReject,
+    this.onReject,
     this.onToggleSelect,
     this.onReturnToPending,
     this.onReceive,
@@ -1161,6 +1163,7 @@ class _OrderCard extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (onReject != null) ...[
                 SizedBox(width: AppSpacing.sm),
                 SizedBox(
                   height: AppSizes.buttonHeightSm,
@@ -1177,6 +1180,7 @@ class _OrderCard extends StatelessWidget {
                     ),
                   ),
                 ),
+                ],
               ] else if (showReturnToPending) ...[
                 Container(
                   padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),

@@ -26,6 +26,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
   List<Map<String, dynamic>> _statusLog = [];
   bool _isLoading = true;
   bool _canDelete = false;
+  bool _canReject = false;
   final _reasonController = TextEditingController();
 
   // For received quantities
@@ -38,10 +39,10 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       ref.read(adminProvider.notifier).refreshActivity();
     });
     _loadOrder();
-    _checkDeletePermission();
+    _checkPermissions();
   }
 
-  Future<void> _checkDeletePermission() async {
+  Future<void> _checkPermissions() async {
     final adminId = ref.read(adminProvider).currentAdmin?.id;
     if (adminId == null) return;
 
@@ -49,17 +50,25 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     final localAdmin = ref.read(adminProvider).currentAdmin;
     if (localAdmin?.canDeleteOrders == true) {
       setState(() => _canDelete = true);
-      return;
     }
+    if (localAdmin?.canRejectOrders == true) {
+      setState(() => _canReject = true);
+    }
+    if (_canDelete && _canReject) return;
 
-    // Try Supabase directly
+    // Try Supabase directly for fresh permissions
     try {
       final remoteAdmins = await SupabaseService.instance
           .fetchAdminUsers()
           .timeout(const Duration(seconds: 5));
       final match = remoteAdmins.where((a) => a['id'] == adminId).toList();
-      if (match.isNotEmpty && match.first['can_delete_orders'] == true) {
-        if (mounted) setState(() => _canDelete = true);
+      if (match.isNotEmpty) {
+        if (match.first['can_delete_orders'] == true) {
+          if (mounted) setState(() => _canDelete = true);
+        }
+        if (match.first['can_reject_orders'] == true) {
+          if (mounted) setState(() => _canReject = true);
+        }
       }
       // Update local DB with fresh data
       await DatabaseService.instance.syncAdminUsers(remoteAdmins);
@@ -621,11 +630,15 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     switch (status) {
       case AppConstants.statusSubmitted:
-        actions.addAll([
+        actions.add(
           _actionButton('Approve', Icons.check_circle, AppColors.success, () => _confirmAction('Approve', AppConstants.statusApproved)),
-          SizedBox(width: AppSpacing.md),
-          _actionButton('Reject', Icons.cancel, AppColors.error, () => _showRejectDialog()),
-        ]);
+        );
+        if (_canReject) {
+          actions.addAll([
+            SizedBox(width: AppSpacing.md),
+            _actionButton('Reject', Icons.cancel, AppColors.error, () => _showRejectDialog()),
+          ]);
+        }
       case AppConstants.statusApproved:
         actions.add(_actionButton('Mark Collected', Icons.local_shipping, AppColors.statusCollected, () => _confirmAction('Mark as Collected', AppConstants.statusCollected)));
       case AppConstants.statusCollected:
