@@ -8,6 +8,12 @@ interface LayoutProps {
   onSignOut: () => void
 }
 
+function userInitial(user: DashboardUser | null): string {
+  if (user?.name) return user.name.charAt(0).toUpperCase()
+  if (user?.email) return user.email.charAt(0).toUpperCase()
+  return '?'
+}
+
 const navItems = [
   { to: '/', icon: BarChart3, label: 'Reports' },
   { to: '/linen-pool', icon: UtensilsCrossed, label: 'Linen Pool' },
@@ -64,7 +70,7 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
           </button>
         </div>
 
-        <nav className="flex-1 pt-6 pl-4 space-y-1">
+        <nav className="flex-1 pt-6 pl-4 space-y-1 overflow-y-auto">
           {navItems.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
@@ -86,11 +92,13 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
         <div className="p-4 border-t border-white/10">
           <div className="flex items-center gap-3 mb-3">
             <div className="w-8 h-8 rounded-full bg-gold/20 flex items-center justify-center text-xs font-semibold text-gold">
-              {user?.name?.charAt(0) || '?'}
+              {userInitial(user)}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate">{user?.name || 'User'}</p>
-              <p className="text-[11px] text-gray-400 truncate">{user?.email}</p>
+              <p className="text-sm font-medium truncate">{user?.name || user?.email || 'User'}</p>
+              {user?.name && user?.email && (
+                <p className="text-[11px] text-gray-400 truncate">{user.email}</p>
+              )}
             </div>
           </div>
           <button
