@@ -6,6 +6,7 @@ import '../../widgets/screen_scaffold.dart';
 import '../../providers/order_provider.dart';
 import '../../providers/catalogue_provider.dart';
 import '../../models/catalogue_item.dart';
+import '../../services/sync_service.dart';
 
 class ItemSelectionScreen extends ConsumerWidget {
   const ItemSelectionScreen({super.key});
@@ -14,7 +15,14 @@ class ItemSelectionScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final order = ref.watch(orderProvider);
     final catalogueAsync = ref.watch(catalogueItemsProvider(order.itemCategory));
-    final catalogueItems = catalogueAsync.valueOrNull ?? CatalogueItem.getByCategory(order.itemCategory);
+    final allItems = catalogueAsync.valueOrNull ?? CatalogueItem.getByCategory(order.itemCategory);
+    // Filter items by department: show items with no department restriction,
+    // or items assigned to the order's department
+    final catalogueItems = allItems.where((item) =>
+      item.departmentId == null ||
+      item.departmentId!.isEmpty ||
+      item.departmentId == order.departmentId
+    ).toList();
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
     final showPrices = order.isUniformOrder;
 
@@ -27,6 +35,19 @@ class ItemSelectionScreen extends ConsumerWidget {
       title: 'Select Items',
       subtitle: 'Step 3 of 4 — Choose Items & Quantities',
       compact: true,
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.refresh_rounded),
+          tooltip: 'Refresh items from server',
+          onPressed: () {
+            SyncService.instance.fullSync();
+            ref.invalidate(catalogueItemsProvider);
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Refreshing items...'), duration: Duration(seconds: 1)),
+            );
+          },
+        ),
+      ],
       child: Column(
         children: [
           Expanded(

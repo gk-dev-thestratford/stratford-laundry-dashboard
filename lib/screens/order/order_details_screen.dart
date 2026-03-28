@@ -6,7 +6,9 @@ import '../../theme/app_theme.dart';
 import '../../widgets/screen_scaffold.dart';
 import '../../providers/order_provider.dart';
 import '../../providers/department_provider.dart';
+import '../../providers/catalogue_provider.dart';
 import '../../models/department.dart';
+import '../../services/sync_service.dart';
 
 /// Capitalizes the first letter of each word as the user types.
 class _CapitalizeWordsFormatter extends TextInputFormatter {
@@ -156,6 +158,22 @@ class _OrderDetailsScreenState extends ConsumerState<OrderDetailsScreen> {
     return ScreenScaffold(
       title: 'Order Details',
       subtitle: _stepSubtitle,
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.refresh_rounded),
+          tooltip: 'Refresh departments & items',
+          onPressed: () {
+            SyncService.instance.fullSync();
+            ref.invalidate(departmentsProvider);
+            ref.invalidate(staffDepartmentsProvider);
+            ref.invalidate(linenDepartmentsProvider);
+            ref.invalidate(catalogueItemsProvider);
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Refreshing...'), duration: Duration(seconds: 1)),
+            );
+          },
+        ),
+      ],
       child: SingleChildScrollView(
         padding: EdgeInsets.symmetric(
           horizontal: isLandscape ? AppSpacing.xl : AppSpacing.lg,

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -63,6 +64,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     _loadData();
     // Re-sync when app returns to foreground
     WidgetsBinding.instance.addObserver(_lifecycleObserver);
+    // Reload data when sync completes (e.g. from login screen or background)
+    _syncSub = SyncService.instance.onReferenceDataSynced.listen((_) {
+      _loadData();
+    });
   }
 
   late final _lifecycleObserver = _AppLifecycleObserver(onResume: () {
@@ -70,8 +75,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     _loadData();
   });
 
+  late final StreamSubscription<void> _syncSub;
+
   @override
   void dispose() {
+    _syncSub.cancel();
     WidgetsBinding.instance.removeObserver(_lifecycleObserver);
     _tabController.dispose();
     super.dispose();
@@ -620,7 +628,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                             child: GestureDetector(
                               onTap: () {
                                 if (isNapkinTab) {
-                                  context.push('/admin/napkin-returns');
+                                  context.push('/admin/napkin-returns').then((_) {
+                                    SyncService.instance.fullSync();
+                                    _loadData();
+                                  });
                                 } else {
                                   _tabController.animateTo(idx);
                                 }
@@ -900,7 +911,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       showCollectedAction: _isCompletedTab,
       onTap: () {
         ref.read(adminProvider.notifier).refreshActivity();
-        context.push('/admin/order/$orderId');
+        context.push('/admin/order/$orderId').then((_) {
+          SyncService.instance.fullSync();
+          _loadData();
+        });
       },
       onApprove: () {
         ref.read(adminProvider.notifier).refreshActivity();
@@ -933,7 +947,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'In Progress' => (_counts[AppConstants.statusCollected] ?? 0) + (_counts[AppConstants.statusInProcessing] ?? 0),
       'Completed' => _counts[AppConstants.statusCompleted] ?? 0,
       'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
-      _ => _counts.values.fold(0, (a, b) => a + b),
+      _ => 0, // All + Napkins — no counter
     };
   }
 }

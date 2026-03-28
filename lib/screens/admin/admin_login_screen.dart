@@ -48,6 +48,8 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
   void initState() {
     super.initState();
     _loadAdmins();
+    // Pull fresh data from Supabase while user enters PIN
+    SyncService.instance.fullSync();
   }
 
   @override
