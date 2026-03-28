@@ -54,7 +54,7 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
 
       {/* Sidebar */}
       <aside className={`
-        fixed inset-y-0 left-0 z-50 w-64 bg-navy text-white flex flex-col transition-transform lg:translate-x-0 lg:static lg:z-auto
+        fixed inset-y-0 left-0 z-50 w-64 bg-navy text-white flex flex-col transition-transform lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen lg:z-auto
         ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
       `}>
         <div className="p-6 flex items-center gap-3 border-b border-white/10">
