@@ -58,14 +58,15 @@ export default function OrdersTable({
           <colgroup>
             <col className="w-[44px]" />
             <col className="w-[120px]" />
-            <col className="w-[120px]" />
+            <col className="w-[110px]" />
+            <col className="w-[130px]" />
             <col className="w-[140px]" />
+            <col className="w-[55px]" />
+            <col className="w-[75px]" />
+            <col className="w-[100px]" />
+            <col className="w-[100px]" />
+            <col className="w-[100px]" />
             <col className="w-[150px]" />
-            <col className="w-[60px]" />
-            <col className="w-[110px]" />
-            <col className="w-[110px]" />
-            <col className="w-[110px]" />
-            <col className="w-[160px]" />
           </colgroup>
           <thead>
             <tr className="border-b border-gray-300 bg-gray-50">
@@ -82,6 +83,7 @@ export default function OrdersTable({
               <th className={`${TH} text-left`}>Name</th>
               <th className={`${TH} text-left`}>Department</th>
               <th className={`${TH} text-center`}>Items</th>
+              <th className={`${TH} text-center`}>Outstanding</th>
               <th className={`${TH} text-right`}>Total ex VAT</th>
               <th className={`${TH} text-right`}>Total inc VAT</th>
               <th className={`${TH} text-center`}>Status</th>
@@ -91,13 +93,16 @@ export default function OrdersTable({
           <tbody>
             {orders.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-4 py-12 text-center text-gray-500">
+                <td colSpan={11} className="px-4 py-12 text-center text-gray-500">
                   No orders found
                 </td>
               </tr>
             ) : (
               orders.map((order) => {
                 const cost = orderCost(order, bulkEdits)
+                const outstanding = (order.order_items || []).reduce(
+                  (sum, i) => sum + Math.max(0, (i.quantity_sent || 0) - (i.quantity_received ?? 0)), 0,
+                )
                 const hasDiscrepancy = (order.order_items || []).some(
                   (i) => i.quantity_received != null && i.quantity_received !== i.quantity_sent,
                 )
@@ -148,6 +153,9 @@ export default function OrdersTable({
                       </td>
                       <td className={`${TD} text-center text-gray-600`}>
                         {order.order_items?.length || 0}
+                      </td>
+                      <td className={`${TD} text-center ${outstanding > 0 ? 'text-amber-600 font-semibold' : 'text-gray-400'}`}>
+                        {outstanding > 0 ? outstanding : '\u2713'}
                       </td>
                       <td className={`${TD} text-right text-gray-900 font-medium`}>
                         {cost != null ? `\u00a3${cost.toFixed(2)}` : '\u2014'}
