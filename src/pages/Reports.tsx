@@ -132,12 +132,12 @@ export default function Reports() {
     // Filter orders by selected department
     const src = breakdownDeptId === '_all' ? orders : orders.filter(o => (o.department_id || '_none') === breakdownDeptId)
 
-    // Collect item names with quantities and costs per month
+    // Collect items — uniform orders grouped as "Uniforms", linen items keep individual names
     const itemMap = new Map<string, { qty: number[]; cost: number[] }>()
     src.forEach(o => {
       const m = new Date(o.created_at).getMonth()
       o.order_items?.forEach(item => {
-        const name = item.item_name
+        const name = o.order_type === 'uniform' ? 'Uniforms' : item.item_name
         if (!itemMap.has(name)) itemMap.set(name, { qty: new Array(12).fill(0), cost: new Array(12).fill(0) })
         const entry = itemMap.get(name)!
         entry.qty[m] += item.quantity_sent || 0
