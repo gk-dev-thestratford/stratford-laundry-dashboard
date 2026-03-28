@@ -624,6 +624,15 @@ export default function Reconciliation() {
       const docket = row.invoiceLine.ticket || `INV-${Date.now()}`
       const orderType = row.sectionType as OrderType
 
+      // Use invoice line date or invoice period so the order falls within the reconciliation window
+      const lineDate = row.invoiceLine.date || null
+      const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
+      const createdAt = lineDate
+        ? new Date(`${lineDate}T12:00:00.000Z`).toISOString()
+        : period
+          ? period.start.toISOString()
+          : new Date().toISOString()
+
       // Create order
       const { data: newOrder, error: orderErr } = await supabase.from('orders').insert({
         docket_number: docket,
@@ -635,6 +644,7 @@ export default function Reconciliation() {
         status: 'completed',
         total_price: +row.invoiceLine.net.toFixed(2),
         notes: `Added from invoice reconciliation — ${invoice.invoiceNumber}`,
+        created_at: createdAt,
       }).select().single()
 
       if (orderErr) throw orderErr
@@ -659,6 +669,22 @@ export default function Reconciliation() {
           quantity_sent: 1,
           quantity_received: 1,
           price_at_time: +row.invoiceLine.net.toFixed(2),
+        })
+      }
+
+      // Log status history
+      if (newOrder) {
+        let userName = 'Dashboard'
+        const { data: { user: authUser } } = await supabase.auth.getUser()
+        if (authUser) {
+          const { data: du } = await supabase.from('dashboard_users').select('name, email').eq('id', authUser.id).single()
+          userName = `Dashboard / ${du?.name || du?.email || 'Unknown'}`
+        }
+        await supabase.from('order_status_log').insert({
+          order_id: newOrder.id,
+          status: 'completed',
+          changed_by_name: userName,
+          reason: `Added from invoice reconciliation — ${invoice.invoiceNumber}`,
         })
       }
 

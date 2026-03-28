@@ -1,6 +1,5 @@
 import { useState, useCallback } from 'react'
 import { Plus, Download, Trash2, RefreshCw, Pencil, Save, X, FileSpreadsheet, Mail, CheckCircle } from 'lucide-react'
-import { supabase } from '../lib/supabase'
 import { useOrders } from '../hooks/useOrders'
 import Filters from '../components/Filters'
 import OrdersTable from '../components/OrdersTable'
@@ -41,7 +40,6 @@ export default function Orders() {
   const [emailTo, setEmailTo] = useState('')
   const [emailSending, setEmailSending] = useState(false)
   const [emailSent, setEmailSent] = useState(false)
-  const [emailError, setEmailError] = useState('')
 
   const editCount = Object.keys(bulkEdits.orders).length + Object.keys(bulkEdits.items).length
 
@@ -123,33 +121,41 @@ export default function Orders() {
     return rows
   }
 
-  async function handleSendEmail() {
+  function handleSendEmail() {
     if (!emailTo.trim()) return
     const rows = getOutstandingEmailData()
     if (rows.length === 0) return
 
     setEmailSending(true)
-    setEmailError('')
 
-    try {
-      const { data, error } = await supabase.functions.invoke('email-outstanding', {
-        body: { to: emailTo.trim(), items: rows },
-      })
+    const subject = `Outstanding Laundry Items — ${rows.reduce((s, r) => s + r.outstanding, 0)} item(s) requiring investigation`
+    const body = [
+      'Dear Team,',
+      '',
+      'Please find below a list of outstanding laundry items that require investigation:',
+      '',
+      ...rows.map(r =>
+        `• Docket: ${r.docket} | Dept: ${r.department} | Item: ${r.item} | Sent: ${r.sent} | Received: ${r.received} | Outstanding: ${r.outstanding}`
+      ),
+      '',
+      `Total outstanding items: ${rows.reduce((s, r) => s + r.outstanding, 0)}`,
+      `Across ${new Set(rows.map(r => r.docket)).size} order(s)`,
+      '',
+      'Please investigate and advise on the status of these items.',
+      '',
+      'Kind regards,',
+      'The Stratford Laundry Team',
+    ].join('\n')
 
-      if (error) throw new Error(error.message)
-      if (data?.error) throw new Error(data.error)
+    window.location.href = `mailto:${encodeURIComponent(emailTo)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
 
-      setEmailSent(true)
-      setTimeout(() => {
-        setShowEmailModal(false)
-        setEmailSent(false)
-        setEmailTo('')
-      }, 3000)
-    } catch (e: any) {
-      setEmailError(e.message || 'Failed to send email')
-    } finally {
-      setEmailSending(false)
-    }
+    setEmailSending(false)
+    setEmailSent(true)
+    setTimeout(() => {
+      setShowEmailModal(false)
+      setEmailSent(false)
+      setEmailTo('')
+    }, 2000)
   }
 
   // ── Standard export (all filtered orders) ──
@@ -444,7 +450,7 @@ export default function Orders() {
             </button>
           )}
           <button
-            onClick={() => { setShowEmailModal(true); setEmailSent(false); setEmailTo(''); setEmailError('') }}
+            onClick={() => { setShowEmailModal(true); setEmailSent(false); setEmailTo('') }}
             className="flex items-center gap-1 px-3 py-1 text-sm text-navy bg-navy/10 border border-navy/20 rounded-lg hover:bg-navy/20"
           >
             <Mail className="w-3.5 h-3.5" />
@@ -525,8 +531,8 @@ export default function Orders() {
             {emailSent ? (
               <div className="px-6 py-12 text-center">
                 <CheckCircle className="w-12 h-12 text-green-500 mx-auto mb-3" />
-                <p className="text-lg font-semibold text-gray-900">Email sent successfully</p>
-                <p className="text-sm text-gray-500 mt-1">The outstanding items report has been sent to {emailTo}</p>
+                <p className="text-lg font-semibold text-gray-900">Email client opened</p>
+                <p className="text-sm text-gray-500 mt-1">Review and send the email from your mail app</p>
               </div>
             ) : (
               <>
@@ -585,11 +591,6 @@ export default function Orders() {
                   </div>
                 </div>
 
-                {emailError && (
-                  <div className="mx-6 mb-0 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
-                    {emailError}
-                  </div>
-                )}
 
                 <div className="px-6 py-3 border-t border-gray-100 flex items-center justify-end gap-2">
                   <button
