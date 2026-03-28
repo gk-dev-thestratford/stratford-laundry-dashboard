@@ -81,7 +81,7 @@ export function useOrders() {
           o.guest_name?.toLowerCase().includes(s) ||
           o.room_number?.toLowerCase().includes(s) ||
           o.department?.name?.toLowerCase().includes(s) ||
-          (o.order_items || []).some(i => i.item_name.toLowerCase().includes(s))
+          (o.order_items || []).some((i: { item_name: string }) => i.item_name.toLowerCase().includes(s))
       )
     }
 
