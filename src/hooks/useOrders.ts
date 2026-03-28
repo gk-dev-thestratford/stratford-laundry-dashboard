@@ -116,6 +116,28 @@ export function useOrders() {
         reason,
         changed_by_name: 'Dashboard',
       })
+
+      // When marking received/completed, auto-fill quantity_received for items
+      // that haven't been manually reconciled yet (null or 0)
+      if (status === 'received' || status === 'completed') {
+        const { data: items } = await supabase
+          .from('order_items')
+          .select('id, quantity_sent, quantity_received')
+          .eq('order_id', orderId)
+        if (items) {
+          const toUpdate = items.filter(i => !i.quantity_received)
+          if (toUpdate.length > 0) {
+            await Promise.all(
+              toUpdate.map(i =>
+                supabase.from('order_items')
+                  .update({ quantity_received: i.quantity_sent })
+                  .eq('id', i.id)
+              )
+            )
+          }
+        }
+      }
+
       fetchOrders()
     }
     return { error }
