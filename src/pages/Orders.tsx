@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { Plus, Download, Trash2, RefreshCw, Pencil, Save, X, FileSpreadsheet } from 'lucide-react'
+import { Plus, Download, Trash2, RefreshCw, Pencil, Save, X, FileSpreadsheet, Mail, CheckCircle } from 'lucide-react'
 import { useOrders } from '../hooks/useOrders'
 import Filters from '../components/Filters'
 import OrdersTable from '../components/OrdersTable'
@@ -34,6 +34,12 @@ export default function Orders() {
 
   // Bulk status progress
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null)
+
+  // Email outstanding modal
+  const [showEmailModal, setShowEmailModal] = useState(false)
+  const [emailTo, setEmailTo] = useState('')
+  const [emailSending, setEmailSending] = useState(false)
+  const [emailSent, setEmailSent] = useState(false)
 
   const editCount = Object.keys(bulkEdits.orders).length + Object.keys(bulkEdits.items).length
 
@@ -91,6 +97,69 @@ export default function Orders() {
     setBulkProgress(null)
     setSelectedIds(new Set())
     setBulkStatus('')
+  }
+
+  // ── Email outstanding items ──
+  function getOutstandingEmailData() {
+    const selected = orders.filter(o => selectedIds.has(o.id))
+    const rows: Array<{ docket: string; department: string; item: string; sent: number; received: number; outstanding: number }> = []
+    selected.forEach(o => {
+      (o.order_items || []).forEach(i => {
+        const out = (i.quantity_sent || 0) - (i.quantity_received ?? 0)
+        if (out > 0) {
+          rows.push({
+            docket: o.docket_number,
+            department: o.department?.name || '—',
+            item: i.item_name,
+            sent: i.quantity_sent,
+            received: i.quantity_received ?? 0,
+            outstanding: out,
+          })
+        }
+      })
+    })
+    return rows
+  }
+
+  function handleSendEmail() {
+    if (!emailTo.trim()) return
+    const rows = getOutstandingEmailData()
+    if (rows.length === 0) return
+
+    setEmailSending(true)
+
+    const subject = `Outstanding Laundry Items — ${rows.length} item(s) requiring investigation`
+    const body = [
+      'Dear Team,',
+      '',
+      'Please find below a list of outstanding laundry items that require investigation:',
+      '',
+      '------------------------------------------------------------',
+      ...rows.map(r =>
+        `Docket: ${r.docket} | Dept: ${r.department} | Item: ${r.item} | Sent: ${r.sent} | Received: ${r.received} | Outstanding: ${r.outstanding}`
+      ),
+      '------------------------------------------------------------',
+      '',
+      `Total outstanding items: ${rows.reduce((s, r) => s + r.outstanding, 0)}`,
+      `Across ${new Set(rows.map(r => r.docket)).size} order(s)`,
+      '',
+      'Please investigate and advise on the status of these items.',
+      '',
+      'Kind regards,',
+      'The Stratford Laundry Team',
+    ].join('\n')
+
+    window.location.href = `mailto:${encodeURIComponent(emailTo)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
+
+    setTimeout(() => {
+      setEmailSending(false)
+      setEmailSent(true)
+      setTimeout(() => {
+        setShowEmailModal(false)
+        setEmailSent(false)
+        setEmailTo('')
+      }, 2000)
+    }, 500)
   }
 
   // ── Standard export (all filtered orders) ──
@@ -385,6 +454,13 @@ export default function Orders() {
             </button>
           )}
           <button
+            onClick={() => { setShowEmailModal(true); setEmailSent(false); setEmailTo('') }}
+            className="flex items-center gap-1 px-3 py-1 text-sm text-navy bg-navy/10 border border-navy/20 rounded-lg hover:bg-navy/20"
+          >
+            <Mail className="w-3.5 h-3.5" />
+            Email Outstanding
+          </button>
+          <button
             onClick={handleBulkDelete}
             className="flex items-center gap-1 px-3 py-1 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100"
           >
@@ -440,6 +516,105 @@ export default function Orders() {
           onClose={() => setShowCreate(false)}
           onCreated={fetchOrders}
         />
+      )}
+
+      {/* Email Outstanding modal */}
+      {showEmailModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Mail className="w-5 h-5 text-navy" />
+                <h3 className="font-semibold text-gray-900">Email Outstanding Items</h3>
+              </div>
+              <button onClick={() => setShowEmailModal(false)} className="p-1 hover:bg-gray-100 rounded-lg">
+                <X className="w-4 h-4 text-gray-500" />
+              </button>
+            </div>
+
+            {emailSent ? (
+              <div className="px-6 py-12 text-center">
+                <CheckCircle className="w-12 h-12 text-green-500 mx-auto mb-3" />
+                <p className="text-lg font-semibold text-gray-900">Email client opened</p>
+                <p className="text-sm text-gray-500 mt-1">Review and send the email from your mail app</p>
+              </div>
+            ) : (
+              <>
+                <div className="px-6 py-4 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Recipient email</label>
+                    <input
+                      type="email"
+                      value={emailTo}
+                      onChange={e => setEmailTo(e.target.value)}
+                      placeholder="e.g. laundry@supplier.com"
+                      className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30 focus:border-navy"
+                    />
+                  </div>
+
+                  {/* Preview */}
+                  <div>
+                    <p className="text-sm font-medium text-gray-700 mb-1">Items to include</p>
+                    <div className="bg-gray-50 rounded-lg border border-gray-200 max-h-48 overflow-y-auto">
+                      {(() => {
+                        const rows = getOutstandingEmailData()
+                        if (rows.length === 0) return (
+                          <p className="px-4 py-6 text-center text-sm text-gray-400">No outstanding items in selected orders</p>
+                        )
+                        return (
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="border-b border-gray-200 bg-gray-100 sticky top-0">
+                                <th className="px-3 py-1.5 text-left font-medium text-gray-600">Docket</th>
+                                <th className="px-3 py-1.5 text-left font-medium text-gray-600">Dept</th>
+                                <th className="px-3 py-1.5 text-left font-medium text-gray-600">Item</th>
+                                <th className="px-3 py-1.5 text-right font-medium text-gray-600">Sent</th>
+                                <th className="px-3 py-1.5 text-right font-medium text-gray-600">Rcvd</th>
+                                <th className="px-3 py-1.5 text-right font-medium text-amber-600">Out</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rows.map((r, i) => (
+                                <tr key={i} className="border-b border-gray-100">
+                                  <td className="px-3 py-1.5 font-mono">{r.docket}</td>
+                                  <td className="px-3 py-1.5">{r.department}</td>
+                                  <td className="px-3 py-1.5">{r.item}</td>
+                                  <td className="px-3 py-1.5 text-right">{r.sent}</td>
+                                  <td className="px-3 py-1.5 text-right">{r.received}</td>
+                                  <td className="px-3 py-1.5 text-right font-semibold text-amber-600">{r.outstanding}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )
+                      })()}
+                    </div>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      {getOutstandingEmailData().reduce((s, r) => s + r.outstanding, 0)} outstanding items across {new Set(getOutstandingEmailData().map(r => r.docket)).size} orders
+                    </p>
+                  </div>
+                </div>
+
+                <div className="px-6 py-3 border-t border-gray-100 flex items-center justify-end gap-2">
+                  <button
+                    onClick={() => setShowEmailModal(false)}
+                    className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSendEmail}
+                    disabled={!emailTo.trim() || getOutstandingEmailData().length === 0 || emailSending}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-navy rounded-lg hover:bg-navy-light disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Mail className="w-4 h-4" />
+                    {emailSending ? 'Opening...' : 'Send Email'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )
