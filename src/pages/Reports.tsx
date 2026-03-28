@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, Fragment } from 'react'
 import { supabase } from '../lib/supabase'
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, Legend,
 } from 'recharts'
 import {
   ChevronLeft, ChevronRight, ChevronDown, Download, RefreshCw,
@@ -114,6 +114,36 @@ export default function Reports() {
   const deptChartData = useMemo(() => deptData.map(d => ({ name: d.name, orders: d.orders })), [deptData])
   const deptCostChartData = useMemo(() => deptData.filter(d => d.cost > 0).map(d => ({ name: d.name, costIncVat: Number((d.cost * 1.2).toFixed(2)) })), [deptData])
 
+  // ── Item breakdown by month (full year, per item name) ──
+  const ITEM_COLORS = ['#1B2A4A', '#C9A84C', '#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6', '#6366F1', '#F97316', '#84CC16', '#A855F7', '#0EA5E9']
+
+  const itemMonthlyBreakdown = useMemo(() => {
+    // Collect all item names and their quantities per month
+    const itemMap = new Map<string, number[]>() // item_name -> [jan..dec]
+    orders.forEach(o => {
+      const m = new Date(o.created_at).getMonth()
+      o.order_items?.forEach(item => {
+        const name = item.item_name
+        if (!itemMap.has(name)) itemMap.set(name, new Array(12).fill(0))
+        itemMap.get(name)![m] += item.quantity_sent || 0
+      })
+    })
+    // Sort items by total quantity descending
+    const sorted = Array.from(itemMap.entries())
+      .map(([name, months]) => ({ name, months, total: months.reduce((a, b) => a + b, 0) }))
+      .filter(i => i.total > 0)
+      .sort((a, b) => b.total - a.total)
+
+    // Build chart data: one entry per month, each item name as a key
+    const itemNames = sorted.map(i => i.name)
+    const chartData = Array.from({ length: 12 }, (_, m) => {
+      const entry: Record<string, string | number> = { month: MONTHS[m + 1] as string }
+      sorted.forEach(item => { entry[item.name] = item.months[m] })
+      return entry
+    })
+    return { chartData, itemNames, sorted }
+  }, [orders])
+
   // ── Discrepancies / outstanding ──
   const discrepancies = useMemo(() => {
     return filtered
@@ -187,14 +217,26 @@ export default function Reports() {
       })
     })
 
+    const itemBreakdownSheet = itemMonthlyBreakdown.sorted.map(item => {
+      const row: Record<string, string | number> = { 'Item': item.name }
+      ;['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].forEach((m, i) => {
+        row[m] = item.months[i]
+      })
+      row['Total'] = item.total
+      return row
+    })
+
     const wb = utils.book_new()
     utils.book_append_sheet(wb, utils.json_to_sheet(monthlySheet), 'Monthly Overview')
     utils.book_append_sheet(wb, utils.json_to_sheet(deptSheet), 'Department Breakdown')
+    if (itemBreakdownSheet.length > 0) {
+      utils.book_append_sheet(wb, utils.json_to_sheet(itemBreakdownSheet), 'Item Breakdown')
+    }
     if (outstandingSheet.length > 0) {
       utils.book_append_sheet(wb, utils.json_to_sheet(outstandingSheet), 'Outstanding Items')
     }
     writeFile(wb, `stratford-report-${year}${month > 0 ? `-${String(month).padStart(2, '0')}` : ''}.xlsx`)
-  }, [monthlyData, deptData, discrepancies, year, month])
+  }, [monthlyData, deptData, discrepancies, itemMonthlyBreakdown, year, month])
 
   // ── Render ──
 
@@ -496,6 +538,81 @@ export default function Reports() {
           )}
         </div>
       </div>
+
+      {/* Item Breakdown by Month */}
+      {itemMonthlyBreakdown.sorted.length > 0 && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100 flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-navy/10 flex items-center justify-center">
+              <Package className="w-4 h-4 text-navy" />
+            </div>
+            <h3 className="text-sm font-semibold text-gray-900">Item Breakdown by Month — {year}</h3>
+          </div>
+
+          {/* Stacked bar chart */}
+          <div className="p-5">
+            <ResponsiveContainer width="100%" height={320}>
+              <BarChart data={itemMonthlyBreakdown.chartData} barSize={28}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={40} allowDecimals={false} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                <Legend
+                  wrapperStyle={{ fontSize: 11, paddingTop: 12 }}
+                  iconType="circle"
+                  iconSize={8}
+                />
+                {itemMonthlyBreakdown.itemNames.map((name, i) => (
+                  <Bar key={name} dataKey={name} stackId="items" fill={ITEM_COLORS[i % ITEM_COLORS.length]} radius={i === itemMonthlyBreakdown.itemNames.length - 1 ? [3, 3, 0, 0] : undefined} />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Detailed table */}
+          <div className="overflow-x-auto border-t border-gray-100">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 bg-gray-50">
+                  <th className="px-4 py-2 text-left font-medium text-gray-600 sticky left-0 bg-gray-50 min-w-[160px]">Item</th>
+                  {(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] as const).map(m => (
+                    <th key={m} className="px-3 py-2 text-right font-medium text-gray-600 min-w-[56px]">{m}</th>
+                  ))}
+                  <th className="px-4 py-2 text-right font-semibold text-gray-900 min-w-[64px]">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {itemMonthlyBreakdown.sorted.map((item, i) => (
+                  <tr key={item.name} className="border-b border-gray-100 last:border-0">
+                    <td className="px-4 py-2 sticky left-0 bg-white">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: ITEM_COLORS[i % ITEM_COLORS.length] }} />
+                        <span className="truncate">{item.name}</span>
+                      </div>
+                    </td>
+                    {item.months.map((qty, m) => (
+                      <td key={m} className={`px-3 py-2 text-right ${qty === 0 ? 'text-gray-300' : ''}`}>
+                        {qty || '—'}
+                      </td>
+                    ))}
+                    <td className="px-4 py-2 text-right font-semibold">{item.total}</td>
+                  </tr>
+                ))}
+                {itemMonthlyBreakdown.sorted.length > 1 && (
+                  <tr className="border-t-2 border-gray-300 bg-gray-50 font-semibold">
+                    <td className="px-4 py-2 sticky left-0 bg-gray-50">Total</td>
+                    {Array.from({ length: 12 }, (_, m) => {
+                      const total = itemMonthlyBreakdown.sorted.reduce((s, item) => s + item.months[m], 0)
+                      return <td key={m} className={`px-3 py-2 text-right ${total === 0 ? 'text-gray-300' : ''}`}>{total || '—'}</td>
+                    })}
+                    <td className="px-4 py-2 text-right">{itemMonthlyBreakdown.sorted.reduce((s, item) => s + item.total, 0)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Department Breakdown */}
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
