@@ -276,7 +276,8 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   let currentSection: InvoiceSection | null = null
   let lastDate = ''
 
-  for (const line of lines) {
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]
     // Extract metadata
     const numM = line.match(/Invoice\s*Number:\s*(\S+)/i)
     if (numM) invoiceNumber = numM[1]
@@ -285,7 +286,18 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     if (dateM) invoiceDate = dateM[1]
 
     const periodM = line.match(/Invoice\s*Period:\s*(.+?)$/i)
-    if (periodM) invoicePeriod = periodM[1].trim()
+    if (periodM) {
+      let periodText = periodM[1].trim()
+      // If period ends with '-' and next line has a date, it's a continuation
+      if (periodText.endsWith('-') && li + 1 < lines.length) {
+        const nextLine = lines[li + 1].trim()
+        if (/^\d{2}[\./]\d{2}[\./]\d{2,4}/.test(nextLine)) {
+          periodText += ' ' + nextLine
+          li++ // skip the next line
+        }
+      }
+      invoicePeriod = periodText
+    }
 
     // Grand totals
     const netM = line.match(/^Net\s+£\s*([\d,]+\.\d{2})/i)
