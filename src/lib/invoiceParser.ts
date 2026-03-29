@@ -276,32 +276,58 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   let currentSection: InvoiceSection | null = null
   let lastDate = ''
 
-  // First pass: join all lines to extract metadata that might be split
-  const fullText = lines.join('\n')
+  // Extract metadata — the PDF layout puts labels at end of one line and values
+  // at start of next line mixed with other text, e.g.:
+  //   'Manhattan Loft Gardens Hotel Limited, Invoice Number:'
+  //   'T/A The Stratford GSSHSM017'
+  //   'Olympic Park, Invoice Date:'
+  //   '20 International Wy, 31.01.2026'
+  //   'London Invoice Period:'
+  //   'E20 1FD 01.01.26- 31.01.26'
+  // Strategy: scan each line for labels, then look for the value on the same or next line
 
-  // Extract metadata from full text (handles multi-line and merged lines)
-  // Use specific patterns that require the field label immediately before the value
-  const numFull = fullText.match(/Invoice\s*Number\s*:\s*([A-Z0-9]+)/i)
-  if (numFull) invoiceNumber = numFull[1]
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const nextLine = i + 1 < lines.length ? lines[i + 1] : ''
 
-  const dateFull = fullText.match(/Invoice\s*Date\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
-  if (dateFull) invoiceDate = dateFull[1]
+    // Invoice Number
+    if (!invoiceNumber && /Invoice\s*Number\s*:/i.test(line)) {
+      // Try same line first: value after the colon
+      const sameM = line.match(/Invoice\s*Number\s*:\s*([A-Z0-9]+)/i)
+      if (sameM) { invoiceNumber = sameM[1]; continue }
+      // Value is on next line — find alphanumeric code pattern (e.g. GSSHSM017)
+      const nextM = nextLine.match(/([A-Z]{2,}[A-Z0-9]*\d+)/i)
+      if (nextM) invoiceNumber = nextM[1]
+    }
 
-  // Period: try single-line first, then multi-line with newline between dates
-  const periodFull = fullText.match(/Invoice\s*Period\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/i)
-  if (periodFull) {
-    invoicePeriod = periodFull[1]
-  } else {
-    // Try with newline or whitespace between start date + dash and end date
-    const periodSplit = fullText.match(/Invoice\s*Period\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])\s+(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
-    if (periodSplit) invoicePeriod = periodSplit[1] + ' ' + periodSplit[2]
-  }
+    // Invoice Date
+    if (!invoiceDate && /Invoice\s*Date\s*:/i.test(line)) {
+      const sameM = line.match(/Invoice\s*Date\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+      if (sameM) { invoiceDate = sameM[1]; continue }
+      const nextM = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      if (nextM) invoiceDate = nextM[1]
+    }
 
-  // Debug: log what was found
-  console.log('[InvoiceParser] Metadata extracted:', { invoiceNumber, invoiceDate, invoicePeriod })
-  if (!invoiceNumber || !invoiceDate || !invoicePeriod) {
-    // Dump first 20 lines for debugging
-    console.log('[InvoiceParser] First 20 lines:', lines.slice(0, 20))
+    // Invoice Period
+    if (!invoicePeriod && /Invoice\s*Perio/i.test(line)) {
+      // Try same line: full period
+      const sameM = line.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      if (sameM) { invoicePeriod = sameM[1]; continue }
+      // Try next line for the full period
+      const nextFull = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      if (nextFull) { invoicePeriod = nextFull[1]; continue }
+      // Try start on same line, end on next
+      const startM = line.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])/)
+      if (startM) {
+        const endM = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4})/)
+        if (endM) invoicePeriod = startM[1] + ' ' + endM[1]
+      }
+      // Try start on next line (label at end of current line, period on next)
+      if (!invoicePeriod) {
+        const nextPeriod = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
+        if (nextPeriod) invoicePeriod = nextPeriod[1]
+      }
+    }
   }
 
   for (let li = 0; li < lines.length; li++) {
