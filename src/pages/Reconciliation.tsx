@@ -991,8 +991,10 @@ export default function Reconciliation() {
         <div><span className="text-gray-500">Invoice:</span> <span className="font-medium text-navy">{invoice.invoiceNumber}</span></div>
         <div><span className="text-gray-500">Date:</span> <span className="font-medium">{invoice.invoiceDate}</span></div>
         <div><span className="text-gray-500">Period:</span> <span className="font-medium">{invoice.invoicePeriod}</span></div>
-        {parsedPeriod && (
+        {parsedPeriod ? (
           <div><span className="text-gray-500">Date range:</span> <span className="font-medium text-navy">{format(parsedPeriod.start, 'dd MMM yyyy')} — {format(parsedPeriod.end, 'dd MMM yyyy')}</span></div>
+        ) : (
+          <div><span className="text-gray-500">Date range:</span> <span className="font-medium text-red-600">Could not parse period "{invoice.invoicePeriod}"</span></div>
         )}
         <div><span className="text-gray-500">Sections:</span> <span className="font-medium">{invoice.sections.map(s => s.name).join(', ')}</span></div>
         <div><span className="text-gray-500">Lines:</span> <span className="font-medium">{invoice.sections.reduce((s, sec) => s + sec.lines.length, 0)}</span></div>

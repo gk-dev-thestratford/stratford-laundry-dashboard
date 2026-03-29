@@ -288,12 +288,21 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     const periodM = line.match(/Invoice\s*Period:\s*(.+?)$/i)
     if (periodM) {
       let periodText = periodM[1].trim()
-      // If period ends with '-' and next line has a date, it's a continuation
-      if (periodText.endsWith('-') && li + 1 < lines.length) {
+      // If period ends with '-' (with optional trailing space) and next line has a date, it's a continuation
+      if (/[-–]\s*$/.test(periodText) && li + 1 < lines.length) {
         const nextLine = lines[li + 1].trim()
         if (/^\d{2}[\./]\d{2}[\./]\d{2,4}/.test(nextLine)) {
-          periodText += ' ' + nextLine
+          periodText = periodText.replace(/\s*$/, '') + ' ' + nextLine
           li++ // skip the next line
+        }
+      }
+      // Also check if the period only has a start date (no end date at all)
+      // and the next line is just a date
+      if (!/\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4}/.test(periodText) && li + 1 < lines.length) {
+        const nextLine = lines[li + 1].trim()
+        if (/^\d{2}[\./]\d{2}[\./]\d{2,4}\s*$/.test(nextLine)) {
+          periodText = periodText.replace(/\s*$/, '') + ' ' + nextLine
+          li++
         }
       }
       invoicePeriod = periodText
@@ -346,12 +355,15 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
 // ── Period parsing ──
 
 export function parseInvoicePeriod(period: string): { start: Date; end: Date } | null {
+  // Normalize: replace en-dash/em-dash with hyphen, collapse whitespace
+  const normalized = period.replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim()
+
   // Try DD.MM.YY(YY) - DD.MM.YY(YY)
-  const dotM = period.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s*-\s*(\d{2})\.(\d{2})\.(\d{2,4})/)
+  const dotM = normalized.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s*-\s*(\d{2})\.(\d{2})\.(\d{2,4})/)
   if (dotM) return buildPeriod(dotM[1], dotM[2], dotM[3], dotM[4], dotM[5], dotM[6])
 
   // Try DD/MM/YY(YY) - DD/MM/YY(YY)
-  const slashM = period.match(/(\d{2})\/(\d{2})\/(\d{2,4})\s*-\s*(\d{2})\/(\d{2})\/(\d{2,4})/)
+  const slashM = normalized.match(/(\d{2})\/(\d{2})\/(\d{2,4})\s*-\s*(\d{2})\/(\d{2})\/(\d{2,4})/)
   if (slashM) return buildPeriod(slashM[1], slashM[2], slashM[3], slashM[4], slashM[5], slashM[6])
 
   return null
