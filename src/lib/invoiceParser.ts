@@ -280,18 +280,28 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   const fullText = lines.join('\n')
 
   // Extract metadata from full text (handles multi-line and merged lines)
-  const numFull = fullText.match(/Invoice\s*Number[:\s]+([A-Z0-9]+)/i)
+  // Use specific patterns that require the field label immediately before the value
+  const numFull = fullText.match(/Invoice\s*Number\s*:\s*([A-Z0-9]+)/i)
   if (numFull) invoiceNumber = numFull[1]
 
-  const dateFull = fullText.match(/Invoice\s*Date[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+  const dateFull = fullText.match(/Invoice\s*Date\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
   if (dateFull) invoiceDate = dateFull[1]
 
-  const periodFull = fullText.match(/Invoice\s*Period[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/i)
-  if (periodFull) invoicePeriod = periodFull[1]
-  else {
-    // Try multi-line: period start on one line, end on next
-    const periodStart = fullText.match(/Invoice\s*Period[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])\s*\n\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
-    if (periodStart) invoicePeriod = periodStart[1] + ' ' + periodStart[2]
+  // Period: try single-line first, then multi-line with newline between dates
+  const periodFull = fullText.match(/Invoice\s*Period\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+  if (periodFull) {
+    invoicePeriod = periodFull[1]
+  } else {
+    // Try with newline or whitespace between start date + dash and end date
+    const periodSplit = fullText.match(/Invoice\s*Period\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])\s+(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+    if (periodSplit) invoicePeriod = periodSplit[1] + ' ' + periodSplit[2]
+  }
+
+  // Debug: log what was found
+  console.log('[InvoiceParser] Metadata extracted:', { invoiceNumber, invoiceDate, invoicePeriod })
+  if (!invoiceNumber || !invoiceDate || !invoicePeriod) {
+    // Dump first 20 lines for debugging
+    console.log('[InvoiceParser] First 20 lines:', lines.slice(0, 20))
   }
 
   for (let li = 0; li < lines.length; li++) {
