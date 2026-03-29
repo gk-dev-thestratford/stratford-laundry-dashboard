@@ -349,7 +349,9 @@ export default function Reconciliation() {
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
     try {
       const lines = await extractPdfLines(f)
+      console.log('[Reconciliation] Extracted PDF lines:', lines.slice(0, 30))
       const parsed = parseInvoice(lines)
+      console.log('[Reconciliation] Parsed metadata:', { invoiceNumber: parsed.invoiceNumber, invoiceDate: parsed.invoiceDate, invoicePeriod: parsed.invoicePeriod })
       if (parsed.sections.every(s => s.lines.length === 0)) {
         setError('Could not parse any invoice lines.'); setParsing(false); return
       }
