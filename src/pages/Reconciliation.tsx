@@ -285,6 +285,7 @@ export default function Reconciliation() {
   const [dragOver, setDragOver] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [parsedPeriod, setParsedPeriod] = useState<{ start: Date; end: Date } | null>(null)
   const [showHistory, setShowHistory] = useState(false)
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
@@ -325,6 +326,7 @@ export default function Reconciliation() {
   const refetchAndReconcile = useCallback(async () => {
     if (!invoice) return
     const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
+    setParsedPeriod(period)
     let fetchedOrders: Order[] = []
     if (period) {
       const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
@@ -353,6 +355,7 @@ export default function Reconciliation() {
       }
       setInvoice(parsed)
       const period = parseInvoicePeriod(parsed.invoicePeriod) || derivePeriodFromLines(parsed)
+      setParsedPeriod(period)
       let fetchedOrders: Order[] = []
       if (period) {
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
@@ -988,6 +991,9 @@ export default function Reconciliation() {
         <div><span className="text-gray-500">Invoice:</span> <span className="font-medium text-navy">{invoice.invoiceNumber}</span></div>
         <div><span className="text-gray-500">Date:</span> <span className="font-medium">{invoice.invoiceDate}</span></div>
         <div><span className="text-gray-500">Period:</span> <span className="font-medium">{invoice.invoicePeriod}</span></div>
+        {parsedPeriod && (
+          <div><span className="text-gray-500">Date range:</span> <span className="font-medium text-navy">{format(parsedPeriod.start, 'dd MMM yyyy')} — {format(parsedPeriod.end, 'dd MMM yyyy')}</span></div>
+        )}
         <div><span className="text-gray-500">Sections:</span> <span className="font-medium">{invoice.sections.map(s => s.name).join(', ')}</span></div>
         <div><span className="text-gray-500">Lines:</span> <span className="font-medium">{invoice.sections.reduce((s, sec) => s + sec.lines.length, 0)}</span></div>
         <div><span className="text-gray-500">System orders:</span> <span className="font-medium">{orders.length}</span></div>
