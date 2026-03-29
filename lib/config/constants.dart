@@ -54,11 +54,11 @@ class AppLabels {
     AppConstants.statusSubmitted: 'Submitted',
     AppConstants.statusApproved: 'Approved',
     AppConstants.statusRejected: 'Rejected',
-    AppConstants.statusCollected: 'In Processing',
+    AppConstants.statusCollected: 'Collected',
     AppConstants.statusInProcessing: 'In Processing',
     AppConstants.statusReceived: 'Received',
-    AppConstants.statusCompleted: 'Completed',
-    AppConstants.statusPickedUp: 'Collected',
+    AppConstants.statusCompleted: 'Returned',
+    AppConstants.statusPickedUp: 'Picked Up',
     AppConstants.statusExpired: 'Expired',
   };
 }

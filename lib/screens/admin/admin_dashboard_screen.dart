@@ -40,7 +40,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   static const _kAll = 5;
   static const _kNapkinReturns = 6;
 
-  static const _tabs = ['Rejected', 'Pending', 'Approved', 'In Progress', 'Completed', 'All', 'Napkins'];
+  static const _tabs = ['Rejected', 'Pending', 'Approved', 'In Processing', 'Returned', 'All', 'Napkins'];
   static const _statusFilters = [
     AppConstants.statusRejected,
     AppConstants.statusSubmitted,
@@ -718,8 +718,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     return switch (tab) {
       'Pending' => Icons.schedule_rounded,
       'Approved' => Icons.check_circle_outline_rounded,
-      'In Progress' => Icons.local_shipping_rounded,
-      'Completed' => Icons.done_all_rounded,
+      'In Processing' => Icons.local_shipping_rounded,
+      'Returned' => Icons.done_all_rounded,
       'All' => Icons.list_alt_rounded,
       'Rejected' => Icons.cancel_outlined,
       'Napkins' => Icons.dining,
@@ -946,8 +946,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     return switch (tab) {
       'Pending' => _counts[AppConstants.statusSubmitted] ?? 0,
       'Approved' => _counts[AppConstants.statusApproved] ?? 0,
-      'In Progress' => (_counts[AppConstants.statusCollected] ?? 0) + (_counts[AppConstants.statusInProcessing] ?? 0),
-      'Completed' => _counts[AppConstants.statusCompleted] ?? 0,
+      'In Processing' => (_counts[AppConstants.statusCollected] ?? 0) + (_counts[AppConstants.statusInProcessing] ?? 0),
+      'Returned' => _counts[AppConstants.statusCompleted] ?? 0,
       'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       _ => 0, // All + Napkins — no counter
     };
@@ -1227,7 +1227,7 @@ class _OrderCard extends StatelessWidget {
                   child: ElevatedButton.icon(
                     onPressed: onMarkCollected,
                     icon: Icon(Icons.check_circle_outline_rounded, size: AppSizes.iconSizeSm),
-                    label: const Text('Collected'),
+                    label: const Text('Picked Up'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.success,
                       foregroundColor: AppColors.white,
