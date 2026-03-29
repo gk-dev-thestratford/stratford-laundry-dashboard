@@ -158,6 +158,32 @@ class SyncService {
       debugPrint('[Sync] Failed to sync admin users: $e');
     }
 
+    // Pull orders (with nested order_items) from Supabase into local SQLite
+    try {
+      final remoteOrders = await SupabaseService.instance.fetchOrders();
+      debugPrint('[Sync] Pulled ${remoteOrders.length} orders from Supabase');
+      if (remoteOrders.isNotEmpty) {
+        final synced = await DatabaseService.instance.syncOrders(remoteOrders);
+        debugPrint('[Sync] Synced $synced orders into local DB');
+        didSync = true;
+      }
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync orders: $e');
+    }
+
+    // Pull order status logs
+    try {
+      final remoteLogs = await SupabaseService.instance.fetchOrderStatusLogs();
+      debugPrint('[Sync] Pulled ${remoteLogs.length} status logs');
+      if (remoteLogs.isNotEmpty) {
+        final synced = await DatabaseService.instance.syncStatusLogs(remoteLogs);
+        debugPrint('[Sync] Synced $synced status logs into local DB');
+        didSync = true;
+      }
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync status logs: $e');
+    }
+
     _lastRefPull = DateTime.now();
 
     // Notify listeners so providers can invalidate caches

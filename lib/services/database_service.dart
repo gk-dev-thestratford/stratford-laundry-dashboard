@@ -520,6 +520,98 @@ class DatabaseService {
     await db.update('sync_queue', {'synced': 1}, where: 'id = ?', whereArgs: [id]);
   }
 
+  // -- Order Sync (pull from Supabase) --
+
+  /// Merge remote orders + their items into local SQLite.
+  /// Skips orders that have pending (unsynced) changes in the sync queue.
+  Future<int> syncOrders(List<Map<String, dynamic>> remoteOrders) async {
+    if (remoteOrders.isEmpty) return 0;
+
+    final db = await database;
+
+    // Get IDs of orders with pending local changes
+    final pendingItems = await getPendingSyncItems();
+    final pendingOrderIds = <String>{};
+    for (final item in pendingItems) {
+      if (item['table_name'] == 'orders') {
+        final data = jsonDecode(item['data'] as String) as Map<String, dynamic>;
+        if (data['id'] != null) pendingOrderIds.add(data['id'] as String);
+      }
+    }
+
+    int synced = 0;
+
+    for (final remote in remoteOrders) {
+      final orderId = remote['id'] as String;
+
+      // Skip orders with pending local changes
+      if (pendingOrderIds.contains(orderId)) continue;
+
+      final remoteItems = (remote['order_items'] as List<dynamic>?) ?? [];
+
+      await db.transaction((txn) async {
+        await txn.insert('orders', {
+          'id': orderId,
+          'docket_number': remote['docket_number'] ?? '',
+          'order_type': remote['order_type'] ?? 'uniform',
+          'department_id': remote['department_id'],
+          'staff_name': remote['staff_name'],
+          'email': remote['email'],
+          'room_number': remote['room_number'],
+          'guest_name': remote['guest_name'],
+          'bag_count': remote['bag_count'],
+          'notes': remote['notes'],
+          'status': remote['status'] ?? 'submitted',
+          'total_price': remote['total_price'] != null
+              ? (remote['total_price'] as num).toDouble()
+              : null,
+          'parent_order_id': remote['parent_order_id'],
+          'created_at': remote['created_at'] ?? DateTime.now().toIso8601String(),
+          'updated_at': remote['updated_at'] ?? DateTime.now().toIso8601String(),
+          'synced_at': DateTime.now().toIso8601String(),
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+        for (final item in remoteItems) {
+          if (item is! Map<String, dynamic>) continue;
+          await txn.insert('order_items', {
+            'id': item['id'],
+            'order_id': orderId,
+            'item_id': item['item_id'] ?? '',
+            'item_name': item['item_name'] ?? '',
+            'quantity_sent': item['quantity_sent'] ?? 0,
+            'quantity_received': item['quantity_received'],
+            'price_at_time': item['price_at_time'] != null
+                ? (item['price_at_time'] as num).toDouble()
+                : null,
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
+        }
+      });
+      synced++;
+    }
+
+    return synced;
+  }
+
+  /// Merge remote status logs into local SQLite.
+  Future<int> syncStatusLogs(List<Map<String, dynamic>> remoteLogs) async {
+    if (remoteLogs.isEmpty) return 0;
+    final db = await database;
+    int synced = 0;
+    for (final log in remoteLogs) {
+      await db.insert('order_status_log', {
+        'id': log['id'],
+        'order_id': log['order_id'],
+        'status': log['status'] ?? '',
+        'changed_by': log['changed_by'],
+        'changed_by_name': log['changed_by_name'],
+        'reason': log['reason'],
+        'created_at': log['created_at'] ?? DateTime.now().toIso8601String(),
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+      synced++;
+    }
+    return synced;
+  }
+
   // ── Dashboard Stats ──
 
   Future<Map<String, int>> getOrderCounts() async {

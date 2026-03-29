@@ -67,6 +67,16 @@ class SupabaseService {
     }).eq('id', orderId);
   }
 
+  /// Fetch all status logs, optionally only those created since [since].
+  Future<List<Map<String, dynamic>>> fetchOrderStatusLogs({DateTime? since}) async {
+    if (!isInitialized) return [];
+    var query = _client!.from('order_status_log').select();
+    if (since != null) {
+      query = query.gte('created_at', since.toIso8601String());
+    }
+    return await query.order('created_at', ascending: false);
+  }
+
   Future<void> deleteOrder(String orderId) async {
     if (!isInitialized) return;
     await _client!.from('orders').delete().eq('id', orderId);
