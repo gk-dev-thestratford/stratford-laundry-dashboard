@@ -21,7 +21,8 @@ const STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   collected: ['in_processing'],
   in_processing: ['received'],
   received: ['completed'],
-  completed: [],
+  completed: ['picked_up'],
+  picked_up: [],
 }
 
 const STATUS_ACTION_LABELS: Record<OrderStatus, string> = {
@@ -31,7 +32,8 @@ const STATUS_ACTION_LABELS: Record<OrderStatus, string> = {
   collected: 'Mark Collected',
   in_processing: 'Mark In Processing',
   received: 'Mark Received',
-  completed: 'Mark Completed',
+  completed: 'Mark Returned',
+  picked_up: 'Mark Picked Up',
 }
 
 export default function OrderDetail({ order, departments, onClose, onStatusChange, onSave, onSaveItem }: OrderDetailProps) {

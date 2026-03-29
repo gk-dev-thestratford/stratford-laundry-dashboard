@@ -26,6 +26,7 @@ export type OrderStatus =
   | 'in_processing'
   | 'received'
   | 'completed'
+  | 'picked_up'
 
 export type OrderType = 'uniform' | 'hsk_linen' | 'fnb_linen' | 'guest_laundry'
 
@@ -87,7 +88,8 @@ export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   collected: 'Collected',
   in_processing: 'In Processing',
   received: 'Received',
-  completed: 'Completed',
+  completed: 'Returned',
+  picked_up: 'Picked Up',
 }
 
 export const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
@@ -97,7 +99,8 @@ export const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
   collected: 'bg-yellow-100 text-yellow-800',
   in_processing: 'bg-orange-100 text-orange-800',
   received: 'bg-purple-100 text-purple-800',
-  completed: 'bg-gray-100 text-gray-800',
+  completed: 'bg-teal-100 text-teal-800',
+  picked_up: 'bg-gray-100 text-gray-800',
 }
 
 export const ORDER_TYPE_LABELS: Record<OrderType, string> = {
