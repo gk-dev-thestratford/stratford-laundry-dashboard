@@ -276,37 +276,26 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   let currentSection: InvoiceSection | null = null
   let lastDate = ''
 
+  // First pass: join all lines to extract metadata that might be split
+  const fullText = lines.join('\n')
+
+  // Extract metadata from full text (handles multi-line and merged lines)
+  const numFull = fullText.match(/Invoice\s*Number[:\s]+([A-Z0-9]+)/i)
+  if (numFull) invoiceNumber = numFull[1]
+
+  const dateFull = fullText.match(/Invoice\s*Date[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+  if (dateFull) invoiceDate = dateFull[1]
+
+  const periodFull = fullText.match(/Invoice\s*Period[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+  if (periodFull) invoicePeriod = periodFull[1]
+  else {
+    // Try multi-line: period start on one line, end on next
+    const periodStart = fullText.match(/Invoice\s*Period[:\s]+(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])\s*\n\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+    if (periodStart) invoicePeriod = periodStart[1] + ' ' + periodStart[2]
+  }
+
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]
-    // Extract metadata
-    const numM = line.match(/Invoice\s*Number:\s*(\S+)/i)
-    if (numM) invoiceNumber = numM[1]
-
-    const dateM = line.match(/Invoice\s*Date:\s*(\S+)/i)
-    if (dateM) invoiceDate = dateM[1]
-
-    const periodM = line.match(/Invoice\s*Period:\s*(.+?)$/i)
-    if (periodM) {
-      let periodText = periodM[1].trim()
-      // If period ends with '-' (with optional trailing space) and next line has a date, it's a continuation
-      if (/[-–]\s*$/.test(periodText) && li + 1 < lines.length) {
-        const nextLine = lines[li + 1].trim()
-        if (/^\d{2}[\./]\d{2}[\./]\d{2,4}/.test(nextLine)) {
-          periodText = periodText.replace(/\s*$/, '') + ' ' + nextLine
-          li++ // skip the next line
-        }
-      }
-      // Also check if the period only has a start date (no end date at all)
-      // and the next line is just a date
-      if (!/\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4}/.test(periodText) && li + 1 < lines.length) {
-        const nextLine = lines[li + 1].trim()
-        if (/^\d{2}[\./]\d{2}[\./]\d{2,4}\s*$/.test(nextLine)) {
-          periodText = periodText.replace(/\s*$/, '') + ' ' + nextLine
-          li++
-        }
-      }
-      invoicePeriod = periodText
-    }
 
     // Grand totals
     const netM = line.match(/^Net\s+£\s*([\d,]+\.\d{2})/i)
@@ -373,8 +362,8 @@ function buildPeriod(sd: string, sm: string, sy: string, ed: string, em: string,
   let startY = parseInt(sy); if (startY < 100) startY += 2000
   let endY = parseInt(ey); if (endY < 100) endY += 2000
   return {
-    start: new Date(startY, parseInt(sm) - 1, parseInt(sd)),
-    end: new Date(endY, parseInt(em) - 1, parseInt(ed), 23, 59, 59),
+    start: new Date(Date.UTC(startY, parseInt(sm) - 1, parseInt(sd), 0, 0, 0)),
+    end: new Date(Date.UTC(endY, parseInt(em) - 1, parseInt(ed), 23, 59, 59)),
   }
 }
 
