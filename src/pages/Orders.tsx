@@ -158,28 +158,53 @@ export default function Orders() {
     }, 2000)
   }
 
-  // ── Standard export (all filtered orders) ──
+  // ── Standard export (all filtered orders with item-level detail) ──
   const exportExcel = useCallback(() => {
     const source = selectedIds.size > 0 ? orders.filter((o) => selectedIds.has(o.id)) : orders
+    const rows: Record<string, string | number>[] = []
 
-    const rows = source.map((o) => {
-      const cost = computeCost(o)
-      return {
-        'Docket': o.docket_number,
-        'Type': ORDER_TYPE_LABELS[o.order_type] || o.order_type,
-        'Status': ORDER_STATUS_LABELS[o.status as OrderStatus] || o.status,
-        'Staff Name': o.staff_name || '',
-        'Guest Name': o.guest_name || '',
-        'Department': o.department?.name || '',
-        'Room': o.room_number || '',
-        'Bags': o.bag_count ?? '',
-        'Items': o.order_items?.length || 0,
-        'Total ex VAT (\u00a3)': cost > 0 ? Number(cost.toFixed(2)) : '',
-        'Total inc VAT (\u00a3)': cost > 0 ? Number((cost * 1.2).toFixed(2)) : '',
-        'Notes': o.notes || '',
-        'Created': format(new Date(o.created_at), 'dd/MM/yyyy HH:mm'),
+    source.forEach((o) => {
+      const items = o.order_items || []
+      if (items.length === 0) {
+        const cost = computeCost(o)
+        rows.push({
+          'Docket': o.docket_number,
+          'Type': ORDER_TYPE_LABELS[o.order_type] || o.order_type,
+          'Department': o.department?.name || '',
+          'Name': o.staff_name || o.guest_name || '',
+          'Status': ORDER_STATUS_LABELS[o.status as OrderStatus] || o.status,
+          'Item': '', 'Qty Sent': '', 'Qty Received': '', 'Outstanding': '',
+          'Unit Price (\u00a3)': '',
+          'Line Total ex VAT (\u00a3)': cost > 0 ? Number(cost.toFixed(2)) : '',
+          'Line Total inc VAT (\u00a3)': cost > 0 ? Number((cost * 1.2).toFixed(2)) : '',
+          'Date': format(new Date(o.created_at), 'dd/MM/yyyy'),
+          'Notes': o.notes || '',
+        })
+      } else {
+        items.forEach((item, idx) => {
+          const price = item.price_at_time ?? 0
+          const lineEx = price * (item.quantity_sent ?? 0)
+          const outstanding = (item.quantity_sent ?? 0) - (item.quantity_received ?? 0)
+          rows.push({
+            'Docket': idx === 0 ? o.docket_number : '',
+            'Type': idx === 0 ? (ORDER_TYPE_LABELS[o.order_type] || o.order_type) : '',
+            'Department': idx === 0 ? (o.department?.name || '') : '',
+            'Name': idx === 0 ? (o.staff_name || o.guest_name || '') : '',
+            'Status': idx === 0 ? (ORDER_STATUS_LABELS[o.status as OrderStatus] || o.status) : '',
+            'Item': item.item_name,
+            'Qty Sent': item.quantity_sent,
+            'Qty Received': item.quantity_received ?? '',
+            'Outstanding': outstanding > 0 ? outstanding : '',
+            'Unit Price (\u00a3)': price > 0 ? Number(price.toFixed(2)) : '',
+            'Line Total ex VAT (\u00a3)': lineEx > 0 ? Number(lineEx.toFixed(2)) : '',
+            'Line Total inc VAT (\u00a3)': lineEx > 0 ? Number((lineEx * 1.2).toFixed(2)) : '',
+            'Date': idx === 0 ? format(new Date(o.created_at), 'dd/MM/yyyy') : '',
+            'Notes': idx === 0 ? (o.notes || '') : '',
+          })
+        })
       }
     })
+
     const ws = utils.json_to_sheet(rows)
     const wb = utils.book_new()
     utils.book_append_sheet(wb, ws, 'Orders')
