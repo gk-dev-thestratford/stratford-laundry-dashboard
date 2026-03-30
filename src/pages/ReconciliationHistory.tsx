@@ -40,6 +40,7 @@ export default function ReconciliationHistory() {
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null)
+  const [monthFilter, setMonthFilter] = useState<string | null>(null)
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
@@ -145,26 +146,44 @@ export default function ReconciliationHistory() {
           <p className="text-sm text-gray-400 mt-1">Upload an invoice on the Reconciliation page and click Save to create a record</p>
         </div>
       ) : (<>
-        {/* Category filter pills */}
-        {(() => {
-          const categories = [...new Set(history.map(h => h.invoice_category || 'Other'))].sort()
-          return categories.length > 1 ? (
-            <div className="flex gap-2 mb-4 flex-wrap">
-              <button
-                onClick={() => setCategoryFilter(null)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors ${!categoryFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-              >All ({history.length})</button>
-              {categories.map(cat => {
-                const count = history.filter(h => (h.invoice_category || 'Other') === cat).length
+        {/* Filters */}
+        <div className="flex gap-6 mb-4 flex-wrap items-start">
+          {/* Category filter */}
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Category</p>
+            <div className="flex gap-1.5 flex-wrap">
+              <button onClick={() => setCategoryFilter(null)}
+                className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${!categoryFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+              >All</button>
+              {[...new Set(history.map(h => h.invoice_category || 'Other'))].sort().map(cat => (
+                <button key={cat} onClick={() => setCategoryFilter(categoryFilter === cat ? null : cat)}
+                  className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${categoryFilter === cat ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+                >{cat}</button>
+              ))}
+            </div>
+          </div>
+          {/* Month filter */}
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Period</p>
+            <div className="flex gap-1.5 flex-wrap">
+              <button onClick={() => setMonthFilter(null)}
+                className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${!monthFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+              >All</button>
+              {[...new Set(history.map(h => {
+                const d = new Date(h.created_at)
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+              }))].sort().reverse().map(ym => {
+                const [y, m] = ym.split('-')
+                const label = format(new Date(+y, +m - 1), 'MMM yyyy')
                 return (
-                  <button key={cat} onClick={() => setCategoryFilter(categoryFilter === cat ? null : cat)}
-                    className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors ${categoryFilter === cat ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-                  >{cat} ({count})</button>
+                  <button key={ym} onClick={() => setMonthFilter(monthFilter === ym ? null : ym)}
+                    className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${monthFilter === ym ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+                  >{label}</button>
                 )
               })}
             </div>
-          ) : null
-        })()}
+          </div>
+        </div>
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
           <table className="w-full text-sm">
             <thead>
@@ -182,7 +201,15 @@ export default function ReconciliationHistory() {
               </tr>
             </thead>
             <tbody>
-              {history.filter(h => !categoryFilter || (h.invoice_category || 'Other') === categoryFilter).map(h => {
+              {history.filter(h => {
+                if (categoryFilter && (h.invoice_category || 'Other') !== categoryFilter) return false
+                if (monthFilter) {
+                  const d = new Date(h.created_at)
+                  const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+                  if (ym !== monthFilter) return false
+                }
+                return true
+              }).map(h => {
                 const issues = h.mismatch_count + h.not_found_count + h.missing_count
                 const isExpanded = expanded === h.id
                 return (

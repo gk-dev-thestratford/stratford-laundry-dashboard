@@ -6,7 +6,7 @@ import {
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
-import { generateReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow } from '../lib/pdfReport'
+import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow } from '../lib/pdfReport'
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -468,7 +468,7 @@ export default function Reconciliation() {
       console.error('Failed to upload PDF report:', e)
     }
 
-    await supabase.from('reconciliations').insert({
+    const { error: saveErr } = await supabase.from('reconciliations').insert({
       invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
       invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
       invoice_net: +result.invoiceTotal.toFixed(2), invoice_gross: +(result.invoiceTotal * 1.2).toFixed(2),
@@ -484,6 +484,7 @@ export default function Reconciliation() {
         allocatedTopUp: d.allocatedTopUp, totalCostNet: d.totalCostNet, totalCostGross: d.totalCostGross,
       })),
     })
+    if (saveErr) console.error('Failed to save reconciliation:', saveErr)
     setSaving(false); setSaved(true); loadHistory()
   }, [result, invoice, file, loadHistory])
 
@@ -940,7 +941,7 @@ export default function Reconciliation() {
   // ── PDF Report ──
   const handlePdfReport = useCallback(() => {
     if (!result || !invoice) return
-    generateReconciliationPdf(invoice, result, departmentDisplayRows)
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows)
   }, [result, invoice, departmentDisplayRows])
 
   // ── Resolution badge helper ──

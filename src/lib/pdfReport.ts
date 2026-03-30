@@ -329,12 +329,20 @@ export function generateReconciliationPdf(
     doc.text(`Page ${i} of ${pageCount}`, pageWidth - 14, pgHeight - 4.5, { align: 'right' })
   }
 
-  doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
-
   return doc
 }
 
-/** Generate the same report but return the PDF as a Blob (for uploading to storage). */
+/** Generate the report and trigger a browser download. */
+export function downloadReconciliationPdf(
+  invoice: ParsedInvoice,
+  result: ReconciliationResultForPdf,
+  displayRows: DepartmentDisplayRow[]
+): void {
+  const doc = generateReconciliationPdf(invoice, result, displayRows)
+  doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
+}
+
+/** Generate the report and return as a Blob (for uploading to storage). */
 export function generateReconciliationPdfBlob(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
