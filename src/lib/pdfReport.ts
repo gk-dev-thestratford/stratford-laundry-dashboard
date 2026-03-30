@@ -179,16 +179,18 @@ export function generateReconciliationPdf(
 
   const deptBody: (string | { content: string; styles?: Record<string, any> })[][] = []
   for (const row of displayRows) {
+    const isRealTopUp = row.isTopUp && row.lineLabel === 'Minimum TopUp'
+    const isSubRow = row.isTopUp && row.lineLabel !== 'Minimum TopUp'
     const label = row.isTopUp
       ? `    ${row.departmentName} \u2014 ${row.lineLabel}`
       : `${row.departmentName} \u2014 ${row.lineLabel}`
 
     deptBody.push([
       { content: label, styles: row.isTopUp ? { fontStyle: 'italic', textColor: '#6B7280' } : {} },
-      row.isTopUp ? '\u2014' : String(row.orderCount),
+      isRealTopUp ? '\u2014' : String(row.orderCount),
       row.invoiceNet.toFixed(2),
-      row.isTopUp ? '\u2014' : row.systemTotal.toFixed(2),
-      row.isTopUp ? '\u2014' : (Math.abs(row.difference) < 0.02 ? '\u2713' : row.difference.toFixed(2)),
+      isRealTopUp ? '\u2014' : row.systemTotal.toFixed(2),
+      isRealTopUp ? '\u2014' : (Math.abs(row.difference) < 0.02 ? '\u2713' : row.difference.toFixed(2)),
       row.totalGross.toFixed(2),
     ])
   }

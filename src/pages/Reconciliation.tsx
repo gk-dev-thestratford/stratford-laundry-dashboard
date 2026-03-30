@@ -175,23 +175,73 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
   }
 }
 
+const SECTION_LABELS: Record<string, string> = {
+  staff: 'Staff Uniform',
+  hsk: 'HSK Linen',
+  bathrobes: 'Bathrobes',
+  guest: 'Guest Laundry',
+  napkins: 'Napkins',
+  table_cloths: 'Table Cloths',
+}
+
 function buildDepartmentDisplayRows(
   breakdown: DepartmentBreakdown[],
   allRows: ReconciliationRow[]
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
-    const label = departmentItemsLabel(allRows, dept.departmentName)
-    displayRows.push({
-      departmentName: dept.departmentName,
-      lineLabel: label,
-      isTopUp: false,
-      orderCount: dept.orderCount,
-      invoiceNet: dept.invoiceNet,
-      systemTotal: dept.systemTotal,
-      difference: dept.difference,
-      totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
-    })
+    // Check if this department has multiple section types (e.g. Housekeeping with uniforms + linen)
+    const sectionBreakdown = new Map<string, { count: number; invNet: number; sysNet: number }>()
+    for (const row of allRows) {
+      const deptName = row.order?.department?.name || 'Unallocated'
+      if (deptName !== dept.departmentName || row.status === 'not_found') continue
+      const sec = row.invoiceLine.sectionType || row.sectionType || 'staff'
+      if (!sectionBreakdown.has(sec)) sectionBreakdown.set(sec, { count: 0, invNet: 0, sysNet: 0 })
+      const entry = sectionBreakdown.get(sec)!
+      entry.count++
+      entry.invNet += row.invoiceLine.net
+      entry.sysNet += row.systemTotal
+    }
+
+    if (sectionBreakdown.size > 1) {
+      // Multiple section types — show main row then sub-rows
+      const label = departmentItemsLabel(allRows, dept.departmentName)
+      displayRows.push({
+        departmentName: dept.departmentName,
+        lineLabel: label,
+        isTopUp: false,
+        orderCount: dept.orderCount,
+        invoiceNet: dept.invoiceNet,
+        systemTotal: dept.systemTotal,
+        difference: dept.difference,
+        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+      })
+      for (const [sec, data] of sectionBreakdown) {
+        const diff = +(data.invNet - data.sysNet).toFixed(2)
+        displayRows.push({
+          departmentName: dept.departmentName,
+          lineLabel: SECTION_LABELS[sec] || sec,
+          isTopUp: true, // renders as indented sub-row
+          orderCount: data.count,
+          invoiceNet: +data.invNet.toFixed(2),
+          systemTotal: +data.sysNet.toFixed(2),
+          difference: diff,
+          totalGross: +(data.invNet * 1.2).toFixed(2),
+        })
+      }
+    } else {
+      const label = departmentItemsLabel(allRows, dept.departmentName)
+      displayRows.push({
+        departmentName: dept.departmentName,
+        lineLabel: label,
+        isTopUp: false,
+        orderCount: dept.orderCount,
+        invoiceNet: dept.invoiceNet,
+        systemTotal: dept.systemTotal,
+        difference: dept.difference,
+        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+      })
+    }
     if (dept.allocatedTopUp > 0) {
       displayRows.push({
         departmentName: dept.departmentName,
@@ -524,10 +574,10 @@ export default function Reconciliation() {
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
       'Line': row.lineLabel,
-      'Orders': row.isTopUp ? '' as any : row.orderCount,
+      'Orders': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : row.orderCount,
       'Invoice NET (\u00a3)': +row.invoiceNet.toFixed(2),
-      'System NET (\u00a3)': row.isTopUp ? '' as any : +row.systemTotal.toFixed(2),
-      'Difference (\u00a3)': row.isTopUp ? '' as any : +row.difference.toFixed(2),
+      'System NET (\u00a3)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.systemTotal.toFixed(2),
+      'Difference (\u00a3)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.difference.toFixed(2),
       'Total inc VAT (\u00a3)': +row.totalGross.toFixed(2),
     }))
     const totalDisplayOrders = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)
@@ -1115,11 +1165,11 @@ export default function Reconciliation() {
                 <td className={`px-4 py-2.5 ${row.isTopUp ? 'pl-8 italic text-gray-500 text-xs' : 'font-medium'}`}>
                   {row.departmentName} {'\u2014'} {row.lineLabel}
                 </td>
-                <td className="px-4 py-2.5 text-right">{row.isTopUp ? '\u2014' : row.orderCount}</td>
+                <td className="px-4 py-2.5 text-right">{row.isTopUp && row.lineLabel === 'Minimum TopUp' ? '\u2014' : row.orderCount}</td>
                 <td className="px-4 py-2.5 text-right">{'\u00a3'}{row.invoiceNet.toFixed(2)}</td>
-                <td className="px-4 py-2.5 text-right">{row.isTopUp ? '\u2014' : `\u00a3${row.systemTotal.toFixed(2)}`}</td>
-                <td className={`px-4 py-2.5 text-right font-medium ${row.isTopUp ? 'text-gray-400' : Math.abs(row.difference) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
-                  {row.isTopUp ? '\u2014' : Math.abs(row.difference) < 0.02 ? '\u2713' : `\u00a3${row.difference.toFixed(2)}`}
+                <td className="px-4 py-2.5 text-right">{row.isTopUp && row.lineLabel === 'Minimum TopUp' ? '\u2014' : `\u00a3${row.systemTotal.toFixed(2)}`}</td>
+                <td className={`px-4 py-2.5 text-right font-medium ${row.isTopUp && row.lineLabel === 'Minimum TopUp' ? 'text-gray-400' : Math.abs(row.difference) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
+                  {row.isTopUp && row.lineLabel === 'Minimum TopUp' ? '\u2014' : Math.abs(row.difference) < 0.02 ? '\u2713' : `\u00a3${row.difference.toFixed(2)}`}
                 </td>
                 <td className="px-4 py-2.5 text-right font-semibold">{'\u00a3'}{row.totalGross.toFixed(2)}</td>
               </tr>
