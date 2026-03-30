@@ -176,13 +176,20 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
 }
 
 // Items that are HSK Linen (not staff uniforms) — matched by keyword in item name
-const HSK_LINEN_KEYWORDS = ['duvet', 'curtain', 'blanket', 'pillow', 'bathrobe', 'linen bundle', 'hsk linen', 'bed sheet', 'mattress']
+// HSK Linen items found within Staff Uniform invoices (NOT bathrobes — those have their own invoice)
+const HSK_LINEN_KEYWORDS = ['duvet', 'curtain', 'blanket', 'pillow', 'linen bundle', 'hsk linen', 'bed sheet', 'mattress']
 
-function isHskLinenOrder(order: { order_items?: { item_name: string }[] } | null): boolean {
-  if (!order?.order_items?.length) return false
-  return order.order_items.some(i =>
-    HSK_LINEN_KEYWORDS.some(kw => i.item_name.toLowerCase().includes(kw))
-  )
+function isHskLinenRow(row: ReconciliationRow): boolean {
+  // Check invoice line description and parsed items
+  const desc = (row.invoiceLine.description || '').toLowerCase()
+  if (HSK_LINEN_KEYWORDS.some(kw => desc.includes(kw))) return true
+  // Check parsed invoice line items
+  if (row.invoiceLine.items?.length) {
+    return row.invoiceLine.items.some(i =>
+      HSK_LINEN_KEYWORDS.some(kw => i.name.toLowerCase().includes(kw))
+    )
+  }
+  return false
 }
 
 function buildDepartmentDisplayRows(
@@ -198,7 +205,7 @@ function buildDepartmentDisplayRows(
     for (const row of allRows) {
       const deptName = row.order?.department?.name || 'Unallocated'
       if (deptName !== dept.departmentName || row.status === 'not_found') continue
-      if (isHskLinenOrder(row.order)) {
+      if (isHskLinenRow(row)) {
         linenCount++
         linenInvNet += row.invoiceLine.net
         linenSysNet += row.systemTotal
@@ -235,7 +242,7 @@ function buildDepartmentDisplayRows(
       })
       displayRows.push({
         departmentName: dept.departmentName,
-        lineLabel: 'HSK Linen',
+        lineLabel: 'Other (HSK Linen)',
         isTopUp: true,
         orderCount: linenCount,
         invoiceNet: +linenInvNet.toFixed(2),
