@@ -175,26 +175,28 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
   }
 }
 
-// Items that are HSK Linen (not staff uniforms) — matched by keyword in item name
-// HSK Linen items found within Staff Uniform invoices (NOT bathrobes — those have their own invoice)
-const HSK_LINEN_KEYWORDS = ['duvet', 'curtain', 'blanket', 'pillow', 'linen bundle', 'hsk linen', 'bed sheet', 'mattress']
-
-function isHskLinenRow(row: ReconciliationRow): boolean {
-  // Check invoice line description and parsed items
+function isHskLinenRow(row: ReconciliationRow, hskLinenNames: Set<string>): boolean {
+  // Check invoice line description and parsed items against catalogue HSK Linen names
   const desc = (row.invoiceLine.description || '').toLowerCase()
-  if (HSK_LINEN_KEYWORDS.some(kw => desc.includes(kw))) return true
-  // Check parsed invoice line items
+  for (const name of hskLinenNames) {
+    if (desc.includes(name)) return true
+  }
   if (row.invoiceLine.items?.length) {
-    return row.invoiceLine.items.some(i =>
-      HSK_LINEN_KEYWORDS.some(kw => i.name.toLowerCase().includes(kw))
-    )
+    return row.invoiceLine.items.some(i => {
+      const itemLower = i.name.toLowerCase()
+      for (const name of hskLinenNames) {
+        if (itemLower.includes(name)) return true
+      }
+      return false
+    })
   }
   return false
 }
 
 function buildDepartmentDisplayRows(
   breakdown: DepartmentBreakdown[],
-  allRows: ReconciliationRow[]
+  allRows: ReconciliationRow[],
+  hskLinenNames: Set<string> = new Set()
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
@@ -205,7 +207,7 @@ function buildDepartmentDisplayRows(
     for (const row of allRows) {
       const deptName = row.order?.department?.name || 'Unallocated'
       if (deptName !== dept.departmentName || row.status === 'not_found') continue
-      if (isHskLinenRow(row)) {
+      if (isHskLinenRow(row, hskLinenNames)) {
         linenCount++
         linenInvNet += row.invoiceLine.net
         linenSysNet += row.systemTotal
@@ -349,6 +351,18 @@ export default function Reconciliation() {
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
+  const [hskLinenNames, setHskLinenNames] = useState<Set<string>>(new Set())
+
+  // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
+  useEffect(() => {
+    supabase.from('item_catalogue').select('name').eq('category', 'hsk_linen').eq('is_active', true)
+      .then(({ data }) => {
+        if (data) {
+          const names = new Set(data.map((i: { name: string }) => i.name.toLowerCase()).filter(n => !n.includes('bathrobe')))
+          setHskLinenNames(names)
+        }
+      })
+  }, [])
 
   // Resolution tracking
   const [notFoundResolutions, setNotFoundResolutions] = useState<Record<string, Resolution>>({})
@@ -469,7 +483,7 @@ export default function Reconciliation() {
     // Generate and upload reconciliation PDF report
     let reportPath: string | null = null
     try {
-      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
       const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
@@ -509,7 +523,7 @@ export default function Reconciliation() {
 
   const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
     if (!result) return []
-    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
   }, [result])
 
   // ── Adjusted totals considering resolutions ──
@@ -590,7 +604,7 @@ export default function Reconciliation() {
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
-    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
       'Line': row.lineLabel,
