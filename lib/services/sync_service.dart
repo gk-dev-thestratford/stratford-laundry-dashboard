@@ -82,8 +82,8 @@ class SyncService {
       return;
     }
 
-    await _pullReferenceData();
     await _pushPending();
+    await _pullReferenceData();
   }
 
   /// Periodic timer handler: only does work when needed.

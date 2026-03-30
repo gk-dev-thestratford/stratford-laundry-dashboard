@@ -4,7 +4,6 @@ import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
 import '../../models/admin_user.dart';
 import '../../providers/admin_provider.dart';
-import '../../services/sync_service.dart';
 import '../../widgets/sync_indicator.dart';
 
 class AdminLoginScreen extends ConsumerStatefulWidget {
@@ -41,21 +40,14 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
 
   Color _colorForIndex(int index) => _adminColors[index % _adminColors.length];
 
-  late final _syncSub = SyncService.instance.onReferenceDataSynced.listen((_) {
-    _loadAdmins();
-  });
-
   @override
   void initState() {
     super.initState();
     _loadAdmins();
-    // Pull fresh data from Supabase while user enters PIN
-    SyncService.instance.fullSync();
   }
 
   @override
   void dispose() {
-    _syncSub.cancel();
     super.dispose();
   }
 

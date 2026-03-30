@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:crypto/crypto.dart';
@@ -587,6 +588,19 @@ class DatabaseService {
         }
       });
       synced++;
+    }
+
+    // Remove local orders that no longer exist in Supabase (deleted on web)
+    final remoteIds = remoteOrders.map((o) => o['id'] as String).toSet();
+    final localOrders = await db.query('orders', columns: ['id']);
+    for (final local in localOrders) {
+      final localId = local['id'] as String;
+      if (!remoteIds.contains(localId) && !pendingOrderIds.contains(localId)) {
+        await db.delete('order_items', where: 'order_id = ?', whereArgs: [localId]);
+        await db.delete('order_status_log', where: 'order_id = ?', whereArgs: [localId]);
+        await db.delete('orders', where: 'id = ?', whereArgs: [localId]);
+        debugPrint('[Sync] Removed local order $localId (deleted remotely)');
+      }
     }
 
     return synced;

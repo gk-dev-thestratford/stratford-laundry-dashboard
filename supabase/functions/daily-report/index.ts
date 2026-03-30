@@ -10,7 +10,7 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
-const REPORT_EMAILS = ["georgi@thestratford.com", "set1000@hotmail.com"];
+const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -32,25 +32,14 @@ async function sendEmail(to: string, subject: string, html: string) {
   });
 }
 
-// ── Fetch all orders with a given status logged today ──
-async function fetchTodaysOrders(targetStatus: string) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const { data: logs } = await supabase
-    .from("order_status_log")
-    .select("order_id")
-    .eq("status", targetStatus)
-    .gte("created_at", today.toISOString());
-
-  if (!logs || logs.length === 0) return [];
-
-  const orderIds = [...new Set(logs.map((l: any) => l.order_id))];
-
+// ── Fetch all orders currently in a given status ──
+async function fetchOrdersByStatus(targetStatus: string) {
   const { data: orders } = await supabase
     .from("orders")
     .select("*, order_items(*), departments(*)")
-    .in("id", orderIds);
+    .eq("status", targetStatus)
+    .order("created_at", { ascending: false })
+    .limit(200);
 
   return orders || [];
 }
@@ -191,8 +180,8 @@ serve(async (_req: Request) => {
   try {
     const emailsSent: string[] = [];
 
-    // Fetch today's collected orders
-    const collectedOrders = await fetchTodaysOrders("collected");
+    // Fetch orders currently in collected status
+    const collectedOrders = await fetchOrdersByStatus("collected");
     if (collectedOrders.length > 0) {
       const reportHtml = buildCollectionReport(collectedOrders);
       const today = new Date().toLocaleDateString("en-GB");
@@ -203,8 +192,8 @@ serve(async (_req: Request) => {
       }
     }
 
-    // Fetch today's received orders
-    const receivedOrders = await fetchTodaysOrders("received");
+    // Fetch orders currently in received status
+    const receivedOrders = await fetchOrdersByStatus("received");
     if (receivedOrders.length > 0) {
       const reportHtml = buildReceivedReport(receivedOrders);
       const today = new Date().toLocaleDateString("en-GB");

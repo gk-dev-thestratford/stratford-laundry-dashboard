@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -59,28 +58,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(adminProvider.notifier).refreshActivity();
     });
-    // Pull latest reference data from Supabase on screen open
-    SyncService.instance.fullSync();
     _loadData();
-    // Re-sync when app returns to foreground
-    WidgetsBinding.instance.addObserver(_lifecycleObserver);
-    // Reload data when sync completes (e.g. from login screen or background)
-    _syncSub = SyncService.instance.onReferenceDataSynced.listen((_) {
-      _loadData();
-    });
   }
-
-  late final _lifecycleObserver = _AppLifecycleObserver(onResume: () {
-    SyncService.instance.fullSync();
-    _loadData();
-  });
-
-  late final StreamSubscription<void> _syncSub;
 
   @override
   void dispose() {
-    _syncSub.cancel();
-    WidgetsBinding.instance.removeObserver(_lifecycleObserver);
     _tabController.dispose();
     super.dispose();
   }
@@ -91,18 +73,25 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       _selectedOrderIds.clear();
       _allTabDateFilter = null;
       _allTabTypeFilter = null;
-      _loadOrders();
+      // Clear stale content and show loading indicator while new tab loads
+      setState(() {
+        _orders = [];
+        _itemSummaries = {};
+        _isLoading = true;
+      });
+      _loadOrders(silent: true);
+      _loadCounts();
     }
   }
 
-  Future<void> _loadData() async {
+  Future<void> _loadData({bool silent = false}) async {
     await DatabaseService.instance.autoCollectCompletedOrders(
       days: AppConstants.autoCollectDays,
     );
     await DatabaseService.instance.autoExpireCompletedOrders(
       days: AppConstants.completedExpiryDays,
     );
-    await Future.wait([_loadOrders(), _loadCounts()]);
+    await Future.wait([_loadOrders(silent: silent), _loadCounts()]);
   }
 
   Future<void> _loadCounts() async {
@@ -110,16 +99,16 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     if (mounted) setState(() => _counts = counts);
   }
 
-  Future<void> _loadOrders() async {
+  Future<void> _loadOrders({bool silent = false}) async {
     if (!mounted) return;
-    setState(() => _isLoading = true);
+    if (!silent) setState(() => _isLoading = true);
     final tabIndex = _tabController.index;
     List<Map<String, dynamic>> orders;
 
     if (tabIndex == _kInProgress) {
       // In Progress = collected + in_processing
-      final c = await DatabaseService.instance.getOrders(status: AppConstants.statusCollected, searchQuery: _searchQuery);
-      final p = await DatabaseService.instance.getOrders(status: AppConstants.statusInProcessing, searchQuery: _searchQuery);
+      final c = List.of(await DatabaseService.instance.getOrders(status: AppConstants.statusCollected, searchQuery: _searchQuery));
+      final p = List.of(await DatabaseService.instance.getOrders(status: AppConstants.statusInProcessing, searchQuery: _searchQuery));
       orders = [...c, ...p];
     } else if (tabIndex == _kAll) {
       // All tab: search-first — only load when search or filters are active
@@ -136,17 +125,17 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         } else if (_allTabDateFilter == '30days') {
           dateFrom = DateTime.now().subtract(const Duration(days: 30)).toIso8601String();
         }
-        orders = await DatabaseService.instance.getOrders(
+        orders = List.of(await DatabaseService.instance.getOrders(
           orderType: _allTabTypeFilter,
           dateFrom: dateFrom,
           searchQuery: _searchQuery,
-        );
+        ));
       }
     } else {
-      orders = await DatabaseService.instance.getOrders(
+      orders = List.of(await DatabaseService.instance.getOrders(
         status: _statusFilters[tabIndex],
         searchQuery: _searchQuery,
-      );
+      ));
     }
 
     // Load item summaries for In Progress tab
@@ -174,9 +163,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   }
 
   void _logout() {
+    SyncService.instance.fullSync();
     ref.read(adminProvider.notifier).logout();
     context.go('/');
   }
+
+  String? _statusForCurrentTab() => _statusFilters[_tabController.index];
 
   bool get _isPendingTab => _tabController.index == _kPending;
   bool get _isApprovedTab => _tabController.index == _kApproved;
@@ -188,6 +180,28 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final admin = ref.read(adminProvider).currentAdmin;
     final db = DatabaseService.instance;
 
+    // Optimistic UI: remove order instantly (new list — sqflite lists are unmodifiable)
+    // Find the order's actual status BEFORE removing it (needed for In Processing tab)
+    final orderStatus = _orders.where((o) => o['id'] == orderId).firstOrNull?['status'] as String?;
+    setState(() {
+      _orders = _orders.where((o) => o['id'] != orderId).toList();
+      _selectedOrderIds.remove(orderId);
+      // Decrement: use actual order status (In Processing tab has mixed statuses)
+      final decrementKey = orderStatus ?? _statusForCurrentTab();
+      if (decrementKey != null && _counts.containsKey(decrementKey)) {
+        _counts[decrementKey] = (_counts[decrementKey]! - 1).clamp(0, 999999);
+      }
+      _counts[newStatus] = (_counts[newStatus] ?? 0) + 1;
+    });
+
+    if (mounted) {
+      ref.read(adminProvider.notifier).refreshActivity();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Order ${AppLabels.statusLabels[newStatus]}')),
+      );
+    }
+
+    // Persist to local SQLite + queue for Supabase push on exit
     await db.updateOrderStatus(orderId, newStatus);
     await db.insertStatusLog({
       'id': const Uuid().v4(),
@@ -199,18 +213,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'created_at': DateTime.now().toIso8601String(),
     });
 
-    // Queue status change for Supabase sync
     await db.addToSyncQueue('orders', orderId, 'update',
         jsonEncode({'id': orderId, 'status': newStatus}));
-    SyncService.instance.pushPendingNow();
-
-    await _loadData();
-    if (mounted) {
-      ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Order ${AppLabels.statusLabels[newStatus]}')),
-      );
-    }
   }
 
   Future<void> _showRejectDialog(String orderId) async {
@@ -279,7 +283,26 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final uuid = const Uuid();
     final now = DateTime.now().toIso8601String();
 
-    for (final orderId in _selectedOrderIds.toList()) {
+    // Optimistic UI
+    final collectedIds = _selectedOrderIds.toSet();
+    setState(() {
+      _orders = _orders.where((o) => !collectedIds.contains(o['id'])).toList();
+      _selectedOrderIds.clear();
+      final currentStatus = _statusForCurrentTab();
+      if (currentStatus != null && _counts.containsKey(currentStatus)) {
+        _counts[currentStatus] = (_counts[currentStatus]! - count).clamp(0, 999999);
+      }
+      _counts[AppConstants.statusCollected] = (_counts[AppConstants.statusCollected] ?? 0) + count;
+    });
+
+    if (mounted) {
+      ref.read(adminProvider.notifier).refreshActivity();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$count order(s) marked as Collected')),
+      );
+    }
+
+    for (final orderId in collectedIds) {
       await db.updateOrderStatus(orderId, AppConstants.statusCollected);
       await db.insertStatusLog({
         'id': uuid.v4(),
@@ -290,24 +313,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         'created_at': now,
       });
 
-      // Log napkin OUT to ledger + auto-complete napkin-only orders
       await _logNapkinOutAndAutoComplete(orderId, admin, db, uuid, now);
 
-      // Queue status change for Supabase sync
       final order = await db.getOrder(orderId);
       final finalStatus = order?['status'] ?? AppConstants.statusCollected;
       await db.addToSyncQueue('orders', orderId, 'update',
           jsonEncode({'id': orderId, 'status': finalStatus}));
-    }
-    SyncService.instance.pushPendingNow();
-
-    _selectedOrderIds.clear();
-    await _loadData();
-    if (mounted) {
-      ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$count order(s) marked as Collected')),
-      );
     }
   }
 
@@ -464,7 +475,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final uuid = const Uuid();
     final now = DateTime.now().toIso8601String();
 
-    // Check for outstanding items
+    // Check for outstanding items (pure computation)
     bool hasOutstanding = false;
     for (final item in items) {
       final id = item['id'] as String;
@@ -473,7 +484,29 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       if (received < sent) hasOutstanding = true;
     }
 
-    // Save received quantities
+    // Optimistic UI — find actual order status before removing (In Processing has mixed statuses)
+    final orderStatus = _orders.where((o) => o['id'] == orderId).firstOrNull?['status'] as String?;
+    setState(() {
+      _orders = _orders.where((o) => o['id'] != orderId).toList();
+      final decrementKey = orderStatus ?? _statusForCurrentTab();
+      if (decrementKey != null && _counts.containsKey(decrementKey)) {
+        _counts[decrementKey] = (_counts[decrementKey]! - 1).clamp(0, 999999);
+      }
+      _counts[AppConstants.statusCompleted] = (_counts[AppConstants.statusCompleted] ?? 0) + 1;
+    });
+
+    if (mounted) {
+      ref.read(adminProvider.notifier).refreshActivity();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(
+          hasOutstanding
+              ? 'Partial receipt — outstanding items on new ticket'
+              : 'All items received — order returned',
+        )),
+      );
+    }
+
+    // Persist to local SQLite
     await db.updateReceivedQuantities(orderId, result);
 
     String? newOrderId;
@@ -514,30 +547,14 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     await db.updateOrderStatus(orderId, AppConstants.statusCompleted);
 
-    // Queue completion for sync
     await db.addToSyncQueue('orders', orderId, 'update',
         jsonEncode({'id': orderId, 'status': AppConstants.statusCompleted}));
     if (hasOutstanding && newOrderId != null) {
-      // Queue the new outstanding order for sync
       final outstandingOrder = await db.getOrder(newOrderId);
       if (outstandingOrder != null) {
         await db.addToSyncQueue('orders', newOrderId, 'insert',
             jsonEncode(outstandingOrder));
       }
-    }
-    SyncService.instance.pushPendingNow();
-
-    await _loadData();
-
-    if (mounted) {
-      ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(
-          hasOutstanding
-              ? 'Partial receipt — outstanding items on new ticket'
-              : 'All items received — order completed',
-        )),
-      );
     }
   }
 
@@ -583,7 +600,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                       children: [
                         IconButton(
                           icon: const Icon(Icons.home_rounded, color: AppColors.white, size: 26),
-                          onPressed: () => context.go('/'),
+                          onPressed: () {
+                            SyncService.instance.fullSync();
+                            context.go('/');
+                          },
                         ),
                         const SizedBox(width: AppSpacing.sm),
                         Expanded(
@@ -597,7 +617,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                             ],
                           ),
                         ),
-                        const SyncIndicator(),
+                        SyncIndicator(onSynced: () => _loadData(silent: true)),
                         const SizedBox(width: AppSpacing.xs),
                         IconButton(
                           icon: const Icon(Icons.logout_rounded, color: AppColors.white, size: 24),
@@ -629,8 +649,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                               onTap: () {
                                 if (isNapkinTab) {
                                   context.push('/admin/napkin-returns').then((_) {
-                                    SyncService.instance.fullSync();
-                                    _loadData();
+                                    _loadData(silent: true);
                                   });
                                 } else {
                                   _tabController.animateTo(idx);
@@ -912,8 +931,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       onTap: () {
         ref.read(adminProvider.notifier).refreshActivity();
         context.push('/admin/order/$orderId').then((_) {
-          SyncService.instance.fullSync();
-          _loadData();
+          _loadData(silent: true);
         });
       },
       onApprove: () {
@@ -1073,21 +1091,30 @@ class _OrderCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
+                    // Status chip + outstanding badge — small, above the name
                     Row(
                       children: [
-                        Flexible(
-                          child: Text(staffName,
-                              style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.medium, color: AppColors.grey900),
-                              overflow: TextOverflow.ellipsis),
+                        Container(
+                          padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: statusColor.withValues(alpha: 0.12),
+                            borderRadius: AppRadius.smallBR,
+                          ),
+                          child: Text(
+                            (status == AppConstants.statusCompleted && isPartiallyCompleted)
+                                ? 'Partly Returned'
+                                : (AppLabels.statusLabels[status] ?? status),
+                            style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.medium, color: statusColor),
+                          ),
                         ),
                         if (isOutstanding) ...[
-                          SizedBox(width: AppSpacing.sm),
+                          SizedBox(width: AppSpacing.xs),
                           () {
                             final isResolved = status == AppConstants.statusCompleted ||
                                 status == AppConstants.statusPickedUp ||
                                 status == AppConstants.statusExpired;
                             return Container(
-                              padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                              padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
                               decoration: BoxDecoration(
                                 color: isResolved
                                     ? AppColors.success.withValues(alpha: 0.12)
@@ -1096,7 +1123,7 @@ class _OrderCard extends StatelessWidget {
                               ),
                               child: Text(
                                 isResolved ? 'Outstanding Resolved' : 'Outstanding',
-                                style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.bold,
+                                style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold,
                                     color: isResolved ? AppColors.success : AppColors.error),
                               ),
                             );
@@ -1104,6 +1131,10 @@ class _OrderCard extends StatelessWidget {
                         ],
                       ],
                     ),
+                    SizedBox(height: 2),
+                    Text(staffName,
+                        style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.medium, color: AppColors.grey900),
+                        overflow: TextOverflow.ellipsis),
                     SizedBox(height: 2),
                     Text('$deptName • ${AppLabels.orderTypeLabels[orderType] ?? orderType}',
                         style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, color: AppColors.grey600),
@@ -1120,25 +1151,28 @@ class _OrderCard extends StatelessWidget {
                       Text(itemSummary!,
                           style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.navy.withValues(alpha: 0.7)),
                           overflow: TextOverflow.ellipsis, maxLines: 1),
-                    // Return to Pending button — inside card content
+                    // Return to Pending button — absorb tap so it doesn't open card detail
                     if (showReturnToPending) ...[
                       SizedBox(height: AppSpacing.sm),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: SizedBox(
-                          height: 36,
-                          child: OutlinedButton.icon(
-                            onPressed: onReturnToPending,
-                            icon: Icon(Icons.undo_rounded, size: 16),
-                            label: const Text('Return to Pending'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: AppColors.statusSubmitted,
-                              side: BorderSide(color: AppColors.statusSubmitted.withValues(alpha: 0.5)),
-                              padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                              textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium),
-                              shape: RoundedRectangleBorder(borderRadius: AppRadius.largeBR),
+                      GestureDetector(
+                        onTap: () {}, // absorb tap to prevent InkWell from firing
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: SizedBox(
+                            height: 36,
+                            child: OutlinedButton.icon(
+                              onPressed: onReturnToPending,
+                              icon: Icon(Icons.undo_rounded, size: 16),
+                              label: const Text('Return to Pending'),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: AppColors.statusSubmitted,
+                                side: BorderSide(color: AppColors.statusSubmitted.withValues(alpha: 0.5)),
+                                padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                                textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium),
+                                shape: RoundedRectangleBorder(borderRadius: AppRadius.largeBR),
                             ),
                           ),
+                        ),
                         ),
                       ),
                     ],
@@ -1181,18 +1215,6 @@ class _OrderCard extends StatelessWidget {
                   ),
                 ),
                 ],
-              ] else if (showReturnToPending) ...[
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.12),
-                    borderRadius: AppRadius.smallBR,
-                  ),
-                  child: Text(
-                    AppLabels.statusLabels[status] ?? status,
-                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: statusColor),
-                  ),
-                ),
               ] else if (showReceiveAction) ...[
                 SizedBox(
                   height: AppSizes.buttonHeightSm,
@@ -1209,18 +1231,6 @@ class _OrderCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                SizedBox(width: AppSpacing.sm),
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.12),
-                    borderRadius: AppRadius.smallBR,
-                  ),
-                  child: Text(
-                    AppLabels.statusLabels[status] ?? status,
-                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: statusColor),
-                  ),
-                ),
               ] else if (showCollectedAction) ...[
                 SizedBox(
                   height: AppSizes.buttonHeightSm,
@@ -1235,34 +1245,6 @@ class _OrderCard extends StatelessWidget {
                       textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
                       shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
                     ),
-                  ),
-                ),
-                SizedBox(width: AppSpacing.sm),
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.12),
-                    borderRadius: AppRadius.smallBR,
-                  ),
-                  child: Text(
-                    (status == AppConstants.statusCompleted && isPartiallyCompleted)
-                        ? 'Partly Completed'
-                        : (AppLabels.statusLabels[status] ?? status),
-                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: statusColor),
-                  ),
-                ),
-              ] else ...[
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.12),
-                    borderRadius: AppRadius.smallBR,
-                  ),
-                  child: Text(
-                    (status == AppConstants.statusCompleted && isPartiallyCompleted)
-                        ? 'Partly Completed'
-                        : (AppLabels.statusLabels[status] ?? status),
-                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: statusColor),
                   ),
                 ),
               ],
@@ -1446,14 +1428,3 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
 }
 
 /// Observes app lifecycle to trigger sync when returning to foreground.
-class _AppLifecycleObserver extends WidgetsBindingObserver {
-  final VoidCallback onResume;
-  _AppLifecycleObserver({required this.onResume});
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      onResume();
-    }
-  }
-}

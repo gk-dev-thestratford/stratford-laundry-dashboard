@@ -127,9 +127,9 @@ class OrderNotifier extends StateNotifier<OrderDraft> {
       'created_at': now,
     });
 
-    // Queue for sync and push immediately
+    // Queue for sync — push new order + pull latest data to keep local SQLite in sync
     await db.addToSyncQueue('orders', orderId, 'insert', jsonEncode(orderMap));
-    SyncService.instance.pushPendingNow();
+    SyncService.instance.fullSync();
 
     reset();
     return orderId;

@@ -31,37 +31,46 @@ import '../services/sync_service.dart';
 }
 
 /// Full sync indicator — pill with icon + label. Used on home and admin screens.
+/// Tap to trigger a manual sync. Optional [onSynced] fires after sync completes.
 class SyncIndicator extends ConsumerWidget {
-  const SyncIndicator({super.key});
+  const SyncIndicator({super.key, this.onSynced});
+
+  final VoidCallback? onSynced;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final s = _resolveSyncState(ref);
 
-    return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: AppSpacing.base,
-        vertical: AppSpacing.sm,
-      ),
-      decoration: BoxDecoration(
-        color: s.color.withValues(alpha: 0.15),
-        borderRadius: AppRadius.largeBR,
-        border: Border.all(color: s.color.withValues(alpha: 0.3), width: 1.5),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(s.icon, size: AppSizes.iconSizeMd, color: s.color),
-          const SizedBox(width: AppSpacing.sm),
-          Text(
-            s.label,
-            style: TextStyle(fontFamily: 'Inter',
-              color: s.color,
-              fontSize: AppTextStyles.captionSize,
-              fontWeight: AppTextStyles.medium,
+    return GestureDetector(
+      onTap: () async {
+        await SyncService.instance.fullSync();
+        onSynced?.call();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.base,
+          vertical: AppSpacing.sm,
+        ),
+        decoration: BoxDecoration(
+          color: s.color.withValues(alpha: 0.15),
+          borderRadius: AppRadius.largeBR,
+          border: Border.all(color: s.color.withValues(alpha: 0.3), width: 1.5),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(s.icon, size: AppSizes.iconSizeMd, color: s.color),
+            const SizedBox(width: AppSpacing.sm),
+            Text(
+              s.label,
+              style: TextStyle(fontFamily: 'Inter',
+                color: s.color,
+                fontSize: AppTextStyles.captionSize,
+                fontWeight: AppTextStyles.medium,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
