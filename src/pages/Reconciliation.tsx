@@ -437,6 +437,14 @@ export default function Reconciliation() {
     if (!result || !invoice) return
     setSaving(true)
     const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
+    // Detect invoice category from invoice number prefix
+    const invNum = (invoice.invoiceNumber || '').toUpperCase()
+    const invoiceCategory = invNum.startsWith('GS') ? 'Staff Uniforms'
+      : invNum.startsWith('GM') ? 'Guest Laundry'
+      : invNum.startsWith('HH') ? 'Bathrobes'
+      : invNum.startsWith('NM') ? 'Napkins'
+      : invNum.startsWith('HM') ? 'HSK Linen'
+      : 'Other'
     const { data: { user } } = await supabase.auth.getUser()
     const ts = Date.now()
 
@@ -469,6 +477,7 @@ export default function Reconciliation() {
       not_found_count: result.stats.notFound, missing_count: result.stats.missing,
       invoice_file_path: invoicePath,
       report_file_path: reportPath,
+      invoice_category: invoiceCategory,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),

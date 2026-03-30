@@ -22,6 +22,7 @@ interface SavedReconciliation {
   missing_count: number
   invoice_file_path: string | null
   report_file_path: string | null
+  invoice_category: string | null
   department_breakdown: {
     departmentName: string
     orderCount: number
@@ -38,6 +39,7 @@ export default function ReconciliationHistory() {
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null)
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
@@ -142,11 +144,32 @@ export default function ReconciliationHistory() {
           <p className="text-gray-500">No reconciliations saved yet</p>
           <p className="text-sm text-gray-400 mt-1">Upload an invoice on the Reconciliation page and click Save to create a record</p>
         </div>
-      ) : (
+      ) : (<>
+        {/* Category filter pills */}
+        {(() => {
+          const categories = [...new Set(history.map(h => h.invoice_category || 'Other'))].sort()
+          return categories.length > 1 ? (
+            <div className="flex gap-2 mb-4 flex-wrap">
+              <button
+                onClick={() => setCategoryFilter(null)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors ${!categoryFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+              >All ({history.length})</button>
+              {categories.map(cat => {
+                const count = history.filter(h => (h.invoice_category || 'Other') === cat).length
+                return (
+                  <button key={cat} onClick={() => setCategoryFilter(categoryFilter === cat ? null : cat)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors ${categoryFilter === cat ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+                  >{cat} ({count})</button>
+                )
+              })}
+            </div>
+          ) : null
+        })()}
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-200 bg-gray-50">
+                <th className="px-4 py-3 text-left font-medium text-gray-600">Category</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-600">Invoice</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-600">Period</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-600">Reconciled</th>
@@ -159,7 +182,7 @@ export default function ReconciliationHistory() {
               </tr>
             </thead>
             <tbody>
-              {history.map(h => {
+              {history.filter(h => !categoryFilter || (h.invoice_category || 'Other') === categoryFilter).map(h => {
                 const issues = h.mismatch_count + h.not_found_count + h.missing_count
                 const isExpanded = expanded === h.id
                 return (
@@ -169,6 +192,16 @@ export default function ReconciliationHistory() {
                       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${isExpanded ? 'bg-gray-50' : ''}`}
                       onClick={() => setExpanded(isExpanded ? null : h.id)}
                     >
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
+                          h.invoice_category === 'Staff Uniforms' ? 'bg-blue-100 text-blue-700'
+                          : h.invoice_category === 'Guest Laundry' ? 'bg-purple-100 text-purple-700'
+                          : h.invoice_category === 'Bathrobes' ? 'bg-teal-100 text-teal-700'
+                          : h.invoice_category === 'Napkins' ? 'bg-amber-100 text-amber-700'
+                          : h.invoice_category === 'HSK Linen' ? 'bg-green-100 text-green-700'
+                          : 'bg-gray-100 text-gray-700'
+                        }`}>{h.invoice_category || 'Other'}</span>
+                      </td>
                       <td className="px-4 py-3 font-mono font-medium text-navy">{h.invoice_number || '—'}</td>
                       <td className="px-4 py-3 text-gray-600">{h.invoice_period || '—'}</td>
                       <td className="px-4 py-3 text-gray-500">{format(new Date(h.created_at), 'dd MMM yyyy HH:mm')}</td>
@@ -185,7 +218,7 @@ export default function ReconciliationHistory() {
                     </tr>
                     {isExpanded && (
                       <tr key={`${h.id}-detail`}>
-                        <td colSpan={9} className="px-6 py-4 bg-gray-50/50">
+                        <td colSpan={10} className="px-6 py-4 bg-gray-50/50">
                           {/* Download buttons */}
                           <div className="flex items-center gap-2 mb-4">
                             <span className="text-xs font-semibold text-gray-500 uppercase mr-2">Documents</span>
@@ -260,7 +293,7 @@ export default function ReconciliationHistory() {
             </tbody>
           </table>
         </div>
-      )}
+      </>)}
     </div>
   )
 }
