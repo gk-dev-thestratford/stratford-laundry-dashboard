@@ -595,19 +595,37 @@ export default function Reconciliation() {
     const orderId = row.order.id
     setUpdatingPrices(prev => new Set(prev).add(orderId))
     try {
-      const items = row.order.order_items || []
-      const currentTotal = computeOrderCost(row.order)
+      // Fetch fresh items from DB (in case local state is stale after delete/recreate)
+      const { data: freshItems } = await supabase
+        .from('order_items')
+        .select('*')
+        .eq('order_id', orderId)
+      const items = freshItems || row.order.order_items || []
+      const currentTotal = items.reduce((s: number, i: any) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
       const invoiceNet = row.invoiceLine.net
 
-      if (items.length > 0 && currentTotal > 0) {
-        const ratio = invoiceNet / currentTotal
-        for (const item of items) {
-          const oldPrice = item.price_at_time ?? 0
-          const newPrice = +(oldPrice * ratio).toFixed(4)
-          await supabase.from('order_items').update({ price_at_time: newPrice }).eq('id', item.id)
+      if (items.length > 0) {
+        if (currentTotal > 0) {
+          const ratio = invoiceNet / currentTotal
+          for (const item of items) {
+            const oldPrice = item.price_at_time ?? 0
+            const newPrice = +(oldPrice * ratio).toFixed(4)
+            const { error } = await supabase.from('order_items').update({ price_at_time: newPrice }).eq('id', item.id)
+            if (error) console.error('Failed to update item price:', error)
+          }
+        } else {
+          const totalQty = items.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
+          if (totalQty > 0) {
+            for (const item of items) {
+              const perUnit = +(invoiceNet / totalQty).toFixed(4)
+              const { error } = await supabase.from('order_items').update({ price_at_time: perUnit }).eq('id', item.id)
+              if (error) console.error('Failed to update item price:', error)
+            }
+          }
         }
       }
-      await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+      const { error } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+      if (error) console.error('Failed to update order total:', error)
       await refetchAndReconcile()
     } catch (e) {
       console.error('Failed to update prices:', e)
