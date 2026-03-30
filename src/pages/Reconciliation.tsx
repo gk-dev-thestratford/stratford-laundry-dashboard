@@ -706,6 +706,13 @@ export default function Reconciliation() {
           quantity_received: it.quantity,
           price_at_time: +(pricePerUnit).toFixed(4),
         }))
+        // Adjust last item to absorb rounding difference
+        const runningTotal = itemInserts.reduce((s, it) => s + it.price_at_time * it.quantity_sent, 0)
+        const roundingDiff = +(row.invoiceLine.net - runningTotal).toFixed(4)
+        if (roundingDiff !== 0 && itemInserts.length > 0) {
+          const last = itemInserts[itemInserts.length - 1]
+          last.price_at_time = +(last.price_at_time + roundingDiff / last.quantity_sent).toFixed(4)
+        }
         await supabase.from('order_items').insert(itemInserts)
       } else if (newOrder) {
         // No parsed items — create a single generic item
