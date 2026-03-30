@@ -603,42 +603,39 @@ export default function Reconciliation() {
   }
 
   // ── Action: update prices to match invoice ──
+  // Distributes invoice total across items at 2dp, adjusting the last item to absorb rounding.
   const handleUpdatePrice = useCallback(async (row: ReconciliationRow) => {
     if (!row.order || !invoice) return
     const orderId = row.order.id
     setUpdatingPrices(prev => new Set(prev).add(orderId))
     try {
-      // Fetch fresh items from DB (in case local state is stale after delete/recreate)
       const { data: freshItems } = await supabase
-        .from('order_items')
-        .select('*')
-        .eq('order_id', orderId)
+        .from('order_items').select('*').eq('order_id', orderId)
       const items = freshItems || row.order.order_items || []
-      const currentTotal = items.reduce((s: number, i: any) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
       const invoiceNet = row.invoiceLine.net
 
       if (items.length > 0) {
-        if (currentTotal > 0) {
-          const ratio = invoiceNet / currentTotal
-          for (const item of items) {
-            const oldPrice = item.price_at_time ?? 0
-            const newPrice = +(oldPrice * ratio).toFixed(4)
-            const { error } = await supabase.from('order_items').update({ price_at_time: newPrice }).eq('id', item.id)
-            if (error) console.error('Failed to update item price:', error)
-          }
-        } else {
-          const totalQty = items.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
-          if (totalQty > 0) {
-            for (const item of items) {
-              const perUnit = +(invoiceNet / totalQty).toFixed(4)
-              const { error } = await supabase.from('order_items').update({ price_at_time: perUnit }).eq('id', item.id)
-              if (error) console.error('Failed to update item price:', error)
+        const totalQty = items.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
+        if (totalQty > 0) {
+          // Calculate base per-unit price (2dp) and distribute
+          const basePrice = Math.floor(invoiceNet / totalQty * 100) / 100
+          let runningTotal = 0
+          for (let idx = 0; idx < items.length; idx++) {
+            const item = items[idx]
+            const qty = item.quantity_sent ?? 0
+            let price: number
+            if (idx === items.length - 1) {
+              // Last item absorbs rounding remainder
+              price = +((invoiceNet - runningTotal) / qty).toFixed(2)
+            } else {
+              price = basePrice
+              runningTotal += +(price * qty).toFixed(2)
             }
+            await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
           }
         }
       }
-      const { error } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
-      if (error) console.error('Failed to update order total:', error)
+      await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
       await refetchAndReconcile()
     } catch (e) {
       console.error('Failed to update prices:', e)
@@ -711,21 +708,25 @@ export default function Reconciliation() {
       // Create order items from parsed invoice line items
       if (newOrder && row.invoiceLine.items.length > 0) {
         const totalItemQty = row.invoiceLine.items.reduce((s, it) => s + it.quantity, 0)
-        const pricePerUnit = totalItemQty > 0 ? row.invoiceLine.net / totalItemQty : row.invoiceLine.net
-        const itemInserts = row.invoiceLine.items.map(it => ({
-          order_id: newOrder.id,
-          item_name: it.name,
-          quantity_sent: it.quantity,
-          quantity_received: it.quantity,
-          price_at_time: +(pricePerUnit).toFixed(4),
-        }))
-        // Adjust last item to absorb rounding difference
-        const runningTotal = itemInserts.reduce((s, it) => s + it.price_at_time * it.quantity_sent, 0)
-        const roundingDiff = +(row.invoiceLine.net - runningTotal).toFixed(4)
-        if (roundingDiff !== 0 && itemInserts.length > 0) {
-          const last = itemInserts[itemInserts.length - 1]
-          last.price_at_time = +(last.price_at_time + roundingDiff / last.quantity_sent).toFixed(4)
-        }
+        const basePrice = totalItemQty > 0 ? Math.floor(row.invoiceLine.net / totalItemQty * 100) / 100 : row.invoiceLine.net
+        let runningTotal = 0
+        const itemInserts = row.invoiceLine.items.map((it, idx) => {
+          let price: number
+          if (idx === row.invoiceLine.items.length - 1) {
+            // Last item absorbs rounding remainder
+            price = +((row.invoiceLine.net - runningTotal) / it.quantity).toFixed(2)
+          } else {
+            price = basePrice
+            runningTotal += +(price * it.quantity).toFixed(2)
+          }
+          return {
+            order_id: newOrder.id,
+            item_name: it.name,
+            quantity_sent: it.quantity,
+            quantity_received: it.quantity,
+            price_at_time: price,
+          }
+        })
         await supabase.from('order_items').insert(itemInserts)
       } else if (newOrder) {
         // No parsed items — create a single generic item
