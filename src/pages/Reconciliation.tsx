@@ -175,13 +175,14 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
   }
 }
 
-const SECTION_LABELS: Record<string, string> = {
-  staff: 'Staff Uniform',
-  hsk: 'HSK Linen',
-  bathrobes: 'Bathrobes',
-  guest: 'Guest Laundry',
-  napkins: 'Napkins',
-  table_cloths: 'Table Cloths',
+// Items that are HSK Linen (not staff uniforms) — matched by keyword in item name
+const HSK_LINEN_KEYWORDS = ['duvet', 'curtain', 'blanket', 'pillow', 'bathrobe', 'linen bundle', 'hsk linen', 'bed sheet', 'mattress']
+
+function isHskLinenOrder(order: { order_items?: { item_name: string }[] } | null): boolean {
+  if (!order?.order_items?.length) return false
+  return order.order_items.some(i =>
+    HSK_LINEN_KEYWORDS.some(kw => i.item_name.toLowerCase().includes(kw))
+  )
 }
 
 function buildDepartmentDisplayRows(
@@ -190,56 +191,57 @@ function buildDepartmentDisplayRows(
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
-    // Check if this department has multiple section types (e.g. Housekeeping with uniforms + linen)
-    const sectionBreakdown = new Map<string, { count: number; invNet: number; sysNet: number }>()
+    // Check if this department has a mix of staff uniform and HSK linen items
+    let uniformCount = 0, uniformInvNet = 0, uniformSysNet = 0
+    let linenCount = 0, linenInvNet = 0, linenSysNet = 0
+
     for (const row of allRows) {
       const deptName = row.order?.department?.name || 'Unallocated'
       if (deptName !== dept.departmentName || row.status === 'not_found') continue
-      const sec = row.invoiceLine.sectionType || row.sectionType || 'staff'
-      if (!sectionBreakdown.has(sec)) sectionBreakdown.set(sec, { count: 0, invNet: 0, sysNet: 0 })
-      const entry = sectionBreakdown.get(sec)!
-      entry.count++
-      entry.invNet += row.invoiceLine.net
-      entry.sysNet += row.systemTotal
+      if (isHskLinenOrder(row.order)) {
+        linenCount++
+        linenInvNet += row.invoiceLine.net
+        linenSysNet += row.systemTotal
+      } else {
+        uniformCount++
+        uniformInvNet += row.invoiceLine.net
+        uniformSysNet += row.systemTotal
+      }
     }
 
-    if (sectionBreakdown.size > 1) {
-      // Multiple section types — show main row then sub-rows
-      const label = departmentItemsLabel(allRows, dept.departmentName)
+    const hasSubBreakdown = linenCount > 0 && uniformCount > 0
+    const label = departmentItemsLabel(allRows, dept.departmentName)
+    displayRows.push({
+      departmentName: dept.departmentName,
+      lineLabel: label,
+      isTopUp: false,
+      orderCount: dept.orderCount,
+      invoiceNet: dept.invoiceNet,
+      systemTotal: dept.systemTotal,
+      difference: dept.difference,
+      totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+    })
+
+    if (hasSubBreakdown) {
       displayRows.push({
         departmentName: dept.departmentName,
-        lineLabel: label,
-        isTopUp: false,
-        orderCount: dept.orderCount,
-        invoiceNet: dept.invoiceNet,
-        systemTotal: dept.systemTotal,
-        difference: dept.difference,
-        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+        lineLabel: 'Staff Uniform',
+        isTopUp: true,
+        orderCount: uniformCount,
+        invoiceNet: +uniformInvNet.toFixed(2),
+        systemTotal: +uniformSysNet.toFixed(2),
+        difference: +(uniformInvNet - uniformSysNet).toFixed(2),
+        totalGross: +(uniformInvNet * 1.2).toFixed(2),
       })
-      for (const [sec, data] of sectionBreakdown) {
-        const diff = +(data.invNet - data.sysNet).toFixed(2)
-        displayRows.push({
-          departmentName: dept.departmentName,
-          lineLabel: SECTION_LABELS[sec] || sec,
-          isTopUp: true, // renders as indented sub-row
-          orderCount: data.count,
-          invoiceNet: +data.invNet.toFixed(2),
-          systemTotal: +data.sysNet.toFixed(2),
-          difference: diff,
-          totalGross: +(data.invNet * 1.2).toFixed(2),
-        })
-      }
-    } else {
-      const label = departmentItemsLabel(allRows, dept.departmentName)
       displayRows.push({
         departmentName: dept.departmentName,
-        lineLabel: label,
-        isTopUp: false,
-        orderCount: dept.orderCount,
-        invoiceNet: dept.invoiceNet,
-        systemTotal: dept.systemTotal,
-        difference: dept.difference,
-        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+        lineLabel: 'HSK Linen',
+        isTopUp: true,
+        orderCount: linenCount,
+        invoiceNet: +linenInvNet.toFixed(2),
+        systemTotal: +linenSysNet.toFixed(2),
+        difference: +(linenInvNet - linenSysNet).toFixed(2),
+        totalGross: +(linenInvNet * 1.2).toFixed(2),
       })
     }
     if (dept.allocatedTopUp > 0) {
