@@ -437,13 +437,14 @@ export default function Reconciliation() {
     if (!result || !invoice) return
     setSaving(true)
     const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
-    // Detect invoice category from invoice number prefix
-    const invNum = (invoice.invoiceNumber || '').toUpperCase()
-    const invoiceCategory = invNum.startsWith('GS') ? 'Staff Uniforms'
-      : invNum.startsWith('GM') ? 'Guest Laundry'
-      : invNum.startsWith('HH') ? 'Bathrobes'
-      : invNum.startsWith('NM') ? 'Napkins'
-      : invNum.startsWith('HM') ? 'HSK Linen'
+    // Detect invoice category from filename or invoice title
+    const fileName = (file?.name || '').toLowerCase()
+    const invoiceCategory = fileName.includes('bathrobe') ? 'Bathrobes'
+      : fileName.includes('napkin') ? 'Napkins'
+      : fileName.includes('table cloth') || fileName.includes('tablecloth') ? 'Table Cloths'
+      : fileName.includes('hsk') || fileName.includes('linen') ? 'HSK Linen'
+      : fileName.includes('guest') ? 'Guest Laundry'
+      : fileName.includes('staff') || fileName.includes('uniform') ? 'Staff Uniforms'
       : 'Other'
     const { data: { user } } = await supabase.auth.getUser()
     const ts = Date.now()
