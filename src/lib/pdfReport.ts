@@ -49,7 +49,7 @@ export function generateReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[]
-): void {
+): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
   const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
@@ -329,4 +329,16 @@ export function generateReconciliationPdf(
   }
 
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
+
+  return doc
+}
+
+/** Generate the same report but return the PDF as a Blob (for uploading to storage). */
+export function generateReconciliationPdfBlob(
+  invoice: ParsedInvoice,
+  result: ReconciliationResultForPdf,
+  displayRows: DepartmentDisplayRow[]
+): Blob {
+  const doc = generateReconciliationPdf(invoice, result, displayRows)
+  return doc.output('blob')
 }

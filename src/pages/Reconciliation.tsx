@@ -6,7 +6,7 @@ import {
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
-import { generateReconciliationPdf, type DepartmentDisplayRow } from '../lib/pdfReport'
+import { generateReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow } from '../lib/pdfReport'
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -398,6 +398,17 @@ export default function Reconciliation() {
       if (!uploadErr) invoicePath = path
     }
 
+    // Generate and upload reconciliation PDF report
+    let reportPath: string | null = null
+    try {
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, departmentDisplayRows)
+      const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
+      const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
+      if (!rptErr) reportPath = rptName
+    } catch (e) {
+      console.error('Failed to upload PDF report:', e)
+    }
+
     await supabase.from('reconciliations').insert({
       invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
       invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
@@ -406,6 +417,7 @@ export default function Reconciliation() {
       matched_count: result.stats.matched, mismatch_count: result.stats.priceMismatch,
       not_found_count: result.stats.notFound, missing_count: result.stats.missing,
       invoice_file_path: invoicePath,
+      report_file_path: reportPath,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
@@ -413,7 +425,7 @@ export default function Reconciliation() {
       })),
     })
     setSaving(false); setSaved(true); loadHistory()
-  }, [result, invoice, file, loadHistory])
+  }, [result, invoice, file, departmentDisplayRows, loadHistory])
 
   const filteredRows = useMemo(() => {
     if (!result) return []

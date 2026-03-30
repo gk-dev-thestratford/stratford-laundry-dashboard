@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet } from 'lucide-react'
+import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet, Trash2 } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { format } from 'date-fns'
 import { utils, writeFile } from 'xlsx'
@@ -21,6 +21,7 @@ interface SavedReconciliation {
   not_found_count: number
   missing_count: number
   invoice_file_path: string | null
+  report_file_path: string | null
   department_breakdown: {
     departmentName: string
     orderCount: number
@@ -91,6 +92,29 @@ export default function ReconciliationHistory() {
     utils.book_append_sheet(wb, utils.json_to_sheet(summarySheet), 'Summary')
     if (deptSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(deptSheet), 'Department Breakdown')
     writeFile(wb, `reconciliation-${h.invoice_number || 'report'}-${format(new Date(h.created_at), 'yyyy-MM-dd')}.xlsx`)
+  }
+
+  async function downloadReport(h: SavedReconciliation) {
+    if (!h.report_file_path) return
+    const { data } = await supabase.storage.from('reconciliations').download(h.report_file_path)
+    if (data) {
+      const url = URL.createObjectURL(data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `reconciliation-report-${h.invoice_number || 'unknown'}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+    }
+  }
+
+  async function deleteRecord(h: SavedReconciliation) {
+    if (!window.confirm(`Delete reconciliation for invoice ${h.invoice_number || 'unknown'}? This cannot be undone.`)) return
+    // Delete stored files
+    if (h.invoice_file_path) await supabase.storage.from('reconciliations').remove([h.invoice_file_path])
+    if (h.report_file_path) await supabase.storage.from('reconciliations').remove([h.report_file_path])
+    // Delete DB record
+    await supabase.from('reconciliations').delete().eq('id', h.id)
+    setHistory(prev => prev.filter(r => r.id !== h.id))
   }
 
   return (
@@ -180,6 +204,23 @@ export default function ReconciliationHistory() {
                             >
                               <FileSpreadsheet className="w-3.5 h-3.5" />
                               Excel Report
+                            </button>
+                            {h.report_file_path && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); downloadReport(h) }}
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 transition-colors"
+                              >
+                                <FileText className="w-3.5 h-3.5" />
+                                PDF Report
+                              </button>
+                            )}
+                            <div className="flex-1" />
+                            <button
+                              onClick={(e) => { e.stopPropagation(); deleteRecord(h) }}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Delete
                             </button>
                           </div>
 
