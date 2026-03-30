@@ -180,7 +180,6 @@ export function generateReconciliationPdf(
   const deptBody: (string | { content: string; styles?: Record<string, any> })[][] = []
   for (const row of displayRows) {
     const isRealTopUp = row.isTopUp && row.lineLabel === 'Minimum TopUp'
-    const isSubRow = row.isTopUp && row.lineLabel !== 'Minimum TopUp'
     const label = row.isTopUp
       ? `    ${row.departmentName} \u2014 ${row.lineLabel}`
       : `${row.departmentName} \u2014 ${row.lineLabel}`
