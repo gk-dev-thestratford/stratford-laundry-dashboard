@@ -401,7 +401,8 @@ export default function Reconciliation() {
     // Generate and upload reconciliation PDF report
     let reportPath: string | null = null
     try {
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, departmentDisplayRows)
+      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -425,7 +426,7 @@ export default function Reconciliation() {
       })),
     })
     setSaving(false); setSaved(true); loadHistory()
-  }, [result, invoice, file, departmentDisplayRows, loadHistory])
+  }, [result, invoice, file, loadHistory])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
