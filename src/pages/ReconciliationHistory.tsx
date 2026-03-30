@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet, Trash2 } from 'lucide-react'
+import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet, Trash2, ChevronLeft, ChevronRight } from 'lucide-react'
 import { supabase } from '../lib/supabase'
+import { MONTHS } from '../types'
 import { format } from 'date-fns'
 import { utils, writeFile } from 'xlsx'
 
@@ -39,8 +40,23 @@ export default function ReconciliationHistory() {
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
-  const [categoryFilter, setCategoryFilter] = useState<string | null>(null)
-  const [monthFilter, setMonthFilter] = useState<string | null>(null)
+  const [year, setYear] = useState(new Date().getFullYear())
+  const [month, setMonth] = useState(0) // 0 = All
+  const [categoryFilter, setCategoryFilter] = useState('all')
+
+  const filteredHistory = useMemo(() => {
+    return history.filter(h => {
+      if (categoryFilter !== 'all' && (h.invoice_category || 'Other') !== categoryFilter) return false
+      const d = new Date(h.created_at)
+      if (d.getFullYear() !== year) return false
+      if (month > 0 && d.getMonth() + 1 !== month) return false
+      return true
+    })
+  }, [history, categoryFilter, year, month])
+
+  const categories = useMemo(() =>
+    [...new Set(history.map(h => h.invoice_category || 'Other'))].sort()
+  , [history])
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
@@ -146,42 +162,37 @@ export default function ReconciliationHistory() {
           <p className="text-sm text-gray-400 mt-1">Upload an invoice on the Reconciliation page and click Save to create a record</p>
         </div>
       ) : (<>
-        {/* Filters */}
-        <div className="flex gap-6 mb-4 flex-wrap items-start">
-          {/* Category filter */}
-          <div>
-            <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Category</p>
-            <div className="flex gap-1.5 flex-wrap">
-              <button onClick={() => setCategoryFilter(null)}
-                className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${!categoryFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-              >All</button>
-              {[...new Set(history.map(h => h.invoice_category || 'Other'))].sort().map(cat => (
-                <button key={cat} onClick={() => setCategoryFilter(categoryFilter === cat ? null : cat)}
-                  className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${categoryFilter === cat ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-                >{cat}</button>
+        {/* Filters — same style as Orders page */}
+        <div className="space-y-4 mb-4">
+          {/* Year selector + Month pills */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1 bg-white border border-gray-200 rounded-lg px-1 py-0.5">
+              <button onClick={() => setYear(y => y - 1)} className="p-1.5 hover:bg-gray-100 rounded transition-colors">
+                <ChevronLeft className="w-4 h-4 text-gray-600" />
+              </button>
+              <span className="px-2 text-sm font-semibold text-navy min-w-[48px] text-center">{year}</span>
+              <button onClick={() => setYear(y => y + 1)} className="p-1.5 hover:bg-gray-100 rounded transition-colors">
+                <ChevronRight className="w-4 h-4 text-gray-600" />
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {MONTHS.map((label, idx) => (
+                <button key={label} onClick={() => setMonth(idx)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                    month === idx ? 'bg-navy text-white' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'
+                  }`}
+                >{label}</button>
               ))}
             </div>
           </div>
-          {/* Month filter */}
-          <div>
-            <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Period</p>
-            <div className="flex gap-1.5 flex-wrap">
-              <button onClick={() => setMonthFilter(null)}
-                className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${!monthFilter ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-              >All</button>
-              {[...new Set(history.map(h => {
-                const d = new Date(h.created_at)
-                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-              }))].sort().reverse().map(ym => {
-                const [y, m] = ym.split('-')
-                const label = format(new Date(+y, +m - 1), 'MMM yyyy')
-                return (
-                  <button key={ym} onClick={() => setMonthFilter(monthFilter === ym ? null : ym)}
-                    className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${monthFilter === ym ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
-                  >{label}</button>
-                )
-              })}
-            </div>
+          {/* Category dropdown */}
+          <div className="flex gap-3">
+            <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
+              className="px-3 py-2 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
+            >
+              <option value="all">All Categories</option>
+              {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+            </select>
           </div>
         </div>
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -201,15 +212,7 @@ export default function ReconciliationHistory() {
               </tr>
             </thead>
             <tbody>
-              {history.filter(h => {
-                if (categoryFilter && (h.invoice_category || 'Other') !== categoryFilter) return false
-                if (monthFilter) {
-                  const d = new Date(h.created_at)
-                  const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-                  if (ym !== monthFilter) return false
-                }
-                return true
-              }).map(h => {
+              {filteredHistory.map(h => {
                 const issues = h.mismatch_count + h.not_found_count + h.missing_count
                 const isExpanded = expanded === h.id
                 return (
