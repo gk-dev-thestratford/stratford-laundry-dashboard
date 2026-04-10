@@ -745,34 +745,39 @@ export default function Reconciliation() {
     const orderId = row.order.id
     setUpdatingPrices(prev => new Set(prev).add(orderId))
     try {
+      // Clear reconciliation_id so the order stays visible after refetch
+      await supabase.from('orders').update({ reconciliation_id: null }).eq('id', orderId)
+
       const { data: freshItems } = await supabase
         .from('order_items').select('*').eq('order_id', orderId)
       const items = freshItems || row.order.order_items || []
       const invoiceNet = row.invoiceLine.net
 
       if (items.length > 0) {
-        const totalQty = items.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
+        // Filter to items with valid qty and id
+        const validItems = items.filter((i: any) => (i.quantity_sent ?? 0) > 0 && i.id)
+        const totalQty = validItems.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
         if (totalQty > 0) {
-          // Issue 3: Use Math.round (not floor) and penny-precise remainder for last item
           const basePrice = Math.round(invoiceNet / totalQty * 100) / 100
           let runningPennies = 0
-          for (let idx = 0; idx < items.length; idx++) {
-            const item = items[idx]
+          for (let idx = 0; idx < validItems.length; idx++) {
+            const item = validItems[idx]
             const qty = item.quantity_sent ?? 0
             let price: number
-            if (idx === items.length - 1) {
-              // Last item absorbs rounding remainder (computed in pennies to avoid fp drift)
+            if (idx === validItems.length - 1) {
               const remainderPennies = Math.round(invoiceNet * 100) - runningPennies
               price = Math.round(remainderPennies / qty) / 100
             } else {
               price = basePrice
               runningPennies += Math.round(price * qty * 100)
             }
-            await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
+            const { error: itemErr } = await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
+            if (itemErr) console.error(`Failed to update item ${item.id}:`, itemErr)
           }
         }
       }
-      await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+      const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+      if (orderErr) console.error('Failed to update order total:', orderErr)
       await refetchAndReconcile()
     } catch (e) {
       console.error('Failed to update prices:', e)
