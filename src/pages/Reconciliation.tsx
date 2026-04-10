@@ -303,24 +303,12 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
           order = candidates.find(o => o.guest_name?.toLowerCase().includes(name)) ?? candidates[0]
         }
       }
-      // Fallback: match orders added from reconciliation by price + date + type
+      // Fallback: match orders added from reconciliation by embedded ref key
       if (!order) {
-        const lineNet = +line.net.toFixed(2)
+        const refKey = `[ref:${line.ticket}|${line.date}|${line.net}]`
         order = orders.find(o => {
           if (matchedOrderIds.has(o.id)) return false
-          if (o.order_type !== orderType) return false
-          if (!o.notes?.includes('Added from invoice reconciliation')) return false
-          if (Math.abs((o.total_price ?? 0) - lineNet) > 0.02) return false
-          // Match date (compare yyyy-MM-dd portion)
-          if (line.date) {
-            const parts = line.date.split('/')
-            if (parts.length === 3) {
-              let yr = parts[2]; if (yr.length === 2) yr = `20${yr}`
-              const lineISO = `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`
-              if (!o.created_at.startsWith(lineISO)) return false
-            }
-          }
-          return true
+          return o.notes?.includes(refKey) === true
         }) ?? null
       }
       if (order) matchedOrderIds.add(order.id)
@@ -758,49 +746,80 @@ export default function Reconciliation() {
     return <XCircle className="w-4 h-4 text-red-500" />
   }
 
+  // Price update error banner
+  const [priceUpdateError, setPriceUpdateError] = useState<string | null>(null)
+
   // ── Action: update prices to match invoice ──
   // Distributes invoice total across items at 2dp, adjusting the last item to absorb rounding.
   const handleUpdatePrice = useCallback(async (row: ReconciliationRow) => {
     if (!row.order || !invoice) return
     const orderId = row.order.id
+    const docket = row.order.docket_number
     setUpdatingPrices(prev => new Set(prev).add(orderId))
+    setPriceUpdateError(null)
     try {
       // Clear reconciliation_id so the order stays visible after refetch
       await supabase.from('orders').update({ reconciliation_id: null }).eq('id', orderId)
 
-      const { data: freshItems } = await supabase
+      const { data: freshItems, error: fetchErr } = await supabase
         .from('order_items').select('*').eq('order_id', orderId)
+      if (fetchErr) {
+        setPriceUpdateError(`Docket ${docket}: Failed to fetch order items — ${fetchErr.message}`)
+        return
+      }
       const items = freshItems || row.order.order_items || []
       const invoiceNet = row.invoiceLine.net
 
-      if (items.length > 0) {
-        // Filter to items with valid qty and id
-        const validItems = items.filter((i: any) => (i.quantity_sent ?? 0) > 0 && i.id)
-        const totalQty = validItems.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
-        if (totalQty > 0) {
-          const basePrice = Math.round(invoiceNet / totalQty * 100) / 100
-          let runningPennies = 0
-          for (let idx = 0; idx < validItems.length; idx++) {
-            const item = validItems[idx]
-            const qty = item.quantity_sent ?? 0
-            let price: number
-            if (idx === validItems.length - 1) {
-              const remainderPennies = Math.round(invoiceNet * 100) - runningPennies
-              price = Math.round(remainderPennies / qty) / 100
-            } else {
-              price = basePrice
-              runningPennies += Math.round(price * qty * 100)
-            }
-            const { error: itemErr } = await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
-            if (itemErr) console.error(`Failed to update item ${item.id}:`, itemErr)
-          }
+      if (items.length === 0) {
+        // No items — just update the total price directly
+        const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+        if (orderErr) {
+          setPriceUpdateError(`Docket ${docket}: Failed to update order total — ${orderErr.message}`)
+          return
         }
+        await refetchAndReconcile()
+        return
       }
+
+      const validItems = items.filter((i: any) => (i.quantity_sent ?? 0) > 0 && i.id)
+      const totalQty = validItems.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
+
+      if (totalQty === 0) {
+        // All items have zero quantity — cannot distribute price, update total only
+        setPriceUpdateError(`Docket ${docket}: All items have zero quantity — updated total price only`)
+        await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+        await refetchAndReconcile()
+        return
+      }
+
+      const basePrice = Math.round(invoiceNet / totalQty * 100) / 100
+      let runningPennies = 0
+      const errors: string[] = []
+      for (let idx = 0; idx < validItems.length; idx++) {
+        const item = validItems[idx]
+        const qty = item.quantity_sent ?? 0
+        let price: number
+        if (idx === validItems.length - 1) {
+          const remainderPennies = Math.round(invoiceNet * 100) - runningPennies
+          price = Math.round(remainderPennies / qty) / 100
+        } else {
+          price = basePrice
+          runningPennies += Math.round(price * qty * 100)
+        }
+        const { error: itemErr } = await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
+        if (itemErr) errors.push(`Item "${item.item_name}": ${itemErr.message}`)
+      }
+
       const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
-      if (orderErr) console.error('Failed to update order total:', orderErr)
+      if (orderErr) errors.push(`Order total: ${orderErr.message}`)
+
+      if (errors.length > 0) {
+        setPriceUpdateError(`Docket ${docket}: ${errors.join('; ')}`)
+      }
       await refetchAndReconcile()
     } catch (e) {
-      console.error('Failed to update prices:', e)
+      const msg = e instanceof Error ? e.message : 'Unknown error'
+      setPriceUpdateError(`Docket ${docket}: ${msg}`)
     } finally {
       setUpdatingPrices(prev => { const next = new Set(prev); next.delete(orderId); return next })
     }
@@ -867,7 +886,7 @@ export default function Reconciliation() {
         room_number: orderType === 'guest_laundry' ? row.invoiceLine.ticket : null,
         status: 'completed',
         total_price: +row.invoiceLine.net.toFixed(2),
-        notes: `Added from invoice reconciliation — ${invoice.invoiceNumber}`,
+        notes: `Added from invoice reconciliation — ${invoice.invoiceNumber} [ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`,
         created_at: createdAt,
       }).select().single()
 
@@ -1329,6 +1348,17 @@ export default function Reconciliation() {
         </div>
       </div>
 
+      {/* Price update error */}
+      {priceUpdateError && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 flex items-start gap-3">
+          <XCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 text-sm text-red-800">{priceUpdateError}</div>
+          <button onClick={() => setPriceUpdateError(null)} className="p-1 rounded hover:bg-red-100">
+            <X className="w-4 h-4 text-red-400" />
+          </button>
+        </div>
+      )}
+
       {/* Filter tabs */}
       <div className="flex gap-1.5 bg-gray-100 rounded-lg p-1 w-fit">
         {([['all', 'All', result.rows.length], ['matched', 'Matched', result.stats.matched],
@@ -1416,7 +1446,19 @@ export default function Reconciliation() {
                     {row.status === 'not_found' && !nfRes && (
                       <div className="flex items-center gap-1 justify-center">
                         <button
-                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept(''); setAddModalDocket(row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`); setAddModalDate(row.invoiceLine.date || '') }}
+                          onClick={() => {
+                            setAddModal({ row, index: i }); setAddModalDept('')
+                            setAddModalDocket(row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`)
+                            // Auto-populate date from invoice line, or fall back to invoice period start
+                            const ld = row.invoiceLine.date
+                            if (ld) {
+                              setAddModalDate(ld)
+                            } else if (parsedPeriod) {
+                              setAddModalDate(format(parsedPeriod.start, 'yyyy-MM-dd'))
+                            } else {
+                              setAddModalDate('')
+                            }
+                          }}
                           className="px-2 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 whitespace-nowrap"
                           title="Add this item to our system"
                         >
