@@ -303,6 +303,26 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
           order = candidates.find(o => o.guest_name?.toLowerCase().includes(name)) ?? candidates[0]
         }
       }
+      // Fallback: match orders added from reconciliation by price + date + type
+      if (!order) {
+        const lineNet = +line.net.toFixed(2)
+        order = orders.find(o => {
+          if (matchedOrderIds.has(o.id)) return false
+          if (o.order_type !== orderType) return false
+          if (!o.notes?.includes('Added from invoice reconciliation')) return false
+          if (Math.abs((o.total_price ?? 0) - lineNet) > 0.02) return false
+          // Match date (compare yyyy-MM-dd portion)
+          if (line.date) {
+            const parts = line.date.split('/')
+            if (parts.length === 3) {
+              let yr = parts[2]; if (yr.length === 2) yr = `20${yr}`
+              const lineISO = `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`
+              if (!o.created_at.startsWith(lineISO)) return false
+            }
+          }
+          return true
+        }) ?? null
+      }
       if (order) matchedOrderIds.add(order.id)
       const systemTotal = order ? computeOrderCost(order) : 0
       const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
@@ -807,7 +827,7 @@ export default function Reconciliation() {
     if (!addModalDept) return
     setAddModalSaving(true)
     try {
-      const docket = addModalDocket.trim() || row.invoiceLine.ticket || `INV-${Date.now()}`
+      const docket = addModalDocket.trim() || row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`
       const orderType = row.sectionType as OrderType
 
       // Set created_at within the invoice period so re-reconciliation finds this order
@@ -1396,7 +1416,7 @@ export default function Reconciliation() {
                     {row.status === 'not_found' && !nfRes && (
                       <div className="flex items-center gap-1 justify-center">
                         <button
-                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept(''); setAddModalDocket(row.invoiceLine.ticket || ''); setAddModalDate(row.invoiceLine.date || '') }}
+                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept(''); setAddModalDocket(row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`); setAddModalDate(row.invoiceLine.date || '') }}
                           className="px-2 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 whitespace-nowrap"
                           title="Add this item to our system"
                         >
@@ -1721,14 +1741,17 @@ export default function Reconciliation() {
               {/* Editable docket number and date */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Docket Number *</label>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Docket Number</label>
                   <input
                     type="text"
                     value={addModalDocket}
                     onChange={e => setAddModalDocket(e.target.value)}
-                    placeholder="e.g. 1234"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy/30"
+                    placeholder="Auto-generated if empty"
+                    className={`w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy/30 ${addModalDocket.startsWith('REC-') ? 'text-gray-400 italic' : ''}`}
                   />
+                  {addModalDocket.startsWith('REC-') && (
+                    <p className="text-[10px] text-gray-400 mt-0.5">Auto-generated — edit if you have the actual docket number</p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
@@ -1820,7 +1843,7 @@ export default function Reconciliation() {
                 </button>
                 <button
                   onClick={handleAddToSystem}
-                  disabled={!addModalDept || !addModalDocket.trim() || addModalSaving}
+                  disabled={!addModalDept || addModalSaving}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
                 >
                   {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
