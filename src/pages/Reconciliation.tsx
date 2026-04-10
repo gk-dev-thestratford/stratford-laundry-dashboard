@@ -385,13 +385,23 @@ export default function Reconciliation() {
   // Add to System modal
   const [addModal, setAddModal] = useState<{ row: ReconciliationRow; index: number } | null>(null)
   const [addModalDept, setAddModalDept] = useState('')
+  const [addModalDocket, setAddModalDocket] = useState('')
+  const [addModalDate, setAddModalDate] = useState('')
   const [addModalSaving, setAddModalSaving] = useState(false)
   const [departments, setDepartments] = useState<Department[]>([])
+  const [catalogueItems, setCatalogueItems] = useState<{ name: string; price: number | null; category: string }[]>([])
 
   // Fetch departments for "Add to System" form
   useEffect(() => {
     supabase.from('departments').select('*').eq('is_active', true).order('name').then(({ data }) => {
       if (data) setDepartments(data)
+    })
+  }, [])
+
+  // Fetch catalogue items for price comparison in Add to System modal
+  useEffect(() => {
+    supabase.from('item_catalogue').select('name, price, category').eq('is_active', true).then(({ data }) => {
+      if (data) setCatalogueItems(data)
     })
   }, [])
 
@@ -485,6 +495,7 @@ export default function Reconciliation() {
     setFile(null); setInvoice(null); setOrders([]); setResult(null)
     setError(''); setFilter('all'); setSaved(false); setBroaderSearch(false)
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
+    setAddModalDocket(''); setAddModalDate('')
     setChallengedItems(new Set()); setAddModal(null)
   }
 
@@ -791,25 +802,31 @@ export default function Reconciliation() {
     if (!addModalDept) return
     setAddModalSaving(true)
     try {
-      const docket = row.invoiceLine.ticket || `INV-${Date.now()}`
+      const docket = addModalDocket.trim() || row.invoiceLine.ticket || `INV-${Date.now()}`
       const orderType = row.sectionType as OrderType
 
       // Set created_at within the invoice period so re-reconciliation finds this order
       const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
 
-      // Parse line date (dd/MM/yy or dd/MM/yyyy UK format)
+      // Parse date from editable field (dd/MM/yy, dd/MM/yyyy, or yyyy-MM-dd format)
       let createdAt: string
-      const lineDate = row.invoiceLine.date
+      const lineDate = addModalDate.trim() || row.invoiceLine.date
       if (lineDate) {
-        const parts = lineDate.split('/')
-        if (parts.length === 3) {
-          const day = parts[0]
-          const month = parts[1]
-          let yr = parts[2]
-          if (yr.length === 2) yr = `20${yr}`
-          createdAt = `${yr}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00.000Z`
+        // Support yyyy-MM-dd (from date input) and dd/MM/yy (from invoice)
+        const isoMatch = lineDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+        if (isoMatch) {
+          createdAt = `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}T12:00:00.000Z`
         } else {
-          createdAt = period ? period.start.toISOString() : new Date().toISOString()
+          const parts = lineDate.split('/')
+          if (parts.length === 3) {
+            const day = parts[0]
+            const month = parts[1]
+            let yr = parts[2]
+            if (yr.length === 2) yr = `20${yr}`
+            createdAt = `${yr}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00.000Z`
+          } else {
+            createdAt = period ? period.start.toISOString() : new Date().toISOString()
+          }
         }
       } else {
         createdAt = period ? period.start.toISOString() : new Date().toISOString()
@@ -894,7 +911,7 @@ export default function Reconciliation() {
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, addModalDept, invoice, refetchAndReconcile])
+  }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile])
 
   // ── Action: Accept charge (acknowledge invoice-only item as valid) ──
   const handleAcceptCharge = useCallback((row: ReconciliationRow) => {
@@ -1374,7 +1391,7 @@ export default function Reconciliation() {
                     {row.status === 'not_found' && !nfRes && (
                       <div className="flex items-center gap-1 justify-center">
                         <button
-                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept('') }}
+                          onClick={() => { setAddModal({ row, index: i }); setAddModalDept(''); setAddModalDocket(row.invoiceLine.ticket || ''); setAddModalDate(row.invoiceLine.date || '') }}
                           className="px-2 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 whitespace-nowrap"
                           title="Add this item to our system"
                         >
@@ -1690,21 +1707,92 @@ export default function Reconciliation() {
               </p>
 
               {/* Invoice item details */}
-              <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-1">
-                <div className="flex justify-between"><span className="text-gray-500">Docket:</span><span className="font-mono font-medium">{addModal.row.invoiceLine.ticket}</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Date:</span><span>{addModal.row.invoiceLine.date}</span></div>
+              <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-2">
                 <div className="flex justify-between"><span className="text-gray-500">Description:</span><span className="text-right max-w-[250px] truncate">{addModal.row.invoiceLine.description}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Amount (NET):</span><span className="font-bold">{'\u00a3'}{addModal.row.invoiceLine.net.toFixed(2)}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Service Type:</span><span>{ORDER_TYPE_LABELS[addModal.row.sectionType as OrderType] ?? addModal.row.sectionType}</span></div>
-                {addModal.row.invoiceLine.items.length > 0 && (
-                  <div className="pt-1 border-t border-gray-200 mt-1">
-                    <span className="text-gray-500 text-xs">Items:</span>
-                    {addModal.row.invoiceLine.items.map((it, idx) => (
-                      <div key={idx} className="text-xs text-gray-700 pl-2">{it.quantity}x {it.name}</div>
-                    ))}
-                  </div>
-                )}
               </div>
+
+              {/* Editable docket number and date */}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Docket Number *</label>
+                  <input
+                    type="text"
+                    value={addModalDocket}
+                    onChange={e => setAddModalDocket(e.target.value)}
+                    placeholder="e.g. 1234"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy/30"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+                  <input
+                    type="date"
+                    value={(() => {
+                      // Convert dd/MM/yy to yyyy-MM-dd for the date input
+                      if (!addModalDate) return ''
+                      const parts = addModalDate.split('/')
+                      if (parts.length === 3) {
+                        let yr = parts[2]; if (yr.length === 2) yr = `20${yr}`
+                        return `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`
+                      }
+                      return addModalDate
+                    })()}
+                    onChange={e => setAddModalDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30"
+                  />
+                </div>
+              </div>
+
+              {/* Catalogue price comparison */}
+              {addModal.row.invoiceLine.items.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Price Comparison vs Catalogue</label>
+                  <div className="border border-gray-200 rounded-lg overflow-hidden">
+                    <table className="w-full text-xs">
+                      <thead><tr className="bg-gray-50 border-b border-gray-200">
+                        <th className="px-2 py-1.5 text-left font-medium text-gray-600">Item</th>
+                        <th className="px-2 py-1.5 text-right font-medium text-gray-600">Qty</th>
+                        <th className="px-2 py-1.5 text-right font-medium text-gray-600">Invoice</th>
+                        <th className="px-2 py-1.5 text-right font-medium text-gray-600">Catalogue</th>
+                        <th className="px-2 py-1.5 text-right font-medium text-gray-600">Diff</th>
+                      </tr></thead>
+                      <tbody>
+                        {addModal.row.invoiceLine.items.map((it, idx) => {
+                          const invoiceUnitPrice = addModal.row.invoiceLine.items.length === 1
+                            ? addModal.row.invoiceLine.net / it.quantity
+                            : null
+                          const catMatch = catalogueItems.find(c =>
+                            c.name.toLowerCase() === it.name.toLowerCase() ||
+                            it.name.toLowerCase().includes(c.name.toLowerCase()) ||
+                            c.name.toLowerCase().includes(it.name.toLowerCase())
+                          )
+                          const catPrice = catMatch?.price ?? null
+                          const diff = invoiceUnitPrice != null && catPrice != null
+                            ? Math.round((invoiceUnitPrice - catPrice) * 100) / 100
+                            : null
+                          return (
+                            <tr key={idx} className={`border-b border-gray-100 ${diff != null && Math.abs(diff) >= 0.01 ? 'bg-amber-50' : ''}`}>
+                              <td className="px-2 py-1.5 text-gray-700">{it.name}</td>
+                              <td className="px-2 py-1.5 text-right">{it.quantity}</td>
+                              <td className="px-2 py-1.5 text-right font-medium">
+                                {invoiceUnitPrice != null ? `\u00a3${invoiceUnitPrice.toFixed(2)}` : '\u2014'}
+                              </td>
+                              <td className="px-2 py-1.5 text-right font-medium">
+                                {catPrice != null ? `\u00a3${catPrice.toFixed(2)}` : <span className="text-gray-400">N/A</span>}
+                              </td>
+                              <td className={`px-2 py-1.5 text-right font-medium ${diff != null && Math.abs(diff) >= 0.01 ? 'text-amber-600' : 'text-green-600'}`}>
+                                {diff != null ? (diff >= 0 ? '+' : '') + `\u00a3${diff.toFixed(2)}` : '\u2014'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               {/* Department selection */}
               <div>
@@ -1727,7 +1815,7 @@ export default function Reconciliation() {
                 </button>
                 <button
                   onClick={handleAddToSystem}
-                  disabled={!addModalDept || addModalSaving}
+                  disabled={!addModalDept || !addModalDocket.trim() || addModalSaving}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
                 >
                   {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
