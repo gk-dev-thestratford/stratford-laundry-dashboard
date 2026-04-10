@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -9,6 +10,7 @@ import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/sync_service.dart';
+import '../../widgets/success_toast.dart';
 import '../../widgets/sync_indicator.dart';
 
 class AdminDashboardScreen extends ConsumerStatefulWidget {
@@ -20,6 +22,7 @@ class AdminDashboardScreen extends ConsumerStatefulWidget {
 
 class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> with SingleTickerProviderStateMixin {
   late TabController _tabController;
+  StreamSubscription<void>? _syncSub;
   List<Map<String, dynamic>> _orders = [];
   Map<String, int> _counts = {};
   bool _isLoading = true;
@@ -55,6 +58,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     super.initState();
     _tabController = TabController(length: _tabs.length, vsync: this, initialIndex: _kPending);
     _tabController.addListener(_onTabChanged);
+    // Reload orders + counts whenever background sync pulls fresh data from Supabase
+    _syncSub = SyncService.instance.onReferenceDataSynced.listen((_) {
+      _loadData(silent: true);
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(adminProvider.notifier).refreshActivity();
     });
@@ -63,6 +70,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
   @override
   void dispose() {
+    _syncSub?.cancel();
     _tabController.dispose();
     super.dispose();
   }
@@ -162,6 +170,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     }
   }
 
+  /// Animated thumbs-up toast — small, non-intrusive, appears in bottom-right
+  /// corner so it doesn't block the workflow.
+  void _showStatusSnackBar(String message) {
+    SuccessToast.show(context, message: message);
+  }
+
   void _logout() {
     SyncService.instance.fullSync();
     ref.read(adminProvider.notifier).logout();
@@ -196,9 +210,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Order ${AppLabels.statusLabels[newStatus]}')),
-      );
+      _showStatusSnackBar('Order ${AppLabels.statusLabels[newStatus]}');
     }
 
     // Persist to local SQLite + queue for Supabase push on exit
@@ -215,6 +227,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     await db.addToSyncQueue('orders', orderId, 'update',
         jsonEncode({'id': orderId, 'status': newStatus}));
+
+    // Push immediately — don't wait for the 30s timer
+    SyncService.instance.pushPendingNow();
   }
 
   Future<void> _showRejectDialog(String orderId) async {
@@ -297,9 +312,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$count order(s) marked as Collected')),
-      );
+      _showStatusSnackBar('$count order(s) marked as Collected');
     }
 
     for (final orderId in collectedIds) {
@@ -320,6 +333,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       await db.addToSyncQueue('orders', orderId, 'update',
           jsonEncode({'id': orderId, 'status': finalStatus}));
     }
+
+    // Push immediately — don't wait for the 30s timer
+    SyncService.instance.pushPendingNow();
   }
 
   /// For napkin items: logs OUT to the linen ledger.
@@ -451,10 +467,15 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       return;
     }
 
-    // Build controllers for each item
+    // Build controllers for each item.
+    // Pre-fill napkin items as fully received — they're pool-tracked,
+    // so staff only needs to count non-napkin items.
     final controllers = <String, TextEditingController>{};
     for (final item in items) {
-      controllers[item['id'] as String] = TextEditingController(text: '0');
+      final name = (item['item_name'] as String? ?? '').toLowerCase();
+      final isNapkin = name.contains('napkin');
+      final prefill = isNapkin ? '${item['quantity_sent']}' : '0';
+      controllers[item['id'] as String] = TextEditingController(text: prefill);
     }
 
     if (!mounted) return;
@@ -497,12 +518,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(
-          hasOutstanding
-              ? 'Partial receipt — outstanding items on new ticket'
-              : 'All items received — order returned',
-        )),
+      _showStatusSnackBar(
+        hasOutstanding
+            ? 'Partial receipt — outstanding items on new ticket'
+            : 'All items received — order returned',
       );
     }
 
@@ -556,6 +575,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
             jsonEncode(outstandingOrder));
       }
     }
+
+    // Push immediately — don't wait for the 30s timer
+    SyncService.instance.pushPendingNow();
   }
 
   @override
@@ -1157,7 +1179,7 @@ class _OrderCard extends StatelessWidget {
                       GestureDetector(
                         onTap: () {}, // absorb tap to prevent InkWell from firing
                         child: Align(
-                          alignment: Alignment.centerLeft,
+                          alignment: Alignment.center,
                           child: SizedBox(
                             height: 36,
                             child: OutlinedButton.icon(
@@ -1333,6 +1355,7 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
               final name = item['item_name'] as String;
               final sent = item['quantity_sent'] as int;
               final controller = widget.controllers[id]!;
+              final isNapkin = name.toLowerCase().contains('napkin');
 
               return Padding(
                 padding: EdgeInsets.symmetric(vertical: AppSpacing.sm),
@@ -1343,7 +1366,10 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(name, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium)),
-                          Text('Sent: $sent', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.grey600)),
+                          if (isNapkin)
+                            Text('Pool tracked — auto-filled', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.success, fontWeight: AppTextStyles.medium))
+                          else
+                            Text('Sent: $sent', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.grey600)),
                         ],
                       ),
                     ),

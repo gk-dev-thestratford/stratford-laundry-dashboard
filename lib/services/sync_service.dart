@@ -13,9 +13,17 @@ class SyncService {
   SyncService._();
 
   final _stateController = StreamController<SyncState>.broadcast();
-  Stream<SyncState> get stateStream => _stateController.stream;
+  /// Stream that replays the current state to new listeners, then emits changes.
+  Stream<SyncState> get stateStream async* {
+    yield _currentState;
+    yield* _stateController.stream;
+  }
   SyncState _currentState = SyncState.offline;
   SyncState get currentState => _currentState;
+
+  /// Human-readable debug line — shown in sync indicator on long-press.
+  String _debugInfo = '';
+  String get debugInfo => _debugInfo;
 
   /// Emitted after reference data (departments, items, admins) is pulled from Supabase.
   /// Providers should invalidate their caches when this fires.
@@ -27,6 +35,11 @@ class SyncService {
   DateTime? _lastCleanup;
   bool _isPushing = false;
 
+  /// Track consecutive failures per sync-queue item ID.
+  /// After [_maxRetries] failures, the item is marked as synced (abandoned).
+  final Map<int, int> _failCounts = {};
+  static const _maxRetries = 3;
+
   /// How often to pull reference data from Supabase (safety-net interval)
   static const _refPullInterval = Duration(seconds: 90);
 
@@ -34,10 +47,13 @@ class SyncService {
   static const _timerInterval = Duration(seconds: 30);
 
   void initialize() {
+    _debugInfo = 'init: supa=${SupabaseService.instance.isInitialized}, conn=${ConnectivityService.instance.currentStatus}';
+    debugPrint('[Sync] $_debugInfo');
+
     // Listen to connectivity changes
     ConnectivityService.instance.statusStream.listen((status) {
+      debugPrint('[Sync] Connectivity changed: $status');
       if (status == ConnectivityStatus.online) {
-        // Connectivity restored — do a full sync immediately
         _fullSync();
       } else {
         _updateState(SyncState.offline);
@@ -71,6 +87,8 @@ class SyncService {
   /// Force a full sync — pull reference data + push pending items.
   /// Can be called from UI (e.g. refresh button).
   Future<void> fullSync() async {
+    // Reset the pushing guard in case it got stuck
+    _isPushing = false;
     return _fullSync();
   }
 
@@ -78,12 +96,41 @@ class SyncService {
   /// Called on connectivity restore and on first initialize.
   Future<void> _fullSync() async {
     if (!SupabaseService.instance.isInitialized) {
+      _debugInfo = 'Supabase not initialized';
+      debugPrint('[Sync] $_debugInfo');
       _updateState(SyncState.synced);
       return;
     }
 
+    _updateState(SyncState.syncing);
+
+    // Clear any stuck queue items older than 1 hour before pushing
+    await _abandonStuckItems();
+
     await _pushPending();
     await _pullReferenceData();
+
+    // Re-check pending state after both push and pull complete.
+    final remaining = await DatabaseService.instance.getPendingSyncItems();
+    _debugInfo = 'sync done: ${remaining.length} pending';
+    debugPrint('[Sync] $_debugInfo');
+    _updateState(remaining.isEmpty ? SyncState.synced : SyncState.pending);
+  }
+
+  /// Mark sync queue items older than 1 hour as abandoned — they'll never succeed.
+  Future<void> _abandonStuckItems() async {
+    final db = DatabaseService.instance;
+    final cutoff = DateTime.now().subtract(const Duration(hours: 1)).toIso8601String();
+    final dbInst = await db.database;
+    final abandoned = await dbInst.update(
+      'sync_queue',
+      {'synced': 1},
+      where: 'synced = 0 AND created_at < ?',
+      whereArgs: [cutoff],
+    );
+    if (abandoned > 0) {
+      debugPrint('[Sync] Abandoned $abandoned stuck queue items (older than 1h)');
+    }
   }
 
   /// Periodic timer handler: only does work when needed.
@@ -267,14 +314,19 @@ class SyncService {
           await DatabaseService.instance.markSynced(item['id'] as int);
           debugPrint('[Push] Synced successfully');
         } catch (e) {
-          debugPrint('[Push] FAILED $operation $tableName: $e');
-          // Mark as synced if it's a data error (won't succeed on retry)
+          final itemId = item['id'] as int;
+          final count = (_failCounts[itemId] ?? 0) + 1;
+          _failCounts[itemId] = count;
+          debugPrint('[Push] FAILED $operation $tableName (attempt $count/$_maxRetries): $e');
+
+          // Give up after max retries OR on known permanent data errors
           final isDataError = e.toString().contains('22P02') || // invalid UUID
               e.toString().contains('23') || // integrity constraint
               e.toString().contains('42');   // syntax/schema error
-          if (isDataError) {
-            await DatabaseService.instance.markSynced(item['id'] as int);
-            debugPrint('[Push] Marked as synced (permanent failure, won\'t retry)');
+          if (isDataError || count >= _maxRetries) {
+            await DatabaseService.instance.markSynced(itemId);
+            _failCounts.remove(itemId);
+            debugPrint('[Push] Abandoned after ${isDataError ? 'data error' : '$count failures'}');
           }
         }
       }

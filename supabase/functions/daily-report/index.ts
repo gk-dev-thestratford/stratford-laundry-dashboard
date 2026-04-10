@@ -103,8 +103,22 @@ function buildCollectionReport(orders: any[]) {
   `;
 }
 
+// ── Fetch today's linen napkin returns from ledger ──
+async function fetchTodaysNapkinReturns() {
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const { data } = await supabase
+    .from("linen_ledger")
+    .select("*")
+    .eq("direction", "in")
+    .eq("item_name", "Linen Napkins")
+    .gte("created_at", today.toISOString())
+    .order("created_at", { ascending: false });
+  return data || [];
+}
+
 // ── Build daily receiving report ──
-function buildReceivedReport(orders: any[]) {
+function buildReceivedReport(orders: any[], napkinReturns: any[] = []) {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
 
   let grandSent = 0;
@@ -166,6 +180,31 @@ function buildReceivedReport(orders: any[]) {
             <td style="padding:10px 8px;text-align:center;color:${hasDiscrepancies ? "#C62828" : "#2E7D32"}">${hasDiscrepancies ? grandOutstanding : "✓"}</td>
           </tr>
         </table>
+
+        ${napkinReturns.length > 0 ? `
+        <div style="margin-top:24px;padding-top:16px;border-top:2px solid #C9A84C">
+          <h3 style="color:#1B2A4A;margin:0 0 12px;font-size:15px">Linen Napkins — Returns Today</h3>
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <tr style="background:#C9A84C;color:white">
+              <th style="padding:8px;text-align:left">Time</th>
+              <th style="padding:8px;text-align:center">Quantity</th>
+              <th style="padding:8px;text-align:left">Note</th>
+              <th style="padding:8px;text-align:left">Recorded By</th>
+            </tr>
+            ${napkinReturns.map((r: any) => `<tr style="border-bottom:1px solid #eee">
+              <td style="padding:8px">${new Date(r.created_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</td>
+              <td style="padding:8px;text-align:center;font-weight:bold">${r.quantity}</td>
+              <td style="padding:8px">${r.note || "—"}</td>
+              <td style="padding:8px">${r.recorded_by || "—"}</td>
+            </tr>`).join("")}
+            <tr style="background:#f5f5f5;font-weight:bold">
+              <td style="padding:8px">Total Returned</td>
+              <td style="padding:8px;text-align:center">${napkinReturns.reduce((s: number, r: any) => s + (r.quantity || 0), 0)}</td>
+              <td colspan="2"></td>
+            </tr>
+          </table>
+        </div>
+        ` : ""}
       </div>
 
       <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
@@ -192,12 +231,15 @@ serve(async (_req: Request) => {
       }
     }
 
-    // Fetch orders currently in received status
+    // Fetch orders currently in received status + today's napkin returns
     const receivedOrders = await fetchOrdersByStatus("received");
-    if (receivedOrders.length > 0) {
-      const reportHtml = buildReceivedReport(receivedOrders);
+    const napkinReturns = await fetchTodaysNapkinReturns();
+    if (receivedOrders.length > 0 || napkinReturns.length > 0) {
+      const reportHtml = buildReceivedReport(receivedOrders, napkinReturns);
       const today = new Date().toLocaleDateString("en-GB");
-      const subject = `Daily Receiving Report — ${today} (${receivedOrders.length} order${receivedOrders.length > 1 ? "s" : ""})`;
+      const napkinTotal = napkinReturns.reduce((s: number, r: any) => s + (r.quantity || 0), 0);
+      const napkinNote = napkinReturns.length > 0 ? ` + ${napkinTotal} napkins returned` : "";
+      const subject = `Daily Receiving Report — ${today} (${receivedOrders.length} order${receivedOrders.length !== 1 ? "s" : ""}${napkinNote})`;
       for (const email of REPORT_EMAILS) {
         await sendEmail(email, subject, reportHtml);
         emailsSent.push(`received:${email}`);

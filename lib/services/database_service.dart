@@ -779,11 +779,26 @@ class DatabaseService {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
 
-    return db.delete(
+    // Clean old completed items
+    final cleaned = await db.delete(
       'sync_queue',
       where: 'synced = 1 AND created_at < ?',
       whereArgs: [cutoff],
     );
+
+    // Also abandon stuck unsynced items older than 2 days — they'll never succeed
+    final stuckCutoff = DateTime.now().subtract(const Duration(days: 2)).toIso8601String();
+    final abandoned = await db.update(
+      'sync_queue',
+      {'synced': 1},
+      where: 'synced = 0 AND created_at < ?',
+      whereArgs: [stuckCutoff],
+    );
+    if (abandoned > 0) {
+      debugPrint('[Sync] Abandoned $abandoned stuck queue items older than 2 days');
+    }
+
+    return cleaned + abandoned;
   }
 
   /// Returns counts of data that can be cleaned up for display in admin UI.

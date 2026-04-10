@@ -8,6 +8,7 @@ import '../../theme/app_theme.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/sync_service.dart';
+import '../../widgets/success_toast.dart';
 
 class NapkinReturnsScreen extends ConsumerStatefulWidget {
   const NapkinReturnsScreen({super.key});
@@ -114,9 +115,7 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
     await _loadData();
 
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$qty napkins received — logged to pool')),
-      );
+      SuccessToast.show(context, message: '$qty napkins logged');
     }
   }
 

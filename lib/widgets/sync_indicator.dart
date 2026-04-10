@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../theme/app_theme.dart';
 import '../services/connectivity_service.dart';
+import '../services/supabase_service.dart';
 import '../services/sync_service.dart';
 
 /// Resolves the current sync visual state from connectivity + sync providers.
@@ -45,6 +46,20 @@ class SyncIndicator extends ConsumerWidget {
       onTap: () async {
         await SyncService.instance.fullSync();
         onSynced?.call();
+      },
+      onLongPress: () {
+        // Debug overlay — shows internal sync state for troubleshooting
+        final info = SyncService.instance.debugInfo;
+        final conn = ConnectivityService.instance.currentStatus;
+        final supa = 'supa=${SupabaseService.instance.isInitialized}';
+        showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Sync Debug'),
+            content: Text('Status: ${s.label}\nConnectivity: $conn\n$supa\n$info'),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+          ),
+        );
       },
       child: Container(
         padding: const EdgeInsets.symmetric(

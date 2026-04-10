@@ -10,6 +10,7 @@ import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
+import '../../widgets/success_toast.dart';
 
 class AdminOrderDetailScreen extends ConsumerStatefulWidget {
   final String orderId;
@@ -182,9 +183,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     await _loadOrder();
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Status updated to ${AppLabels.statusLabels[finalStatus]}')),
-      );
+      SuccessToast.show(context, message: '${AppLabels.statusLabels[finalStatus]}');
     }
   }
 
@@ -326,13 +325,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     await _loadOrder();
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(
-          hasOutstanding
-              ? 'Partial receipt recorded — outstanding items on new ticket'
-              : 'All items received — order completed',
-        )),
-      );
+      SuccessToast.show(context, message: hasOutstanding ? 'Partial receipt' : 'All received');
     }
   }
 
@@ -736,9 +729,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           jsonEncode({'id': widget.orderId}));
       SyncService.instance.pushPendingNow();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Order deleted')),
-        );
+        SuccessToast.show(context, message: 'Deleted');
         context.pop();
       }
     }
