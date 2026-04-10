@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
-import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send } from 'lucide-react'
+import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
@@ -40,6 +40,7 @@ interface ReconciliationResult {
   rows: ReconciliationRow[]
   topUpCharges: InvoiceLine[]
   missingFromInvoice: Order[]
+  matchedOrderIds: string[]
   stats: { matched: number; priceMismatch: number; notFound: number; missing: number }
   invoiceTotal: number
   systemTotal: number
@@ -81,7 +82,7 @@ function notFoundKey(line: InvoiceLine): string {
 function computeOrderCost(o: Order): number {
   if (o.order_items && o.order_items.length > 0) {
     const t = o.order_items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
-    if (t > 0) return t
+    if (t > 0) return Math.round(t * 100) / 100
   }
   return o.total_price ?? 0
 }
@@ -269,11 +270,14 @@ function buildDepartmentDisplayRows(
   return displayRows
 }
 
-function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null): ReconciliationResult {
-  const byDocket = new Map<string, Order>()
+function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null, strictPeriod?: { start: Date; end: Date } | null): ReconciliationResult {
+  // Issue 2: Use array map to handle duplicate docket numbers
+  const byDocket = new Map<string, Order[]>()
   const byRoom = new Map<string, Order[]>()
   for (const o of orders) {
-    byDocket.set(o.docket_number.trim(), o)
+    const dk = o.docket_number.trim()
+    if (!byDocket.has(dk)) byDocket.set(dk, [])
+    byDocket.get(dk)!.push(o)
     if (o.room_number) {
       if (!byRoom.has(o.room_number)) byRoom.set(o.room_number, [])
       byRoom.get(o.room_number)!.push(o)
@@ -288,9 +292,11 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     const orderType = sectionTypeToOrderType(section.type)
     for (const line of section.lines) {
       if (line.isTopUp) { topUpCharges.push(line); continue }
-      let order = byDocket.get(line.ticket.trim()) ?? null
+      // Issue 2: Pick first unclaimed order with this docket
+      const docketCandidates = byDocket.get(line.ticket.trim()) ?? []
+      let order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
       if (!order && section.type === 'guest' && line.ticket) {
-        const candidates = byRoom.get(line.ticket) ?? []
+        const candidates = (byRoom.get(line.ticket) ?? []).filter(o => !matchedOrderIds.has(o.id))
         if (candidates.length === 1) order = candidates[0]
         else if (candidates.length > 1 && line.guestInfo) {
           const name = line.guestInfo.replace(/[()]/g, '').toLowerCase()
@@ -306,19 +312,23 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     }
   }
 
+  // Issue 1: Use strictPeriod (original invoice period) for "In System Only" filtering
+  // so broader-search orders from the previous month don't appear as missing
+  const missingPeriod = strictPeriod ?? period
   const invoiceOrderTypes = new Set(invoice.sections.map(s => sectionTypeToOrderType(s.type)))
   const missingFromInvoice = orders.filter(o => {
     if (matchedOrderIds.has(o.id)) return false
     if (!invoiceOrderTypes.has(o.order_type)) return false
-    if (period) {
+    if (missingPeriod) {
       const orderDate = new Date(o.created_at)
-      if (orderDate < period.start || orderDate > period.end) return false
+      if (orderDate < missingPeriod.start || orderDate > missingPeriod.end) return false
     }
     return true
   })
 
   return {
     rows, topUpCharges, missingFromInvoice,
+    matchedOrderIds: Array.from(matchedOrderIds),
     stats: {
       matched: rows.filter(r => r.status === 'matched').length,
       priceMismatch: rows.filter(r => r.status === 'price_mismatch').length,
@@ -352,6 +362,7 @@ export default function Reconciliation() {
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
   const [hskLinenNames, setHskLinenNames] = useState<Set<string>>(new Set())
+  const [broaderSearch, setBroaderSearch] = useState(false)
 
   // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
   useEffect(() => {
@@ -395,6 +406,11 @@ export default function Reconciliation() {
 
   useEffect(() => { loadHistory() }, [loadHistory])
 
+  // Issue 1: Re-trigger reconciliation when broader search toggle changes
+  useEffect(() => {
+    if (invoice) refetchAndReconcile()
+  }, [broaderSearch]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Shared re-fetch + re-reconcile helper ──
   const refetchAndReconcile = useCallback(async () => {
     if (!invoice) return
@@ -402,18 +418,27 @@ export default function Reconciliation() {
     setParsedPeriod(period)
     let fetchedOrders: Order[] = []
     if (period) {
+      // Issue 1: If broader search is ON, extend start date back 1 month
+      let fetchStart = period.start
+      if (broaderSearch) {
+        fetchStart = new Date(period.start)
+        fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
+      }
       const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-        .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
+        .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
+        .is('reconciliation_id', null)
         .order('created_at', { ascending: true })
       fetchedOrders = data ?? []
     } else {
       const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+        .is('reconciliation_id', null)
         .order('created_at', { ascending: false }).limit(500)
       fetchedOrders = data ?? []
     }
     setOrders(fetchedOrders)
-    setResult(reconcile(invoice, fetchedOrders, period))
-  }, [invoice])
+    // Pass original period as strictPeriod so broader-search orders don't appear in "In System Only"
+    setResult(reconcile(invoice, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
+  }, [invoice, broaderSearch])
 
   async function handleFile(f: File) {
     if (!f.type.includes('pdf')) { setError('Please upload a PDF file'); return }
@@ -433,17 +458,24 @@ export default function Reconciliation() {
       setParsedPeriod(period)
       let fetchedOrders: Order[] = []
       if (period) {
+        let fetchStart = period.start
+        if (broaderSearch) {
+          fetchStart = new Date(period.start)
+          fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
+        }
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .gte('created_at', period.start.toISOString()).lte('created_at', period.end.toISOString())
+          .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
+          .is('reconciliation_id', null)
           .order('created_at', { ascending: true })
         fetchedOrders = data ?? []
       } else {
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .is('reconciliation_id', null)
           .order('created_at', { ascending: false }).limit(500)
         fetchedOrders = data ?? []
       }
       setOrders(fetchedOrders)
-      setResult(reconcile(parsed, fetchedOrders, period))
+      setResult(reconcile(parsed, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to parse PDF')
     } finally { setParsing(false) }
@@ -451,7 +483,7 @@ export default function Reconciliation() {
 
   function reset() {
     setFile(null); setInvoice(null); setOrders([]); setResult(null)
-    setError(''); setFilter('all'); setSaved(false)
+    setError(''); setFilter('all'); setSaved(false); setBroaderSearch(false)
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setChallengedItems(new Set()); setAddModal(null)
   }
@@ -492,7 +524,7 @@ export default function Reconciliation() {
       console.error('Failed to upload PDF report:', e)
     }
 
-    const { error: saveErr } = await supabase.from('reconciliations').insert({
+    const { data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert({
       invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
       invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
       invoice_net: +result.invoiceTotal.toFixed(2), invoice_gross: +(result.invoiceTotal * 1.2).toFixed(2),
@@ -507,8 +539,17 @@ export default function Reconciliation() {
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
         allocatedTopUp: d.allocatedTopUp, totalCostNet: d.totalCostNet, totalCostGross: d.totalCostGross,
       })),
-    })
+    }).select('id').single()
     if (saveErr) console.error('Failed to save reconciliation:', saveErr)
+
+    // Issue 4: Mark matched orders as reconciled so they don't appear in future reconciliations
+    if (savedRec && result.matchedOrderIds.length > 0) {
+      const { error: stampErr } = await supabase.from('orders')
+        .update({ reconciliation_id: savedRec.id })
+        .in('id', result.matchedOrderIds)
+      if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
+    }
+
     setSaving(false); setSaved(true); loadHistory()
   }, [result, invoice, file, loadHistory])
 
@@ -701,19 +742,20 @@ export default function Reconciliation() {
       if (items.length > 0) {
         const totalQty = items.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
         if (totalQty > 0) {
-          // Calculate base per-unit price (2dp) and distribute
-          const basePrice = Math.floor(invoiceNet / totalQty * 100) / 100
-          let runningTotal = 0
+          // Issue 3: Use Math.round (not floor) and penny-precise remainder for last item
+          const basePrice = Math.round(invoiceNet / totalQty * 100) / 100
+          let runningPennies = 0
           for (let idx = 0; idx < items.length; idx++) {
             const item = items[idx]
             const qty = item.quantity_sent ?? 0
             let price: number
             if (idx === items.length - 1) {
-              // Last item absorbs rounding remainder
-              price = +((invoiceNet - runningTotal) / qty).toFixed(2)
+              // Last item absorbs rounding remainder (computed in pennies to avoid fp drift)
+              const remainderPennies = Math.round(invoiceNet * 100) - runningPennies
+              price = Math.round(remainderPennies / qty) / 100
             } else {
               price = basePrice
-              runningTotal += +(price * qty).toFixed(2)
+              runningPennies += Math.round(price * qty * 100)
             }
             await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
           }
@@ -792,16 +834,16 @@ export default function Reconciliation() {
       // Create order items from parsed invoice line items
       if (newOrder && row.invoiceLine.items.length > 0) {
         const totalItemQty = row.invoiceLine.items.reduce((s, it) => s + it.quantity, 0)
-        const basePrice = totalItemQty > 0 ? Math.floor(row.invoiceLine.net / totalItemQty * 100) / 100 : row.invoiceLine.net
-        let runningTotal = 0
+        const basePrice = totalItemQty > 0 ? Math.round(row.invoiceLine.net / totalItemQty * 100) / 100 : row.invoiceLine.net
+        let runningPennies = 0
         const itemInserts = row.invoiceLine.items.map((it, idx) => {
           let price: number
           if (idx === row.invoiceLine.items.length - 1) {
-            // Last item absorbs rounding remainder
-            price = +((row.invoiceLine.net - runningTotal) / it.quantity).toFixed(2)
+            const remainderPennies = Math.round(row.invoiceLine.net * 100) - runningPennies
+            price = Math.round(remainderPennies / it.quantity) / 100
           } else {
             price = basePrice
-            runningTotal += +(price * it.quantity).toFixed(2)
+            runningPennies += Math.round(price * it.quantity * 100)
           }
           return {
             order_id: newOrder.id,
@@ -1124,7 +1166,30 @@ export default function Reconciliation() {
         <div><span className="text-gray-500">Sections:</span> <span className="font-medium">{invoice.sections.map(s => s.name).join(', ')}</span></div>
         <div><span className="text-gray-500">Lines:</span> <span className="font-medium">{invoice.sections.reduce((s, sec) => s + sec.lines.length, 0)}</span></div>
         <div><span className="text-gray-500">System orders:</span> <span className="font-medium">{orders.length}</span></div>
+        {/* Issue 1: Broader search toggle */}
+        <div className="flex items-center gap-2 ml-auto">
+          <Search className="w-3.5 h-3.5 text-gray-400" />
+          <span className="text-xs text-gray-500">Broader search (-1 month)</span>
+          <button
+            onClick={() => setBroaderSearch(prev => !prev)}
+            className={`relative w-9 h-5 rounded-full transition-colors ${broaderSearch ? 'bg-navy' : 'bg-gray-300'}`}
+          >
+            <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${broaderSearch ? 'translate-x-4' : ''}`} />
+          </button>
+        </div>
       </div>
+
+      {/* Issue 4: Warning if this invoice was already reconciled */}
+      {history.some(h => h.invoice_number === invoice.invoiceNumber) && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex items-center gap-3">
+          <AlertTriangle className="w-5 h-5 text-blue-500 flex-shrink-0" />
+          <p className="text-sm text-blue-800">
+            This invoice (<span className="font-medium">{invoice.invoiceNumber}</span>) was previously reconciled on{' '}
+            <span className="font-medium">{format(new Date(history.find(h => h.invoice_number === invoice.invoiceNumber)!.created_at), 'dd MMM yyyy')}</span>.
+            Previously matched orders are excluded from this reconciliation.
+          </p>
+        </div>
+      )}
 
       {/* Parse integrity warning */}
       {parsedVsStatedGap > 1 && (

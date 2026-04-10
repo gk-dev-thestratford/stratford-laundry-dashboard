@@ -46,6 +46,7 @@ export interface Order {
   created_at: string
   updated_at: string
   synced_at: string | null
+  reconciliation_id: string | null
   // Joined
   department?: Department
   order_items?: OrderItem[]
