@@ -82,7 +82,15 @@ function notFoundKey(line: InvoiceLine): string {
 function computeOrderCost(o: Order): number {
   if (o.order_items && o.order_items.length > 0) {
     const t = o.order_items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
-    if (t > 0) return Math.round(t * 100) / 100
+    if (t > 0) {
+      const itemTotal = Math.round(t * 100) / 100
+      // If total_price was explicitly set (e.g. from invoice update) and differs from
+      // item recalculation, trust total_price — item prices may not have saved (RLS)
+      if (o.total_price != null && o.total_price > 0 && Math.abs(itemTotal - o.total_price) > 0.01) {
+        return o.total_price
+      }
+      return itemTotal
+    }
   }
   return o.total_price ?? 0
 }
@@ -771,7 +779,6 @@ export default function Reconciliation() {
       const invoiceNet = row.invoiceLine.net
 
       if (items.length === 0) {
-        // No items — just update the total price directly
         const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
         if (orderErr) {
           setPriceUpdateError(`Docket ${docket}: Failed to update order total — ${orderErr.message}`)
@@ -785,7 +792,6 @@ export default function Reconciliation() {
       const totalQty = validItems.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
 
       if (totalQty === 0) {
-        // All items have zero quantity — cannot distribute price, update total only
         setPriceUpdateError(`Docket ${docket}: All items have zero quantity — updated total price only`)
         await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
         await refetchAndReconcile()
@@ -806,12 +812,25 @@ export default function Reconciliation() {
           price = basePrice
           runningPennies += Math.round(price * qty * 100)
         }
-        const { error: itemErr } = await supabase.from('order_items').update({ price_at_time: price }).eq('id', item.id)
+        const { error: itemErr, data: updatedRows } = await supabase.from('order_items')
+          .update({ price_at_time: price }).eq('id', item.id).select('id')
         if (itemErr) errors.push(`Item "${item.item_name}": ${itemErr.message}`)
+        else if (!updatedRows || updatedRows.length === 0) errors.push(`Item "${item.item_name}": update had no effect (possible RLS policy)`)
       }
 
       const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
       if (orderErr) errors.push(`Order total: ${orderErr.message}`)
+
+      // Verify: re-fetch items and check the computed total actually matches
+      const { data: verifyItems } = await supabase.from('order_items').select('*').eq('order_id', orderId)
+      if (verifyItems) {
+        const verifyTotal = Math.round(verifyItems.reduce((s: number, i: any) =>
+          s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0) * 100) / 100
+        const expectedTotal = +invoiceNet.toFixed(2)
+        if (Math.abs(verifyTotal - expectedTotal) > 0.01) {
+          errors.push(`Verification failed: items sum to £${verifyTotal.toFixed(2)} but expected £${expectedTotal.toFixed(2)}. Item prices may not have saved.`)
+        }
+      }
 
       if (errors.length > 0) {
         setPriceUpdateError(`Docket ${docket}: ${errors.join('; ')}`)
