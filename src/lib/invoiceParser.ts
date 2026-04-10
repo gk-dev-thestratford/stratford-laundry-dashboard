@@ -67,7 +67,8 @@ function mergeSplitLines(lines: string[]): string[] {
       const prev = result[result.length - 1]
       // If the previous line has no £ signs, it's likely a split description
       if (!/£/.test(prev) && prev.length < 120
-        && !/^(DATE|TICKET|NET|VAT|GROSS|Invoice|Account|Company|Goldstar|Sort|National)/i.test(prev)) {
+        && !/^(DATE|TICKET|NET|VAT|GROSS|Invoice|Account|Company|Goldstar|Sort|National)/i.test(prev)
+        && !/^(Staff|Guest|Napkins?|Table\s*Cloths?|Bathrobes?|HSK\b)/i.test(prev)) {
         result[result.length - 1] = (prev + ' ' + line).replace(/\s+/g, ' ').trim()
         continue
       }
