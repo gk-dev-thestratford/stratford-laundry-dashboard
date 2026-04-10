@@ -331,6 +331,9 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
+  // Track section totals from "Total MM/YY" lines for informational line detection
+  const sectionTotals = new Map<InvoiceSection, number>()
+
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]
 
@@ -343,6 +346,12 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
 
     const grossM = line.match(/^Total\s+£\s*([\d,]+\.\d{2})/i)
     if (grossM) totalGross = parseFloat(grossM[1].replace(',', ''))
+
+    // Capture section total (e.g. "Total 03/26 11072x Napkins £ 2,226.97 £445.39 £2,672.36")
+    const sectionTotalM = line.match(/^Total\s+\d{2}\/\d{2}.*£\s*([\d,]+\.\d{2})\s+£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}/i)
+    if (sectionTotalM && currentSection) {
+      sectionTotals.set(currentSection, parseFloat(sectionTotalM[1].replace(',', '')))
+    }
 
     // Section header
     const sectionType = detectSection(line)
@@ -368,6 +377,24 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
       invoiceLine.sectionType = currentSection.type
       currentSection.lines.push(invoiceLine)
       lastDate = parsedDate
+    }
+  }
+
+  // Post-process: remove informational lines covered by minimum charges
+  // If a section's line sum exceeds the section total, find and remove the line(s)
+  // whose NET accounts for the difference (e.g. napkin usage lines covered by weekly minimum)
+  for (const section of sections) {
+    const sectionTotal = sectionTotals.get(section)
+    if (sectionTotal == null) continue
+    const lineSum = Math.round(section.lines.reduce((s, l) => s + l.net, 0) * 100) / 100
+    const excess = Math.round((lineSum - sectionTotal) * 100) / 100
+    if (excess > 0.01) {
+      // Find a line whose NET matches the excess — it's an informational/minimum-covered line
+      const idx = section.lines.findIndex(l => Math.abs(l.net - excess) < 0.02)
+      if (idx !== -1) {
+        console.log(`[Parser] Removing informational line covered by minimum: ${section.lines[idx].description} £${section.lines[idx].net} (section total £${sectionTotal}, line sum £${lineSum})`)
+        section.lines.splice(idx, 1)
+      }
     }
   }
 
