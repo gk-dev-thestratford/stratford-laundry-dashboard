@@ -45,6 +45,12 @@ const LIGHT_GRAY = '#F3F4F6'
 
 // ── Generator ──
 
+export interface UniformMinWeek {
+  dateRange: string
+  items: { key: string; sent: number; topUp: number; min: number }[]
+  topUpNet: number
+}
+
 export interface NapkinDeptAllocation {
   deptName: string
   totalSent: number
@@ -58,7 +64,8 @@ export function generateReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
-  napkinDeptAllocation?: NapkinDeptAllocation[]
+  napkinDeptAllocation?: NapkinDeptAllocation[],
+  uniformMinWeeks?: UniformMinWeek[]
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
@@ -357,6 +364,44 @@ export function generateReconciliationPdf(
     })
   }
 
+  // ── Chef Uniform Minimum Usage ──
+  if (uniformMinWeeks && uniformMinWeeks.length > 0) {
+    y = (doc as any).lastAutoTable?.finalY ?? y
+    if (y > doc.internal.pageSize.getHeight() - 60) { doc.addPage(); y = 20 }
+    y += 8
+    doc.setTextColor(NAVY)
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.text('Chef Uniform Minimum Usage \u2014 Main Kitchen', 14, y)
+    y += 4
+
+    const itemKeys = uniformMinWeeks[0]?.items.map(i => i.key) ?? []
+    const head = ['Week', ...itemKeys.flatMap(k => [`${k} Sent`, 'TopUp', 'Used%']), 'TopUp NET']
+
+    const body = uniformMinWeeks.map(w => {
+      const cells: string[] = [w.dateRange]
+      for (const it of w.items) {
+        const pct = Math.round(it.sent / it.min * 100)
+        cells.push(String(it.sent), it.topUp > 0 ? String(it.topUp) : '\u2014', `${pct}%`)
+      }
+      cells.push(`\u00a3${w.topUpNet.toFixed(2)}`)
+      return cells
+    })
+
+    autoTable(doc, {
+      startY: y,
+      head: [head],
+      body,
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold', fontSize: 6 },
+      alternateRowStyles: { fillColor: '#FAFAFA' },
+      columnStyles: Object.fromEntries(
+        Array.from({ length: head.length }, (_, i) => [i, { halign: i === 0 ? 'left' as const : 'right' as const }])
+      ),
+      margin: { left: 14, right: 14 },
+    })
+  }
+
   // ── Footer on every page ──
   const pageCount = doc.getNumberOfPages()
   for (let i = 1; i <= pageCount; i++) {
@@ -379,9 +424,10 @@ export function downloadReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
-  napkinDeptAllocation?: NapkinDeptAllocation[]
+  napkinDeptAllocation?: NapkinDeptAllocation[],
+  uniformMinWeeks?: UniformMinWeek[]
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -390,8 +436,9 @@ export function generateReconciliationPdfBlob(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
-  napkinDeptAllocation?: NapkinDeptAllocation[]
+  napkinDeptAllocation?: NapkinDeptAllocation[],
+  uniformMinWeeks?: UniformMinWeek[]
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks)
   return doc.output('blob')
 }

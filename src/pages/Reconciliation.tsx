@@ -552,7 +552,15 @@ export default function Reconciliation() {
     let reportPath: string | null = null
     try {
       const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals)
+      const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
+        dateRange: w.dateRange,
+        items: uniformMinSummary.ITEM_KEYS.map(k => ({
+          key: k.charAt(0).toUpperCase() + k.slice(1),
+          sent: w.invoiceSent[k], topUp: w.topUp[k], min: uniformMinSummary.MINIMUMS[k],
+        })),
+        topUpNet: w.topUpNet,
+      }))
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -804,6 +812,147 @@ export default function Reconciliation() {
       hasLedgerData,
     }
   }, [result, invoice, orders, linenLedger])
+
+  // ── Chef Uniform Minimum Usage (Main Kitchen) ──
+  const uniformMinSummary = useMemo(() => {
+    if (!result || !invoice) return null
+    const staffSection = invoice.sections.find(s => s.type === 'staff')
+    if (!staffSection || !staffSection.lines.some(l => l.isTopUp)) return null
+
+    const ITEM_KEYS = ['chef jacket', 'apron', 'chef trouser'] as const
+    type ItemKey = typeof ITEM_KEYS[number]
+    const MINIMUMS: Record<ItemKey, number> = { 'chef jacket': 85, 'apron': 80, 'chef trouser': 80 }
+    const PRICES: Record<ItemKey, number> = { 'chef jacket': 1.41, 'apron': 0.99, 'chef trouser': 1.48 }
+    const MAIN_KITCHEN_ID = '048478b5-976a-4522-8316-02a9456d8c91'
+
+    function normaliseChefItem(name: string): ItemKey | null {
+      const lower = name.toLowerCase()
+      if (lower.includes('chef') && lower.includes('jacket')) return 'chef jacket'
+      if (lower.includes('apron')) return 'apron'
+      if (lower.includes('chef') && (lower.includes('trouser') || lower.includes('trousers'))) return 'chef trouser'
+      return null
+    }
+
+    function emptyItemCounts(): Record<ItemKey, number> {
+      return { 'chef jacket': 0, 'apron': 0, 'chef trouser': 0 }
+    }
+
+    interface UniformWeek {
+      dateRange: string
+      weekStart: Date | null
+      weekEnd: Date | null
+      invoiceSent: Record<ItemKey, number>
+      topUp: Record<ItemKey, number>
+      topUpNet: number
+      systemSent: Record<ItemKey, number>
+    }
+
+    const weeks: UniformWeek[] = []
+    let currentWeek = {
+      dateRange: '', weekStart: null as Date | null, weekEnd: null as Date | null,
+      invoiceSent: emptyItemCounts(), topUpNet: 0,
+    }
+    let lastDate = ''
+
+    // Helper to parse date
+    function parseDate(dateStr: string): Date | null {
+      if (!dateStr) return null
+      const yrM = invoice!.invoicePeriod.match(/(\d{2,4})\s*$/)
+      let defaultYr = yrM ? parseInt(yrM[1]) : new Date().getFullYear()
+      if (defaultYr < 100) defaultYr += 2000
+      const singleM = dateStr.match(/^(\d{1,2})\/(\d{2})(?:\/(\d{2,4}))?$/)
+      if (singleM) {
+        let yr = singleM[3] ? parseInt(singleM[3]) : defaultYr
+        if (yr < 100) yr += 2000
+        return new Date(Date.UTC(yr, parseInt(singleM[2]) - 1, parseInt(singleM[1])))
+      }
+      return null
+    }
+
+    // Group staff section lines by week using TopUp as boundary
+    for (const line of staffSection.lines) {
+      if (line.isTopUp) {
+        // Extract per-item TopUp quantities
+        const topUp = emptyItemCounts()
+        for (const it of line.items) {
+          const key = normaliseChefItem(it.name)
+          if (key) topUp[key] += it.quantity
+        }
+        const dr = line.date || (currentWeek.weekStart ? `${format(currentWeek.weekStart, 'dd/MM')}-${currentWeek.weekEnd ? format(currentWeek.weekEnd, 'dd/MM') : ''}` : lastDate)
+        weeks.push({ ...currentWeek, dateRange: dr, topUp, topUpNet: line.net, systemSent: emptyItemCounts() })
+        currentWeek = { dateRange: '', weekStart: null, weekEnd: null, invoiceSent: emptyItemCounts(), topUpNet: 0 }
+      } else {
+        // Count chef items from matched Main Kitchen orders
+        if (line.sectionType === 'staff' || !line.sectionType) {
+          for (const it of line.items) {
+            const key = normaliseChefItem(it.name)
+            if (key) currentWeek.invoiceSent[key] += it.quantity
+          }
+        }
+        const d = parseDate(line.date)
+        if (d) {
+          if (!currentWeek.weekStart || d < currentWeek.weekStart) currentWeek.weekStart = d
+          if (!currentWeek.weekEnd || d > currentWeek.weekEnd) currentWeek.weekEnd = d
+        }
+        lastDate = line.date
+      }
+    }
+
+    // Skip if no weeks found (no TopUp lines in staff section)
+    if (weeks.length === 0) return null
+
+    // Match system orders for Main Kitchen uniforms per week
+    const kitchenUniformOrders = orders.filter(o =>
+      o.order_type === 'uniform' && o.department_id === MAIN_KITCHEN_ID
+    )
+
+    for (const week of weeks) {
+      if (!week.weekStart || !week.weekEnd) continue
+      const ws = week.weekStart.getTime()
+      const we = week.weekEnd.getTime() + 86400000
+
+      for (const o of kitchenUniformOrders) {
+        const orderTime = new Date(o.created_at).getTime()
+        if (orderTime >= ws && orderTime < we) {
+          for (const it of (o.order_items || [])) {
+            const key = normaliseChefItem(it.item_name || '')
+            if (key) week.systemSent[key] += it.quantity_sent ?? 0
+          }
+        }
+      }
+    }
+
+    // Totals
+    const totalInvoiceSent = emptyItemCounts()
+    const totalTopUp = emptyItemCounts()
+    const totalSystemSent = emptyItemCounts()
+    let totalTopUpNet = 0
+
+    for (const w of weeks) {
+      for (const k of ITEM_KEYS) {
+        totalInvoiceSent[k] += w.invoiceSent[k]
+        totalTopUp[k] += w.topUp[k]
+        totalSystemSent[k] += w.systemSent[k]
+      }
+      totalTopUpNet += w.topUpNet
+    }
+
+    // Unused capacity per item across all weeks
+    const unusedCapacity = emptyItemCounts()
+    for (const w of weeks) {
+      for (const k of ITEM_KEYS) {
+        const sent = w.invoiceSent[k]
+        if (sent < MINIMUMS[k]) unusedCapacity[k] += MINIMUMS[k] - sent
+      }
+    }
+
+    return {
+      weeks, ITEM_KEYS, MINIMUMS, PRICES, weekCount: weeks.length,
+      totalInvoiceSent, totalTopUp, totalSystemSent, totalTopUpNet,
+      unusedCapacity,
+      unusedCost: ITEM_KEYS.reduce((s, k) => s + unusedCapacity[k] * PRICES[k], 0),
+    }
+  }, [result, invoice, orders])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1298,8 +1447,16 @@ export default function Reconciliation() {
   // ── PDF Report ──
   const handlePdfReport = useCallback(() => {
     if (!result || !invoice) return
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals)
-  }, [result, invoice, departmentDisplayRows, napkinSummary])
+    const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
+      dateRange: w.dateRange,
+      items: uniformMinSummary.ITEM_KEYS.map(k => ({
+        key: k.charAt(0).toUpperCase() + k.slice(1),
+        sent: w.invoiceSent[k], topUp: w.topUp[k], min: uniformMinSummary.MINIMUMS[k],
+      })),
+      topUpNet: w.topUpNet,
+    }))
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf)
+  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
@@ -1720,6 +1877,83 @@ export default function Reconciliation() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Chef Uniform Minimum Usage */}
+      {uniformMinSummary && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ChevronRight className="w-4 h-4 text-gray-500" />
+              <h3 className="text-sm font-semibold text-gray-900">Chef Uniform Minimum Usage — Main Kitchen</h3>
+            </div>
+            <span className="text-xs text-gray-500">
+              Weekly min: Jacket {uniformMinSummary.MINIMUMS['chef jacket']} | Apron {uniformMinSummary.MINIMUMS['apron']} | Trouser {uniformMinSummary.MINIMUMS['chef trouser']}
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="border-b border-gray-200 bg-gray-50">
+                <th className="px-3 py-2 text-left font-medium text-gray-600" rowSpan={2}>Week</th>
+                <th className="px-3 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Chef Jacket (min {uniformMinSummary.MINIMUMS['chef jacket']})</th>
+                <th className="px-3 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Apron (min {uniformMinSummary.MINIMUMS['apron']})</th>
+                <th className="px-3 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Chef Trouser (min {uniformMinSummary.MINIMUMS['chef trouser']})</th>
+                <th className="px-3 py-2 text-right font-medium text-gray-600 border-l border-gray-200" rowSpan={2}>TopUp NET</th>
+              </tr><tr className="border-b border-gray-200 bg-gray-50">
+                {uniformMinSummary.ITEM_KEYS.map(k => (
+                  <><th key={`${k}-s`} className="px-2 py-1 text-right font-medium text-gray-500 border-l border-gray-200">Sent</th>
+                  <th key={`${k}-t`} className="px-2 py-1 text-right font-medium text-gray-500">TopUp</th>
+                  <th key={`${k}-p`} className="px-2 py-1 text-right font-medium text-gray-500">Used%</th></>
+                ))}
+              </tr></thead>
+              <tbody>
+                {uniformMinSummary.weeks.map((w, i) => (
+                  <tr key={i} className="border-b border-gray-100">
+                    <td className="px-3 py-2 font-medium text-gray-700 whitespace-nowrap">{w.dateRange}</td>
+                    {uniformMinSummary.ITEM_KEYS.map(k => {
+                      const sent = w.invoiceSent[k]
+                      const min = uniformMinSummary.MINIMUMS[k]
+                      const pct = Math.round(sent / min * 100)
+                      return (
+                        <><td key={`${k}-s-${i}`} className="px-2 py-2 text-right border-l border-gray-200">{sent}</td>
+                        <td key={`${k}-t-${i}`} className={`px-2 py-2 text-right ${w.topUp[k] > 0 ? 'text-amber-600 font-medium' : 'text-gray-300'}`}>
+                          {w.topUp[k] > 0 ? w.topUp[k] : '-'}
+                        </td>
+                        <td key={`${k}-p-${i}`} className={`px-2 py-2 text-right font-medium ${pct < 60 ? 'text-red-600' : pct < 80 ? 'text-amber-600' : pct >= 100 ? 'text-green-600' : 'text-amber-500'}`}>
+                          {pct}%
+                        </td></>
+                      )
+                    })}
+                    <td className="px-3 py-2 text-right border-l border-gray-200 font-medium">{'\u00a3'}{w.topUpNet.toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot><tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
+                <td className="px-3 py-2.5">Total ({uniformMinSummary.weekCount} weeks)</td>
+                {uniformMinSummary.ITEM_KEYS.map(k => (
+                  <><td key={`${k}-ts`} className="px-2 py-2.5 text-right border-l border-gray-200">{uniformMinSummary.totalInvoiceSent[k]}</td>
+                  <td key={`${k}-tt`} className="px-2 py-2.5 text-right text-amber-600">{uniformMinSummary.totalTopUp[k]}</td>
+                  <td key={`${k}-tp`} className="px-2 py-2.5 text-right">
+                    {Math.round(uniformMinSummary.totalInvoiceSent[k] / (uniformMinSummary.MINIMUMS[k] * uniformMinSummary.weekCount) * 100)}%
+                  </td></>
+                ))}
+                <td className="px-3 py-2.5 text-right border-l border-gray-200">{'\u00a3'}{uniformMinSummary.totalTopUpNet.toFixed(2)}</td>
+              </tr></tfoot>
+            </table>
+          </div>
+          <div className="px-5 py-3 bg-gray-50 border-t border-gray-200 text-xs text-gray-600 space-y-1">
+            <div className="flex flex-wrap gap-4">
+              {uniformMinSummary.ITEM_KEYS.map(k => (
+                <span key={k} className={uniformMinSummary.unusedCapacity[k] > 0 ? 'text-amber-700 font-medium' : 'text-green-600'}>
+                  {k.charAt(0).toUpperCase() + k.slice(1)}: {uniformMinSummary.unusedCapacity[k]} unused ({'\u00a3'}{(uniformMinSummary.unusedCapacity[k] * uniformMinSummary.PRICES[k]).toFixed(2)} waste)
+                </span>
+              ))}
+            </div>
+            <div className="text-amber-700 font-medium">
+              Total unused capacity cost: {'\u00a3'}{uniformMinSummary.unusedCost.toFixed(2)}
+            </div>
+          </div>
         </div>
       )}
 
