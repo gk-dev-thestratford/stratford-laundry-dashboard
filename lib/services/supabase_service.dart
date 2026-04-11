@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
 
@@ -94,9 +95,27 @@ class SupabaseService {
     return await _client!.from('item_catalogue').select().eq('is_active', true).order('sort_order');
   }
 
+  /// Fetch the item_department_access junction table (multi-department visibility)
+  Future<List<Map<String, dynamic>>> fetchItemDepartmentAccess() async {
+    if (!isInitialized) return [];
+    return await _client!.from('item_department_access').select('item_id, department_id');
+  }
+
   Future<List<Map<String, dynamic>>> fetchAdminUsers() async {
     if (!isInitialized) return [];
     return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders, can_reject_orders');
+  }
+
+  // ── Edge Functions ──
+
+  /// Invoke the daily-report Edge Function to send collection report emails
+  Future<void> invokeDailyReport() async {
+    if (!isInitialized) return;
+    try {
+      await _client!.functions.invoke('daily-report');
+    } catch (e) {
+      debugPrint('[Supabase] Failed to invoke daily-report: $e');
+    }
   }
 
   // ── Linen Ledger ──

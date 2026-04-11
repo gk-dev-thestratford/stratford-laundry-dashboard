@@ -1,5 +1,6 @@
 // Supabase Edge Function: Daily collection & receiving report
-// Scheduled to run once per day at 2pm UK time via pg_cron.
+// Triggered on-demand when the Collect button is pressed on the tablet.
+// Also still callable via pg_cron as a fallback.
 //
 // Deploy: supabase functions deploy daily-report
 
@@ -32,14 +33,27 @@ async function sendEmail(to: string, subject: string, html: string) {
   });
 }
 
-// ── Fetch all orders currently in a given status ──
-async function fetchOrdersByStatus(targetStatus: string) {
+// ── Fetch orders that were moved to a given status today ──
+async function fetchTodaysOrdersByStatus(targetStatus: string) {
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+
+  // Find status logs created today for the target status
+  const { data: logs } = await supabase
+    .from("order_status_log")
+    .select("order_id")
+    .eq("status", targetStatus)
+    .gte("created_at", today.toISOString());
+
+  if (!logs || logs.length === 0) return [];
+
+  const orderIds = [...new Set(logs.map((l: any) => l.order_id))];
+
   const { data: orders } = await supabase
     .from("orders")
     .select("*, order_items(*), departments(*)")
-    .eq("status", targetStatus)
-    .order("created_at", { ascending: false })
-    .limit(200);
+    .in("id", orderIds)
+    .order("created_at", { ascending: false });
 
   return orders || [];
 }
@@ -219,8 +233,8 @@ serve(async (_req: Request) => {
   try {
     const emailsSent: string[] = [];
 
-    // Fetch orders currently in collected status
-    const collectedOrders = await fetchOrdersByStatus("collected");
+    // Fetch orders collected today
+    const collectedOrders = await fetchTodaysOrdersByStatus("collected");
     if (collectedOrders.length > 0) {
       const reportHtml = buildCollectionReport(collectedOrders);
       const today = new Date().toLocaleDateString("en-GB");
@@ -231,8 +245,8 @@ serve(async (_req: Request) => {
       }
     }
 
-    // Fetch orders currently in received status + today's napkin returns
-    const receivedOrders = await fetchOrdersByStatus("received");
+    // Fetch orders received today + today's napkin returns
+    const receivedOrders = await fetchTodaysOrdersByStatus("received");
     const napkinReturns = await fetchTodaysNapkinReturns();
     if (receivedOrders.length > 0 || napkinReturns.length > 0) {
       const reportHtml = buildReceivedReport(receivedOrders, napkinReturns);

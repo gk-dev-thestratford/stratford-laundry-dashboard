@@ -9,3 +9,9 @@ final catalogueItemsProvider =
   if (rows.isEmpty) return CatalogueItem.getByCategory(category);
   return rows.map((r) => CatalogueItem.fromMap(r)).toList();
 });
+
+/// Loads item→department visibility map from local SQLite
+final itemDepartmentMapProvider =
+    FutureProvider<Map<String, List<String>>>((ref) async {
+  return DatabaseService.instance.getItemDepartmentMap();
+});

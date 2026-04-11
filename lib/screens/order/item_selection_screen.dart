@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
@@ -16,18 +17,26 @@ class ItemSelectionScreen extends ConsumerWidget {
     final order = ref.watch(orderProvider);
     final catalogueAsync = ref.watch(catalogueItemsProvider(order.itemCategory));
     final allItems = catalogueAsync.valueOrNull ?? CatalogueItem.getByCategory(order.itemCategory);
-    // Filter items by department: show items with no department restriction,
-    // or items assigned to the order's department
-    final catalogueItems = allItems.where((item) =>
-      item.departmentId == null ||
-      item.departmentId!.isEmpty ||
-      item.departmentId == order.departmentId
-    ).toList();
+    final itemDeptMap = ref.watch(itemDepartmentMapProvider).valueOrNull ?? {};
+    // Filter items by department using the junction table:
+    // - If item has entries in item_department_access, only show for those departments
+    // - If item has NO entries, fall back to old department_id field or show for all
+    final catalogueItems = allItems.where((item) {
+      final allowedDepts = itemDeptMap[item.id];
+      if (allowedDepts != null && allowedDepts.isNotEmpty) {
+        return order.departmentId != null && allowedDepts.contains(order.departmentId);
+      }
+      // Fallback: legacy single department_id or no restriction
+      return item.departmentId == null ||
+          item.departmentId!.isEmpty ||
+          item.departmentId == order.departmentId;
+    }).toList();
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
     final showPrices = order.isUniformOrder;
 
-    // For linen orders: only one item type per ticket
-    final selectedItemId = (order.isLinenOrder && order.items.isNotEmpty)
+    // For HSK linen orders: only one item type per ticket
+    // For F&B linen: allow multiple items (numeric input for all)
+    final selectedItemId = (order.itemCategory == 'hsk_linen' && order.items.isNotEmpty)
         ? order.items.first.item.id
         : null;
 
@@ -74,11 +83,14 @@ class ItemSelectionScreen extends ConsumerWidget {
                   quantity: qty,
                   showPrice: showPrices,
                   disabled: disabled,
+                  useNumericInput: order.itemCategory == 'fnb_linen',
                   onAdd: () => ref.read(orderProvider.notifier).addItem(item),
                   onIncrement: () => ref.read(orderProvider.notifier)
                       .updateItemQuantity(item.id, qty + 1),
                   onDecrement: () => ref.read(orderProvider.notifier)
                       .updateItemQuantity(item.id, qty - 1),
+                  onQuantityChanged: (newQty) => ref.read(orderProvider.notifier)
+                      .updateItemQuantity(item.id, newQty),
                 );
               },
             ),
@@ -95,38 +107,76 @@ class ItemSelectionScreen extends ConsumerWidget {
   }
 }
 
-class _ItemCard extends StatelessWidget {
+class _ItemCard extends StatefulWidget {
   final CatalogueItem item;
   final int quantity;
   final bool showPrice;
   final bool disabled;
+  final bool useNumericInput;
   final VoidCallback onAdd;
   final VoidCallback onIncrement;
   final VoidCallback onDecrement;
+  final ValueChanged<int> onQuantityChanged;
 
   const _ItemCard({
     required this.item,
     required this.quantity,
     required this.showPrice,
     this.disabled = false,
+    this.useNumericInput = false,
     required this.onAdd,
     required this.onIncrement,
     required this.onDecrement,
+    required this.onQuantityChanged,
   });
 
   @override
+  State<_ItemCard> createState() => _ItemCardState();
+}
+
+class _ItemCardState extends State<_ItemCard> {
+  late TextEditingController _qtyController;
+
+  @override
+  void initState() {
+    super.initState();
+    _qtyController = TextEditingController(
+      text: widget.quantity > 0 ? '${widget.quantity}' : '',
+    );
+  }
+
+  @override
+  void didUpdateWidget(_ItemCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Sync controller when quantity changes externally (e.g. remove item)
+    final expected = widget.quantity > 0 ? '${widget.quantity}' : '';
+    if (_qtyController.text != expected && !_qtyController.text.endsWith('.')) {
+      _qtyController.text = expected;
+      _qtyController.selection = TextSelection.collapsed(offset: expected.length);
+    }
+  }
+
+  @override
+  void dispose() {
+    _qtyController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final isSelected = quantity > 0;
+    final isSelected = widget.quantity > 0;
 
     return Opacity(
-      opacity: disabled ? 0.35 : 1.0,
+      opacity: widget.disabled ? 0.35 : 1.0,
       child: Material(
         color: isSelected ? AppColors.navy.withValues(alpha: 0.06) : AppColors.white,
         borderRadius: AppRadius.mediumBR,
         elevation: isSelected ? 4 : 2,
         shadowColor: isSelected ? AppColors.gold.withValues(alpha: 0.2) : AppColors.navy.withValues(alpha: 0.08),
         child: InkWell(
-          onTap: isSelected || disabled ? null : onAdd,
+          onTap: widget.useNumericInput
+              ? null  // For numeric input, tapping the card does nothing
+              : (isSelected || widget.disabled ? null : widget.onAdd),
           borderRadius: AppRadius.mediumBR,
           child: Container(
             padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.md),
@@ -145,21 +195,21 @@ class _ItemCard extends StatelessWidget {
                   height: 58,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: CatalogueItem.iconBackgroundColor(item.category, selected: isSelected),
+                    color: CatalogueItem.iconBackgroundColor(widget.item.category, selected: isSelected),
                     border: Border.all(
-                      color: CatalogueItem.iconBorderColor(item.category, selected: isSelected),
+                      color: CatalogueItem.iconBorderColor(widget.item.category, selected: isSelected),
                       width: 2,
                     ),
                   ),
                   child: Icon(
-                    item.icon,
+                    widget.item.icon,
                     size: 29,
-                    color: CatalogueItem.iconAccentColor(item.category, selected: isSelected),
+                    color: CatalogueItem.iconAccentColor(widget.item.category, selected: isSelected),
                   ),
                 ),
                 const SizedBox(height: AppSpacing.sm),
                 Text(
-                  item.name,
+                  widget.item.name,
                   style: TextStyle(fontFamily: 'Inter',
                     fontSize: AppTextStyles.labelSize,
                     fontWeight: AppTextStyles.bold,
@@ -169,10 +219,10 @@ class _ItemCard extends StatelessWidget {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
-                if (showPrice && item.price != null) ...[
+                if (widget.showPrice && widget.item.price != null) ...[
                   const SizedBox(height: AppSpacing.xs),
                   Text(
-                    '£${item.price!.toStringAsFixed(2)}',
+                    '£${widget.item.price!.toStringAsFixed(2)}',
                     style: TextStyle(fontFamily: 'Inter',
                       fontSize: AppTextStyles.captionSize,
                       color: AppColors.grey600,
@@ -181,11 +231,19 @@ class _ItemCard extends StatelessWidget {
                   ),
                 ],
                 const SizedBox(height: AppSpacing.sm),
-                if (isSelected)
+                if (widget.useNumericInput)
+                  _NumericQuantityField(
+                    controller: _qtyController,
+                    onChanged: (value) {
+                      final qty = int.tryParse(value) ?? 0;
+                      widget.onQuantityChanged(qty);
+                    },
+                  )
+                else if (isSelected)
                   _QuantityStepper(
-                    quantity: quantity,
-                    onIncrement: onIncrement,
-                    onDecrement: onDecrement,
+                    quantity: widget.quantity,
+                    onIncrement: widget.onIncrement,
+                    onDecrement: widget.onDecrement,
                   )
                 else
                   Container(
@@ -207,6 +265,48 @@ class _ItemCard extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _NumericQuantityField extends StatelessWidget {
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+
+  const _NumericQuantityField({
+    required this.controller,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 90,
+      height: 40,
+      child: TextField(
+        controller: controller,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        style: TextStyle(
+          fontFamily: 'Inter',
+          fontSize: AppTextStyles.bodySize,
+          fontWeight: AppTextStyles.bold,
+          color: AppColors.navy,
+        ),
+        textAlign: TextAlign.center,
+        decoration: InputDecoration(
+          hintText: '0',
+          hintStyle: TextStyle(color: AppColors.grey600),
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          border: OutlineInputBorder(borderRadius: AppRadius.mediumBR),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: AppRadius.mediumBR,
+            borderSide: BorderSide(color: AppColors.gold, width: 2),
+          ),
+        ),
+        onChanged: onChanged,
       ),
     );
   }

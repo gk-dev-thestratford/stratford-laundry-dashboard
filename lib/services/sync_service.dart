@@ -195,6 +195,17 @@ class SyncService {
     }
 
     try {
+      final remoteAccess = await SupabaseService.instance.fetchItemDepartmentAccess();
+      debugPrint('[Sync] Pulled ${remoteAccess.length} item-department mappings');
+      if (remoteAccess.isNotEmpty) {
+        await DatabaseService.instance.syncItemDepartmentAccess(remoteAccess);
+        didSync = true;
+      }
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync item-department access: $e');
+    }
+
+    try {
       final remoteAdmins = await SupabaseService.instance.fetchAdminUsers();
       debugPrint('[Sync] Pulled ${remoteAdmins.length} admin users');
       if (remoteAdmins.isNotEmpty) {
@@ -290,6 +301,13 @@ class SyncService {
                   orderId,
                   newStatus,
                 );
+                // Also push order items (with quantity_received) so the
+                // webhook email has accurate received data.
+                final items = await DatabaseService.instance.getOrderItems(orderId);
+                if (items.isNotEmpty) {
+                  await SupabaseService.instance.pushOrderItems(items);
+                  debugPrint('[Push] Pushed ${items.length} order items (update)');
+                }
                 // Push only status logs that haven't been synced yet.
                 // We fetch all logs and check which ones exist in Supabase,
                 // but for simplicity we just INSERT new logs (not upsert)

@@ -22,7 +22,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 5,
+      version: 6,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -52,6 +52,15 @@ class DatabaseService {
     }
     if (oldVersion < 5) {
       await db.execute('ALTER TABLE admin_users ADD COLUMN can_reject_orders INTEGER NOT NULL DEFAULT 0');
+    }
+    if (oldVersion < 6) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS item_department_access (
+          item_id TEXT NOT NULL,
+          department_id TEXT NOT NULL,
+          PRIMARY KEY (item_id, department_id)
+        )
+      ''');
     }
   }
 
@@ -150,6 +159,14 @@ class DatabaseService {
         note TEXT,
         recorded_by TEXT,
         created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE item_department_access (
+        item_id TEXT NOT NULL,
+        department_id TEXT NOT NULL,
+        PRIMARY KEY (item_id, department_id)
       )
     ''');
 
@@ -459,6 +476,46 @@ class DatabaseService {
         });
       }
     });
+  }
+
+  // ── Item Department Access (junction table) ──
+
+  /// Replace all item-department mappings with fresh data from Supabase
+  Future<void> syncItemDepartmentAccess(List<Map<String, dynamic>> rows) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('item_department_access');
+      for (final row in rows) {
+        await txn.insert('item_department_access', {
+          'item_id': row['item_id'],
+          'department_id': row['department_id'],
+        });
+      }
+    });
+  }
+
+  /// Get all department IDs that an item is visible to.
+  /// Empty list means visible to all departments.
+  Future<List<String>> getDepartmentIdsForItem(String itemId) async {
+    final db = await database;
+    final rows = await db.query('item_department_access',
+        columns: ['department_id'],
+        where: 'item_id = ?',
+        whereArgs: [itemId]);
+    return rows.map((r) => r['department_id'] as String).toList();
+  }
+
+  /// Get all item-department mappings as a map: itemId -> [departmentId, ...]
+  Future<Map<String, List<String>>> getItemDepartmentMap() async {
+    final db = await database;
+    final rows = await db.query('item_department_access');
+    final map = <String, List<String>>{};
+    for (final row in rows) {
+      final itemId = row['item_id'] as String;
+      final deptId = row['department_id'] as String;
+      map.putIfAbsent(itemId, () => []).add(deptId);
+    }
+    return map;
   }
 
   // ── Admin Users ──

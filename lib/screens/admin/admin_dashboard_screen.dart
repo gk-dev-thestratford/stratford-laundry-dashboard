@@ -9,6 +9,7 @@ import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
+import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
 import '../../widgets/success_toast.dart';
 import '../../widgets/sync_indicator.dart';
@@ -336,6 +337,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Push immediately — don't wait for the 30s timer
     SyncService.instance.pushPendingNow();
+
+    // Send the daily collection report email now (instead of scheduled 3pm cron)
+    SupabaseService.instance.invokeDailyReport();
   }
 
   /// For napkin items: logs OUT to the linen ledger.
