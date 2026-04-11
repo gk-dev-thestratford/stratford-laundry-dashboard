@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
-import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search } from 'lucide-react'
+import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
@@ -543,7 +543,7 @@ export default function Reconciliation() {
     let reportPath: string | null = null
     try {
       const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows)
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -635,6 +635,16 @@ export default function Reconciliation() {
 
     // Group invoice lines by week using TopUp lines as week boundaries
     // Each TopUp line marks the end of a week and shows the minimum shortfall
+    interface NapkinDeptBreakdown {
+      deptId: string | null
+      deptName: string
+      sentQty: number
+      pctShare: number
+      actualCost: number
+      topUpAlloc: number
+      totalCost: number
+    }
+
     interface NapkinWeek {
       dateRange: string
       invoiceItems: number  // count of individual docket lines
@@ -647,10 +657,11 @@ export default function Reconciliation() {
       poolReceivedQty: number  // from linen ledger 'in' entries
       weekStart: Date | null
       weekEnd: Date | null
+      deptBreakdown: NapkinDeptBreakdown[]
     }
 
     const weeks: NapkinWeek[] = []
-    let currentWeek: Omit<NapkinWeek, 'systemSentQty' | 'poolReceivedQty'> = {
+    let currentWeek: Omit<NapkinWeek, 'systemSentQty' | 'poolReceivedQty' | 'deptBreakdown'> = {
       dateRange: '', invoiceItems: 0, invoiceSentQty: 0,
       topUpQty: 0, topUpNet: 0, totalChargedQty: 0, totalNet: 0,
       weekStart: null, weekEnd: null,
@@ -666,7 +677,7 @@ export default function Reconciliation() {
         currentWeek.totalChargedQty = currentWeek.invoiceSentQty + topUpQty
         currentWeek.totalNet += line.net
         currentWeek.dateRange = line.date || (currentWeek.weekStart ? `${format(currentWeek.weekStart, 'dd/MM')}-${currentWeek.weekEnd ? format(currentWeek.weekEnd, 'dd/MM') : ''}` : lastDate)
-        weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0 })
+        weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0, deptBreakdown: [] })
         currentWeek = { dateRange: '', invoiceItems: 0, invoiceSentQty: 0, topUpQty: 0, topUpNet: 0, totalChargedQty: 0, totalNet: 0, weekStart: null, weekEnd: null }
       } else {
         // Regular docket line
@@ -686,10 +697,10 @@ export default function Reconciliation() {
     if (currentWeek.invoiceItems > 0) {
       currentWeek.totalChargedQty = currentWeek.invoiceSentQty
       currentWeek.dateRange = currentWeek.weekStart ? `${format(currentWeek.weekStart, 'dd/MM')}-${currentWeek.weekEnd ? format(currentWeek.weekEnd, 'dd/MM') : ''}` : lastDate
-      weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0 })
+      weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0, deptBreakdown: [] })
     }
 
-    // Match system orders and linen ledger to each week
+    // Match system orders and linen ledger to each week, group by department
     const napkinOrders = orders.filter(o => o.order_type === 'fnb_linen' && o.order_items?.some(
       (it: any) => it.item_name?.toLowerCase().includes('napkin')
     ))
@@ -699,17 +710,39 @@ export default function Reconciliation() {
       const ws = week.weekStart.getTime()
       const we = week.weekEnd.getTime() + 86400000 // end of day
 
-      // System sent (from orders)
+      // Group system sent by department
+      const deptMap = new Map<string, { name: string; qty: number }>()
       for (const o of napkinOrders) {
         const orderTime = new Date(o.created_at).getTime()
         if (orderTime >= ws && orderTime < we) {
+          const deptId = o.department_id || '_none'
+          const deptName = o.department?.name || 'Unallocated'
+          if (!deptMap.has(deptId)) deptMap.set(deptId, { name: deptName, qty: 0 })
           for (const it of (o.order_items || [])) {
             if (it.item_name?.toLowerCase().includes('napkin')) {
+              deptMap.get(deptId)!.qty += it.quantity_sent ?? 0
               week.systemSentQty += it.quantity_sent ?? 0
             }
           }
         }
       }
+
+      // Calculate department breakdown with cost allocation
+      const totalSent = Array.from(deptMap.values()).reduce((s, d) => s + d.qty, 0)
+      week.deptBreakdown = Array.from(deptMap.entries()).map(([id, d]) => {
+        const pctShare = totalSent > 0 ? d.qty / totalSent * 100 : 0
+        const actualCost = +(d.qty * UNIT_RATE).toFixed(2)
+        const topUpAlloc = +(pctShare / 100 * week.topUpNet).toFixed(2)
+        return {
+          deptId: id === '_none' ? null : id,
+          deptName: d.name,
+          sentQty: d.qty,
+          pctShare: Math.round(pctShare * 10) / 10,
+          actualCost,
+          topUpAlloc,
+          totalCost: +(actualCost + topUpAlloc).toFixed(2),
+        }
+      }).sort((a, b) => b.sentQty - a.sentQty)
 
       // Pool received (from linen ledger 'in' entries)
       for (const entry of linenLedger) {
@@ -720,6 +753,29 @@ export default function Reconciliation() {
         }
       }
     }
+
+    // Monthly department totals (aggregate across all weeks)
+    const deptTotalMap = new Map<string, { name: string; sent: number; topUp: number; actual: number }>()
+    for (const week of weeks) {
+      for (const d of week.deptBreakdown) {
+        const key = d.deptId || '_none'
+        if (!deptTotalMap.has(key)) deptTotalMap.set(key, { name: d.deptName, sent: 0, topUp: 0, actual: 0 })
+        const t = deptTotalMap.get(key)!
+        t.sent += d.sentQty
+        t.topUp += d.topUpAlloc
+        t.actual += d.actualCost
+      }
+    }
+    const totalSentAll = Array.from(deptTotalMap.values()).reduce((s, d) => s + d.sent, 0)
+    const deptTotals = Array.from(deptTotalMap.entries()).map(([id, d]) => ({
+      deptId: id === '_none' ? null : id,
+      deptName: d.name,
+      totalSent: d.sent,
+      pctShare: totalSentAll > 0 ? Math.round(d.sent / totalSentAll * 1000) / 10 : 0,
+      totalActualCost: +d.actual.toFixed(2),
+      totalTopUpAlloc: +d.topUp.toFixed(2),
+      totalCost: +(d.actual + d.topUp).toFixed(2),
+    })).sort((a, b) => b.totalSent - a.totalSent)
 
     // Totals
     const totalInvoiceSent = weeks.reduce((s, w) => s + w.invoiceSentQty, 0)
@@ -732,7 +788,7 @@ export default function Reconciliation() {
     const hasLedgerData = linenLedger.length > 0
 
     return {
-      weeks, totalInvoiceSent, totalTopUp, totalCharged,
+      weeks, deptTotals, totalInvoiceSent, totalTopUp, totalCharged,
       totalSystemSent, totalReceived, totalTopUpCost, totalNet,
       weeklyMinimum: WEEKLY_MIN, unitRate: UNIT_RATE,
       weeklyMinCost: +(WEEKLY_MIN * UNIT_RATE).toFixed(2),
@@ -1233,8 +1289,8 @@ export default function Reconciliation() {
   // ── PDF Report ──
   const handlePdfReport = useCallback(() => {
     if (!result || !invoice) return
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows)
-  }, [result, invoice, departmentDisplayRows])
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals)
+  }, [result, invoice, departmentDisplayRows, napkinSummary])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
@@ -1611,6 +1667,50 @@ export default function Reconciliation() {
               <div className="text-gray-400 italic">No linen pool data for this period — pool tracking may not have been active yet</div>
             )}
           </div>
+          {/* Department Cost Allocation */}
+          {napkinSummary.deptTotals.length > 0 && (
+            <div className="border-t border-gray-200">
+              <div className="px-5 py-3 border-b border-gray-100 flex items-center gap-2">
+                <Scale className="w-4 h-4 text-gray-400" />
+                <h4 className="text-sm font-semibold text-gray-800">Napkin Minimum — Department Cost Allocation</h4>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead><tr className="border-b border-gray-200 bg-gray-50">
+                    <th className="px-4 py-2 text-left font-medium text-gray-600">Department</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Napkins Sent</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">% Share</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Actual Cost</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">TopUp Allocated</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Total Cost</th>
+                    <th className="px-4 py-2 text-right font-medium text-gray-600">Total inc VAT</th>
+                  </tr></thead>
+                  <tbody>
+                    {napkinSummary.deptTotals.map((d, i) => (
+                      <tr key={i} className="border-b border-gray-100">
+                        <td className="px-4 py-2 font-medium text-gray-700">{d.deptName}</td>
+                        <td className="px-4 py-2 text-right">{d.totalSent.toLocaleString()}</td>
+                        <td className="px-4 py-2 text-right">{d.pctShare.toFixed(1)}%</td>
+                        <td className="px-4 py-2 text-right">{'\u00a3'}{d.totalActualCost.toFixed(2)}</td>
+                        <td className="px-4 py-2 text-right text-amber-600">{'\u00a3'}{d.totalTopUpAlloc.toFixed(2)}</td>
+                        <td className="px-4 py-2 text-right font-semibold">{'\u00a3'}{d.totalCost.toFixed(2)}</td>
+                        <td className="px-4 py-2 text-right font-semibold">{'\u00a3'}{(d.totalCost * 1.2).toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot><tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
+                    <td className="px-4 py-2.5">Total</td>
+                    <td className="px-4 py-2.5 text-right">{napkinSummary.deptTotals.reduce((s, d) => s + d.totalSent, 0).toLocaleString()}</td>
+                    <td className="px-4 py-2.5 text-right">100%</td>
+                    <td className="px-4 py-2.5 text-right">{'\u00a3'}{napkinSummary.deptTotals.reduce((s, d) => s + d.totalActualCost, 0).toFixed(2)}</td>
+                    <td className="px-4 py-2.5 text-right text-amber-600">{'\u00a3'}{napkinSummary.deptTotals.reduce((s, d) => s + d.totalTopUpAlloc, 0).toFixed(2)}</td>
+                    <td className="px-4 py-2.5 text-right">{'\u00a3'}{napkinSummary.deptTotals.reduce((s, d) => s + d.totalCost, 0).toFixed(2)}</td>
+                    <td className="px-4 py-2.5 text-right">{'\u00a3'}{(napkinSummary.deptTotals.reduce((s, d) => s + d.totalCost, 0) * 1.2).toFixed(2)}</td>
+                  </tr></tfoot>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

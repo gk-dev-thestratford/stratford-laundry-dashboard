@@ -45,10 +45,20 @@ const LIGHT_GRAY = '#F3F4F6'
 
 // ── Generator ──
 
+export interface NapkinDeptAllocation {
+  deptName: string
+  totalSent: number
+  pctShare: number
+  totalActualCost: number
+  totalTopUpAlloc: number
+  totalCost: number
+}
+
 export function generateReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
-  displayRows: DepartmentDisplayRow[]
+  displayRows: DepartmentDisplayRow[],
+  napkinDeptAllocation?: NapkinDeptAllocation[]
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
@@ -315,6 +325,67 @@ export function generateReconciliationPdf(
     })
   }
 
+  // ── Napkin Department Cost Allocation ──
+  if (napkinDeptAllocation && napkinDeptAllocation.length > 0) {
+    y = (doc as any).lastAutoTable?.finalY ?? y
+    if (y > doc.internal.pageSize.getHeight() - 60) { doc.addPage(); y = 20 }
+    y += 8
+    doc.setTextColor(NAVY)
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.text('Napkin Minimum — Department Cost Allocation', 14, y)
+    y += 4
+
+    const napkinRows = napkinDeptAllocation.map(d => [
+      d.deptName,
+      d.totalSent.toLocaleString(),
+      `${d.pctShare.toFixed(1)}%`,
+      `£${d.totalActualCost.toFixed(2)}`,
+      `£${d.totalTopUpAlloc.toFixed(2)}`,
+      `£${d.totalCost.toFixed(2)}`,
+      `£${(d.totalCost * 1.2).toFixed(2)}`,
+    ])
+    // Totals row
+    const totSent = napkinDeptAllocation.reduce((s, d) => s + d.totalSent, 0)
+    const totActual = napkinDeptAllocation.reduce((s, d) => s + d.totalActualCost, 0)
+    const totTopUp = napkinDeptAllocation.reduce((s, d) => s + d.totalTopUpAlloc, 0)
+    const totCost = napkinDeptAllocation.reduce((s, d) => s + d.totalCost, 0)
+    napkinRows.push([
+      'Total', totSent.toLocaleString(), '100%',
+      `£${totActual.toFixed(2)}`, `£${totTopUp.toFixed(2)}`,
+      `£${totCost.toFixed(2)}`, `£${(totCost * 1.2).toFixed(2)}`,
+    ])
+
+    autoTable(doc, {
+      startY: y,
+      head: [['Department', 'Sent', '% Share', 'Actual Cost', 'TopUp Alloc', 'Total NET', 'Total inc VAT']],
+      body: napkinRows,
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: '#FAFAFA' },
+      columnStyles: {
+        1: { halign: 'right' },
+        2: { halign: 'right' },
+        3: { halign: 'right' },
+        4: { halign: 'right' },
+        5: { halign: 'right', fontStyle: 'bold' },
+        6: { halign: 'right', fontStyle: 'bold' },
+      },
+      margin: { left: 14, right: 14 },
+      didParseCell: (data) => {
+        // Bold the totals row
+        if (data.section === 'body' && data.row.index === napkinRows.length - 1) {
+          data.cell.styles.fontStyle = 'bold'
+          data.cell.styles.fillColor = LIGHT_GRAY
+        }
+        // Amber colour for TopUp column
+        if (data.section === 'body' && data.column.index === 4 && data.row.index < napkinRows.length - 1) {
+          data.cell.styles.textColor = '#D97706'
+        }
+      },
+    })
+  }
+
   // ── Footer on every page ──
   const pageCount = doc.getNumberOfPages()
   for (let i = 1; i <= pageCount; i++) {
@@ -336,9 +407,10 @@ export function generateReconciliationPdf(
 export function downloadReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
-  displayRows: DepartmentDisplayRow[]
+  displayRows: DepartmentDisplayRow[],
+  napkinDeptAllocation?: NapkinDeptAllocation[]
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -346,8 +418,9 @@ export function downloadReconciliationPdf(
 export function generateReconciliationPdfBlob(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
-  displayRows: DepartmentDisplayRow[]
+  displayRows: DepartmentDisplayRow[],
+  napkinDeptAllocation?: NapkinDeptAllocation[]
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation)
   return doc.output('blob')
 }
