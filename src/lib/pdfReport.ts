@@ -68,26 +68,26 @@ export function generateReconciliationPdf(
 
   // ── Header ──
   doc.setFillColor(NAVY)
-  doc.rect(0, 0, pageWidth, 32, 'F')
+  doc.rect(0, 0, pageWidth, 22, 'F')
   doc.setTextColor(GOLD)
-  doc.setFontSize(18)
+  doc.setFontSize(14)
   doc.setFont('helvetica', 'bold')
-  doc.text('The Stratford', 14, 16)
-  doc.setFontSize(11)
+  doc.text('The Stratford', 14, 10)
+  doc.setFontSize(9)
   doc.setFont('helvetica', 'normal')
   doc.setTextColor('#FFFFFF')
-  doc.text('Laundry Reconciliation Report', 14, 25)
+  doc.text('Laundry Reconciliation Report', 14, 17)
 
   // Date generated on right
-  doc.setFontSize(8)
+  doc.setFontSize(7)
   doc.setTextColor('#D1D5DB')
   const now = new Date()
   doc.text(
     `Generated: ${now.toLocaleDateString('en-GB')} ${now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`,
-    pageWidth - 14, 25, { align: 'right' }
+    pageWidth - 14, 17, { align: 'right' }
   )
 
-  y = 40
+  y = 28
 
   // ── Invoice metadata ──
   doc.setTextColor(NAVY)
@@ -141,35 +141,6 @@ export function generateReconciliationPdf(
       3: { halign: 'right' },
     },
     margin: { left: 14, right: 14 },
-  })
-
-  y = (doc as any).lastAutoTable.finalY + 8
-
-  // ── Reconciliation Stats ──
-  doc.setTextColor(NAVY)
-  doc.setFontSize(10)
-  doc.setFont('helvetica', 'bold')
-  doc.text('Reconciliation Summary', 14, y)
-  y += 2
-
-  autoTable(doc, {
-    startY: y,
-    head: [['Metric', 'Count']],
-    body: [
-      ['Matched Orders', String(result.stats.matched)],
-      ['Price Mismatches', String(result.stats.priceMismatch)],
-      ['Not Found in System', String(result.stats.notFound)],
-      ['Missing from Invoice', String(result.stats.missing)],
-    ],
-    theme: 'grid',
-    styles: { fontSize: 8, cellPadding: 2 },
-    headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold' },
-    columnStyles: {
-      0: { fontStyle: 'bold', cellWidth: 50 },
-      1: { halign: 'right', cellWidth: 25 },
-    },
-    tableWidth: 75,
-    margin: { left: 14 },
   })
 
   y = (doc as any).lastAutoTable.finalY + 8
