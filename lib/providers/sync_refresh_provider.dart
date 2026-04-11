@@ -12,6 +12,7 @@ final syncRefreshProvider = Provider<void>((ref) {
     ref.invalidate(linenDepartmentsProvider);
     // catalogueItemsProvider is a family — invalidating it clears all categories
     ref.invalidate(catalogueItemsProvider);
+    ref.invalidate(itemDepartmentMapProvider);
   });
   ref.onDispose(() => sub.cancel());
 });

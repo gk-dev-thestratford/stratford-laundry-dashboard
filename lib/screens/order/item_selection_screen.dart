@@ -51,6 +51,7 @@ class ItemSelectionScreen extends ConsumerWidget {
           onPressed: () {
             SyncService.instance.fullSync();
             ref.invalidate(catalogueItemsProvider);
+            ref.invalidate(itemDepartmentMapProvider);
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Refreshing items...'), duration: Duration(seconds: 1)),
             );
