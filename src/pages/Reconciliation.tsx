@@ -132,23 +132,32 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
       const orderType = sectionTypeToOrderType(secType as InvoiceSectionType)
       const deptCounts = sectionDeptCounts.get(secType) || sectionDeptCounts.get(orderType)
 
-      let targetDept = 'Unallocated'
       if (deptCounts && deptCounts.size > 0) {
-        let max = 0
+        // Distribute TopUp proportionally across all departments by order count
+        const totalCount = Array.from(deptCounts.values()).reduce((s, c) => s + c, 0)
         for (const [name, count] of deptCounts) {
-          if (count > max) { max = count; targetDept = name }
+          const share = +(topUp.net * count / totalCount).toFixed(2)
+          if (!deptMap.has(name)) {
+            deptMap.set(name, {
+              departmentName: name, departmentId: null,
+              orderCount: 0, invoiceNet: 0, invoiceGross: 0,
+              systemTotal: 0, difference: 0, allocatedTopUp: 0,
+              totalCostNet: 0, totalCostGross: 0,
+            })
+          }
+          deptMap.get(name)!.allocatedTopUp += share
         }
+      } else {
+        if (!deptMap.has('Unallocated')) {
+          deptMap.set('Unallocated', {
+            departmentName: 'Unallocated', departmentId: null,
+            orderCount: 0, invoiceNet: 0, invoiceGross: 0,
+            systemTotal: 0, difference: 0, allocatedTopUp: 0,
+            totalCostNet: 0, totalCostGross: 0,
+          })
+        }
+        deptMap.get('Unallocated')!.allocatedTopUp += topUp.net
       }
-
-      if (!deptMap.has(targetDept)) {
-        deptMap.set(targetDept, {
-          departmentName: targetDept, departmentId: null,
-          orderCount: 0, invoiceNet: 0, invoiceGross: 0,
-          systemTotal: 0, difference: 0, allocatedTopUp: 0,
-          totalCostNet: 0, totalCostGross: 0,
-        })
-      }
-      deptMap.get(targetDept)!.allocatedTopUp += topUp.net
     }
   }
 
