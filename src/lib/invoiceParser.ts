@@ -197,15 +197,15 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
     before = before.substring(sectionPrefixM[0].length).trim()
   }
 
-  // Extract date (range or single)
+  // Extract date (range or single) — allow 1 or 2 digit days
   let date = lastDate
-  const drm = before.match(/^(\d{2}\/\d{2}(?:\/\d{2,4})?\s*-\s*\d{2}\/\d{2}(?:\/\d{2,4})?)\s+(.*)/)
-  const dm = before.match(/^(\d{2}\/\d{2}\/\d{2,4})\s+(.*)/)
+  const drm = before.match(/^(\d{1,2}\/\d{2}(?:\/\d{2,4})?\s*-\s*\d{1,2}\/\d{2}(?:\/\d{2,4})?)\s+(.*)/)
+  const dm = before.match(/^(\d{1,2}\/\d{2}\/\d{2,4})\s+(.*)/)
   if (drm) { date = drm[1].trim(); before = drm[2].trim() }
   else if (dm) { date = dm[1].trim(); before = dm[2].trim() }
 
   // Skip total/summary rows
-  if (/^Total\s+\d{2}\/\d{2}/i.test(before)) return null
+  if (/^Total\s+\d{1,2}\/\d{2}/i.test(before)) return null
   if (/^Net\b|^VAT\b|^Total\b/i.test(before)) return null
 
   // Extract ticket
@@ -351,7 +351,7 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     if (grossM) totalGross = parseFloat(grossM[1].replace(',', ''))
 
     // Capture section total (e.g. "Total 03/26 11072x Napkins £ 2,226.97 £445.39 £2,672.36")
-    const sectionTotalM = line.match(/^Total\s+\d{2}\/\d{2}.*£\s*([\d,]+\.\d{2})\s+£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}/i)
+    const sectionTotalM = line.match(/^Total\s+\d{1,2}\/\d{2}.*£\s*([\d,]+\.\d{2})\s+£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}/i)
     if (sectionTotalM && currentSection) {
       sectionTotals.set(currentSection, parseFloat(sectionTotalM[1].replace(',', '')))
     }
