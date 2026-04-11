@@ -214,16 +214,19 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
   let guestInfo: string | undefined
 
   const guestM = before.match(/^(\d{3,4})\s*(\([^)]+\))\s+(.*)/)
-  const topUpM = before.match(/^(Minimum TopUp)\s+(.*)/)
+  const topUpM = before.match(/^(Minimum\s+Top\s*[Uu]p)\s+(.*)/)
   const napkinM = before.match(/^(NAPKINS)\s+(.*)/)
   const ntnM = before.match(/^(NTN)\s+(.*)/)
   const stdM = before.match(/^(\d{4})\s+(.*)/)
+  // Alphanumeric ticket (e.g. "Sam 77x napkins") — short word followed by qty description
+  const alphaM = before.match(/^([A-Za-z][A-Za-z0-9]{1,10})\s+(\d+x\s+.*)/)
 
   if (guestM) { ticket = guestM[1]; guestInfo = guestM[2]; description = guestM[3].trim() }
   else if (topUpM) { ticket = 'Minimum TopUp'; description = topUpM[2].trim() }
   else if (napkinM) { ticket = 'NAPKINS'; description = napkinM[2].trim() }
   else if (ntnM) { ticket = 'NTN'; description = ntnM[2].trim() }
   else if (stdM) { ticket = stdM[1]; description = stdM[2].trim() }
+  else if (alphaM) { ticket = alphaM[1]; description = alphaM[2].trim() }
 
   return {
     date, ticket, guestInfo, description,

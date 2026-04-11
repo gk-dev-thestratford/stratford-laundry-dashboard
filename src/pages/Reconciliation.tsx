@@ -595,6 +595,21 @@ export default function Reconciliation() {
   }, [result])
 
   // ── Napkin Usage Summary ──
+  const [linenLedger, setLinenLedger] = useState<{ direction: string; quantity: number; created_at: string }[]>([])
+
+  // Fetch linen ledger data when invoice has napkins section
+  useEffect(() => {
+    if (!invoice || !parsedPeriod) return
+    const hasNapkins = invoice.sections.some(s => s.type === 'napkins')
+    if (!hasNapkins) { setLinenLedger([]); return }
+    supabase.from('linen_ledger')
+      .select('direction, quantity, created_at')
+      .ilike('item_name', '%napkin%')
+      .gte('created_at', parsedPeriod.start.toISOString())
+      .lte('created_at', parsedPeriod.end.toISOString())
+      .then(({ data }) => setLinenLedger(data ?? []))
+  }, [invoice, parsedPeriod])
+
   const napkinSummary = useMemo(() => {
     if (!result || !invoice) return null
     const napkinSection = invoice.sections.find(s => s.type === 'napkins')
@@ -603,82 +618,127 @@ export default function Reconciliation() {
     const WEEKLY_MIN = 2500
     const UNIT_RATE = 0.215
 
-    // Parse each invoice line's date range into start/end dates for matching
-    function parseDateRange(dateStr: string, invoicePeriod: string): { start: Date; end: Date } | null {
+    // Helper: parse date string to Date (derive year from invoice period)
+    function parseDate(dateStr: string): Date | null {
       if (!dateStr) return null
-      // Range: "02/03-08/03" or "02/03/26-08/03/26"
-      const rangeM = dateStr.match(/^(\d{2})\/(\d{2})(?:\/(\d{2,4}))?\s*-\s*(\d{2})\/(\d{2})(?:\/(\d{2,4}))?$/)
-      if (rangeM) {
-        // Derive year from invoice period
-        const yrM = invoicePeriod.match(/(\d{2,4})\s*$/)
-        let yr = yrM ? parseInt(yrM[1]) : new Date().getFullYear()
-        if (yr < 100) yr += 2000
-        const start = new Date(Date.UTC(yr, parseInt(rangeM[2]) - 1, parseInt(rangeM[1])))
-        const end = new Date(Date.UTC(yr, parseInt(rangeM[5]) - 1, parseInt(rangeM[4]), 23, 59, 59))
-        return { start, end }
-      }
-      // Single date: "01/03/2026" or "01/03/26"
-      const singleM = dateStr.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/)
+      const yrM = invoice!.invoicePeriod.match(/(\d{2,4})\s*$/)
+      let defaultYr = yrM ? parseInt(yrM[1]) : new Date().getFullYear()
+      if (defaultYr < 100) defaultYr += 2000
+      const singleM = dateStr.match(/^(\d{2})\/(\d{2})(?:\/(\d{2,4}))?$/)
       if (singleM) {
-        let yr = parseInt(singleM[3]); if (yr < 100) yr += 2000
-        const d = new Date(Date.UTC(yr, parseInt(singleM[2]) - 1, parseInt(singleM[1])))
-        return { start: d, end: new Date(Date.UTC(yr, parseInt(singleM[2]) - 1, parseInt(singleM[1]), 23, 59, 59)) }
+        let yr = singleM[3] ? parseInt(singleM[3]) : defaultYr
+        if (yr < 100) yr += 2000
+        return new Date(Date.UTC(yr, parseInt(singleM[2]) - 1, parseInt(singleM[1])))
       }
       return null
     }
 
-    // Get all system napkin orders (fnb_linen with napkin items)
+    // Group invoice lines by week using TopUp lines as week boundaries
+    // Each TopUp line marks the end of a week and shows the minimum shortfall
+    interface NapkinWeek {
+      dateRange: string
+      invoiceItems: number  // count of individual docket lines
+      invoiceSentQty: number  // sum of actual napkins sent (from docket lines)
+      topUpQty: number  // minimum top-up quantity
+      topUpNet: number  // cost of the top-up
+      totalChargedQty: number  // sent + topup = what they charge
+      totalNet: number  // total cost for the week
+      systemSentQty: number  // from our system orders
+      poolReceivedQty: number  // from linen ledger 'in' entries
+      weekStart: Date | null
+      weekEnd: Date | null
+    }
+
+    const weeks: NapkinWeek[] = []
+    let currentWeek: Omit<NapkinWeek, 'systemSentQty' | 'poolReceivedQty'> = {
+      dateRange: '', invoiceItems: 0, invoiceSentQty: 0,
+      topUpQty: 0, topUpNet: 0, totalChargedQty: 0, totalNet: 0,
+      weekStart: null, weekEnd: null,
+    }
+    let lastDate = ''
+
+    for (const line of napkinSection.lines) {
+      if (line.isTopUp) {
+        // TopUp line closes the current week
+        const topUpQty = line.items[0]?.quantity ?? 0
+        currentWeek.topUpQty = topUpQty
+        currentWeek.topUpNet = line.net
+        currentWeek.totalChargedQty = currentWeek.invoiceSentQty + topUpQty
+        currentWeek.totalNet += line.net
+        currentWeek.dateRange = line.date || (currentWeek.weekStart ? `${format(currentWeek.weekStart, 'dd/MM')}-${currentWeek.weekEnd ? format(currentWeek.weekEnd, 'dd/MM') : ''}` : lastDate)
+        weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0 })
+        currentWeek = { dateRange: '', invoiceItems: 0, invoiceSentQty: 0, topUpQty: 0, topUpNet: 0, totalChargedQty: 0, totalNet: 0, weekStart: null, weekEnd: null }
+      } else {
+        // Regular docket line
+        const qty = line.items[0]?.quantity ?? 0
+        currentWeek.invoiceItems++
+        currentWeek.invoiceSentQty += qty
+        currentWeek.totalNet += line.net
+        const d = parseDate(line.date)
+        if (d) {
+          if (!currentWeek.weekStart || d < currentWeek.weekStart) currentWeek.weekStart = d
+          if (!currentWeek.weekEnd || d > currentWeek.weekEnd) currentWeek.weekEnd = d
+        }
+        lastDate = line.date
+      }
+    }
+    // Remaining lines after last TopUp (e.g. partial week at end of month)
+    if (currentWeek.invoiceItems > 0) {
+      currentWeek.totalChargedQty = currentWeek.invoiceSentQty
+      currentWeek.dateRange = currentWeek.weekStart ? `${format(currentWeek.weekStart, 'dd/MM')}-${currentWeek.weekEnd ? format(currentWeek.weekEnd, 'dd/MM') : ''}` : lastDate
+      weeks.push({ ...currentWeek, systemSentQty: 0, poolReceivedQty: 0 })
+    }
+
+    // Match system orders and linen ledger to each week
     const napkinOrders = orders.filter(o => o.order_type === 'fnb_linen' && o.order_items?.some(
       (it: any) => it.item_name?.toLowerCase().includes('napkin')
     ))
 
-    const weeks: { dateRange: string; invoiceQty: number; invoiceNet: number; systemQty: number; isFullWeek: boolean }[] = []
-    let totalInvoiceQty = 0
-    let totalSystemQty = 0
+    for (const week of weeks) {
+      if (!week.weekStart || !week.weekEnd) continue
+      const ws = week.weekStart.getTime()
+      const we = week.weekEnd.getTime() + 86400000 // end of day
 
-    for (const line of napkinSection.lines) {
-      const invoiceQty = line.items[0]?.quantity ?? 0
-      const range = parseDateRange(line.date, invoice.invoicePeriod)
-
-      let systemQty = 0
-      if (range) {
-        for (const o of napkinOrders) {
-          const orderDate = new Date(o.created_at)
-          if (orderDate >= range.start && orderDate <= range.end) {
-            for (const it of (o.order_items || [])) {
-              if (it.item_name?.toLowerCase().includes('napkin')) {
-                systemQty += it.quantity_sent ?? 0
-              }
+      // System sent (from orders)
+      for (const o of napkinOrders) {
+        const orderTime = new Date(o.created_at).getTime()
+        if (orderTime >= ws && orderTime < we) {
+          for (const it of (o.order_items || [])) {
+            if (it.item_name?.toLowerCase().includes('napkin')) {
+              week.systemSentQty += it.quantity_sent ?? 0
             }
           }
         }
       }
 
-      // Determine if this is a full-week minimum charge
-      const isFullWeek = invoiceQty === WEEKLY_MIN
-      totalInvoiceQty += invoiceQty
-      totalSystemQty += systemQty
-
-      weeks.push({ dateRange: line.date, invoiceQty, invoiceNet: line.net, systemQty, isFullWeek })
+      // Pool received (from linen ledger 'in' entries)
+      for (const entry of linenLedger) {
+        if (entry.direction !== 'in') continue
+        const entryTime = new Date(entry.created_at).getTime()
+        if (entryTime >= ws && entryTime < we) {
+          week.poolReceivedQty += entry.quantity
+        }
+      }
     }
 
-    // Calculate unused capacity (only for weeks at minimum)
-    const unusedCapacity = weeks.reduce((s, w) => {
-      if (w.isFullWeek && w.systemQty < WEEKLY_MIN) return s + (WEEKLY_MIN - w.systemQty)
-      return s
-    }, 0)
+    // Totals
+    const totalInvoiceSent = weeks.reduce((s, w) => s + w.invoiceSentQty, 0)
+    const totalTopUp = weeks.reduce((s, w) => s + w.topUpQty, 0)
+    const totalCharged = weeks.reduce((s, w) => s + w.totalChargedQty, 0)
+    const totalSystemSent = weeks.reduce((s, w) => s + w.systemSentQty, 0)
+    const totalReceived = weeks.reduce((s, w) => s + w.poolReceivedQty, 0)
+    const totalTopUpCost = weeks.reduce((s, w) => s + w.topUpNet, 0)
+    const totalNet = weeks.reduce((s, w) => s + w.totalNet, 0)
+    const hasLedgerData = linenLedger.length > 0
 
     return {
-      weeks,
-      totalInvoiceQty,
-      totalSystemQty,
-      weeklyMinimum: WEEKLY_MIN,
-      unitRate: UNIT_RATE,
+      weeks, totalInvoiceSent, totalTopUp, totalCharged,
+      totalSystemSent, totalReceived, totalTopUpCost, totalNet,
+      weeklyMinimum: WEEKLY_MIN, unitRate: UNIT_RATE,
       weeklyMinCost: +(WEEKLY_MIN * UNIT_RATE).toFixed(2),
-      unusedCapacity,
-      unusedCost: +(unusedCapacity * UNIT_RATE).toFixed(2),
+      hasLedgerData,
     }
-  }, [result, invoice, orders])
+  }, [result, invoice, orders, linenLedger])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1461,51 +1521,57 @@ export default function Reconciliation() {
               <ChevronRight className="w-4 h-4 text-gray-500" />
               <h3 className="text-sm font-semibold text-gray-900">Napkin Usage Summary</h3>
             </div>
-            <span className="text-xs text-gray-500">Weekly minimum: {napkinSummary.weeklyMinimum.toLocaleString()} napkins @ {'\u00a3'}{napkinSummary.unitRate.toFixed(3)}/ea = {'\u00a3'}{napkinSummary.weeklyMinCost.toFixed(2)}/week</span>
+            <span className="text-xs text-gray-500">Weekly minimum: {napkinSummary.weeklyMinimum.toLocaleString()} @ {'\u00a3'}{napkinSummary.unitRate.toFixed(3)}/ea = {'\u00a3'}{napkinSummary.weeklyMinCost.toFixed(2)}/week</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead><tr className="border-b border-gray-200 bg-gray-50">
-                <th className="px-4 py-2.5 text-left font-medium text-gray-600">Week</th>
-                <th className="px-4 py-2.5 text-right font-medium text-gray-600">Invoice Count</th>
-                <th className="px-4 py-2.5 text-right font-medium text-gray-600">System Count</th>
-                <th className="px-4 py-2.5 text-right font-medium text-gray-600">Diff</th>
-                <th className="px-4 py-2.5 text-right font-medium text-gray-600">Invoice NET</th>
-                <th className="px-4 py-2.5 text-right font-medium text-gray-600">Min Used</th>
-                <th className="px-4 py-2.5 text-center font-medium text-gray-600">Status</th>
+                <th className="px-3 py-2.5 text-left font-medium text-gray-600">Week</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Dockets</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Invoice Sent</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">System Sent</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Sent Diff</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">TopUp</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Total Charged</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Total NET</th>
+                {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Received</th>}
+                {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Shrinkage</th>}
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600">Min Used</th>
               </tr></thead>
               <tbody>
                 {napkinSummary.weeks.map((w, i) => {
-                  const diff = w.systemQty - w.invoiceQty
-                  const minUsedPct = w.isFullWeek ? Math.round(w.systemQty / napkinSummary.weeklyMinimum * 100) : null
-                  const isUnder = w.isFullWeek && w.systemQty < napkinSummary.weeklyMinimum
-                  const isOver = w.systemQty > w.invoiceQty
+                  const sentDiff = w.systemSentQty - w.invoiceSentQty
+                  const hasTopUp = w.topUpQty > 0
+                  const minUsedPct = hasTopUp ? Math.round(w.invoiceSentQty / napkinSummary.weeklyMinimum * 100) : null
+                  const shrinkage = napkinSummary.hasLedgerData && w.poolReceivedQty > 0 ? w.invoiceSentQty - w.poolReceivedQty : null
                   return (
-                    <tr key={i} className={`border-b border-gray-100 ${isUnder ? 'bg-amber-50/50' : ''}`}>
-                      <td className="px-4 py-2.5 font-medium text-gray-700">{w.dateRange}</td>
-                      <td className="px-4 py-2.5 text-right">{w.invoiceQty.toLocaleString()}</td>
-                      <td className="px-4 py-2.5 text-right font-medium">{w.systemQty.toLocaleString()}</td>
-                      <td className={`px-4 py-2.5 text-right font-medium ${diff > 0 ? 'text-red-600' : diff < 0 ? 'text-amber-600' : 'text-green-600'}`}>
-                        {diff > 0 ? '+' : ''}{diff.toLocaleString()}
+                    <tr key={i} className={`border-b border-gray-100 ${hasTopUp && minUsedPct != null && minUsedPct < 80 ? 'bg-red-50/30' : hasTopUp ? 'bg-amber-50/30' : ''}`}>
+                      <td className="px-3 py-2 font-medium text-gray-700 whitespace-nowrap">{w.dateRange}</td>
+                      <td className="px-3 py-2 text-right text-gray-500">{w.invoiceItems}</td>
+                      <td className="px-3 py-2 text-right">{w.invoiceSentQty.toLocaleString()}</td>
+                      <td className="px-3 py-2 text-right font-medium">{w.systemSentQty > 0 ? w.systemSentQty.toLocaleString() : <span className="text-gray-300">-</span>}</td>
+                      <td className={`px-3 py-2 text-right font-medium ${w.systemSentQty === 0 ? 'text-gray-300' : sentDiff > 0 ? 'text-red-600' : sentDiff < 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                        {w.systemSentQty === 0 ? '-' : `${sentDiff > 0 ? '+' : ''}${sentDiff.toLocaleString()}`}
                       </td>
-                      <td className="px-4 py-2.5 text-right">{'\u00a3'}{w.invoiceNet.toFixed(2)}</td>
-                      <td className="px-4 py-2.5 text-right">
+                      <td className={`px-3 py-2 text-right ${hasTopUp ? 'text-amber-600 font-medium' : 'text-gray-300'}`}>
+                        {hasTopUp ? w.topUpQty.toLocaleString() : '-'}
+                      </td>
+                      <td className="px-3 py-2 text-right font-medium">{w.totalChargedQty.toLocaleString()}</td>
+                      <td className="px-3 py-2 text-right">{'\u00a3'}{w.totalNet.toFixed(2)}</td>
+                      {napkinSummary.hasLedgerData && (
+                        <td className="px-3 py-2 text-right">{w.poolReceivedQty > 0 ? w.poolReceivedQty.toLocaleString() : <span className="text-gray-300">-</span>}</td>
+                      )}
+                      {napkinSummary.hasLedgerData && (
+                        <td className={`px-3 py-2 text-right font-medium ${shrinkage != null && shrinkage > 0 ? 'text-red-600' : 'text-gray-300'}`}>
+                          {shrinkage != null && shrinkage > 0 ? shrinkage.toLocaleString() : '-'}
+                        </td>
+                      )}
+                      <td className="px-3 py-2 text-right">
                         {minUsedPct != null ? (
-                          <span className={minUsedPct < 80 ? 'text-red-600 font-medium' : minUsedPct < 100 ? 'text-amber-600' : 'text-green-600'}>
+                          <span className={minUsedPct < 60 ? 'text-red-600 font-bold' : minUsedPct < 80 ? 'text-red-600 font-medium' : minUsedPct < 100 ? 'text-amber-600' : 'text-green-600'}>
                             {minUsedPct}%
                           </span>
                         ) : <span className="text-gray-400">{'\u2014'}</span>}
-                      </td>
-                      <td className="px-4 py-2.5 text-center text-xs">
-                        {!w.isFullWeek ? (
-                          <span className="text-gray-400">Partial</span>
-                        ) : isOver ? (
-                          <span className="text-red-600 font-medium">Over min</span>
-                        ) : isUnder ? (
-                          <span className="text-amber-600 font-medium">Under min</span>
-                        ) : (
-                          <span className="text-green-600">At min</span>
-                        )}
                       </td>
                     </tr>
                   )
@@ -1513,30 +1579,36 @@ export default function Reconciliation() {
               </tbody>
               <tfoot>
                 <tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
-                  <td className="px-4 py-3">Total</td>
-                  <td className="px-4 py-3 text-right">{napkinSummary.totalInvoiceQty.toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right">{napkinSummary.totalSystemQty.toLocaleString()}</td>
-                  <td className={`px-4 py-3 text-right ${napkinSummary.totalSystemQty - napkinSummary.totalInvoiceQty > 0 ? 'text-red-600' : napkinSummary.totalSystemQty - napkinSummary.totalInvoiceQty < 0 ? 'text-amber-600' : 'text-green-600'}`}>
-                    {napkinSummary.totalSystemQty - napkinSummary.totalInvoiceQty > 0 ? '+' : ''}{(napkinSummary.totalSystemQty - napkinSummary.totalInvoiceQty).toLocaleString()}
+                  <td className="px-3 py-3">Total</td>
+                  <td className="px-3 py-3 text-right text-gray-500">{napkinSummary.weeks.reduce((s, w) => s + w.invoiceItems, 0)}</td>
+                  <td className="px-3 py-3 text-right">{napkinSummary.totalInvoiceSent.toLocaleString()}</td>
+                  <td className="px-3 py-3 text-right">{napkinSummary.totalSystemSent > 0 ? napkinSummary.totalSystemSent.toLocaleString() : '-'}</td>
+                  <td className={`px-3 py-3 text-right ${napkinSummary.totalSystemSent === 0 ? '' : napkinSummary.totalSystemSent - napkinSummary.totalInvoiceSent > 0 ? 'text-red-600' : 'text-amber-600'}`}>
+                    {napkinSummary.totalSystemSent > 0 ? (napkinSummary.totalSystemSent - napkinSummary.totalInvoiceSent).toLocaleString() : '-'}
                   </td>
-                  <td className="px-4 py-3 text-right">{'\u00a3'}{napkinSummary.weeks.reduce((s, w) => s + w.invoiceNet, 0).toFixed(2)}</td>
-                  <td className="px-4 py-3" colSpan={2} />
+                  <td className="px-3 py-3 text-right text-amber-600">{napkinSummary.totalTopUp.toLocaleString()}</td>
+                  <td className="px-3 py-3 text-right">{napkinSummary.totalCharged.toLocaleString()}</td>
+                  <td className="px-3 py-3 text-right">{'\u00a3'}{napkinSummary.totalNet.toFixed(2)}</td>
+                  {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right">{napkinSummary.totalReceived > 0 ? napkinSummary.totalReceived.toLocaleString() : '-'}</td>}
+                  {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right text-red-600">{napkinSummary.totalReceived > 0 ? (napkinSummary.totalInvoiceSent - napkinSummary.totalReceived).toLocaleString() : '-'}</td>}
+                  <td className="px-3 py-3" />
                 </tr>
               </tfoot>
             </table>
           </div>
           {/* Summary footer */}
           <div className="px-5 py-3 bg-gray-50 border-t border-gray-200 text-xs text-gray-600 space-y-1">
-            <div className="flex justify-between">
-              <span>Weekly minimum: {napkinSummary.weeklyMinimum.toLocaleString()} napkins @ {'\u00a3'}{napkinSummary.unitRate.toFixed(3)}/each = {'\u00a3'}{napkinSummary.weeklyMinCost.toFixed(2)}/week</span>
-            </div>
-            {napkinSummary.unusedCapacity > 0 && (
-              <div className="flex justify-between text-amber-700 font-medium">
-                <span>Unused minimum capacity: {napkinSummary.unusedCapacity.toLocaleString()} napkins ({'\u00a3'}{napkinSummary.unusedCost.toFixed(2)} paid but not used)</span>
+            <div>Weekly minimum: {napkinSummary.weeklyMinimum.toLocaleString()} napkins @ {'\u00a3'}{napkinSummary.unitRate.toFixed(3)}/each = {'\u00a3'}{napkinSummary.weeklyMinCost.toFixed(2)}/week</div>
+            {napkinSummary.totalTopUp > 0 && (
+              <div className="text-amber-700 font-medium">
+                TopUp waste: {napkinSummary.totalTopUp.toLocaleString()} napkins paid but not sent ({'\u00a3'}{napkinSummary.totalTopUpCost.toFixed(2)})
               </div>
             )}
-            {napkinSummary.totalSystemQty === 0 && (
-              <div className="text-gray-400 italic">No napkin orders found in system for this period — tracking may not have been active yet</div>
+            {napkinSummary.totalSystemSent === 0 && (
+              <div className="text-gray-400 italic">No system order data for this period — docket tracking may not have been active yet</div>
+            )}
+            {!napkinSummary.hasLedgerData && (
+              <div className="text-gray-400 italic">No linen pool data for this period — pool tracking may not have been active yet</div>
             )}
           </div>
         </div>
