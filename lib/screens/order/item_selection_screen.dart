@@ -166,6 +166,111 @@ class _ItemCardState extends State<_ItemCard> {
   Widget build(BuildContext context) {
     final isSelected = widget.quantity > 0;
 
+    final cardBody = Container(
+      padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.md),
+      decoration: BoxDecoration(
+        borderRadius: AppRadius.mediumBR,
+        border: Border.all(
+          color: isSelected ? AppColors.gold : AppColors.grey200,
+          width: isSelected ? 2 : 1,
+        ),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            width: 58,
+            height: 58,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: CatalogueItem.iconBackgroundColor(widget.item.category, selected: isSelected),
+              border: Border.all(
+                color: CatalogueItem.iconBorderColor(widget.item.category, selected: isSelected),
+                width: 2,
+              ),
+            ),
+            child: Icon(
+              widget.item.icon,
+              size: 29,
+              color: CatalogueItem.iconAccentColor(widget.item.category, selected: isSelected),
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            widget.item.name,
+            style: TextStyle(fontFamily: 'Inter',
+              fontSize: AppTextStyles.labelSize,
+              fontWeight: AppTextStyles.bold,
+              color: AppColors.navy,
+            ),
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          if (widget.showPrice && widget.item.price != null) ...[
+            const SizedBox(height: AppSpacing.xs),
+            Text(
+              '£${widget.item.price!.toStringAsFixed(2)}',
+              style: TextStyle(fontFamily: 'Inter',
+                fontSize: AppTextStyles.captionSize,
+                color: AppColors.grey600,
+                fontWeight: AppTextStyles.medium,
+              ),
+            ),
+          ],
+          const SizedBox(height: AppSpacing.sm),
+          if (widget.useNumericInput)
+            _NumericQuantityField(
+              controller: _qtyController,
+              onChanged: (value) {
+                final qty = int.tryParse(value) ?? 0;
+                if (qty > 0 && widget.quantity == 0) {
+                  // Item not in order yet — add it first, then set quantity
+                  widget.onAdd();
+                }
+                widget.onQuantityChanged(qty);
+              },
+            )
+          else if (isSelected)
+            _QuantityStepper(
+              quantity: widget.quantity,
+              onIncrement: widget.onIncrement,
+              onDecrement: widget.onDecrement,
+            )
+          else
+            Container(
+              padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+              decoration: BoxDecoration(
+                color: AppColors.navy.withValues(alpha: 0.08),
+                borderRadius: AppRadius.largeBR,
+              ),
+              child: Text(
+                'Tap to add',
+                style: TextStyle(fontFamily: 'Inter',
+                  fontSize: AppTextStyles.captionSize,
+                  color: AppColors.navy,
+                  fontWeight: AppTextStyles.medium,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+
+    // For numeric input cards: no InkWell wrapper so the TextField can receive focus
+    if (widget.useNumericInput) {
+      return Opacity(
+        opacity: widget.disabled ? 0.35 : 1.0,
+        child: Material(
+          color: isSelected ? AppColors.navy.withValues(alpha: 0.06) : AppColors.white,
+          borderRadius: AppRadius.mediumBR,
+          elevation: isSelected ? 4 : 2,
+          shadowColor: isSelected ? AppColors.gold.withValues(alpha: 0.2) : AppColors.navy.withValues(alpha: 0.08),
+          child: cardBody,
+        ),
+      );
+    }
+
     return Opacity(
       opacity: widget.disabled ? 0.35 : 1.0,
       child: Material(
@@ -174,96 +279,9 @@ class _ItemCardState extends State<_ItemCard> {
         elevation: isSelected ? 4 : 2,
         shadowColor: isSelected ? AppColors.gold.withValues(alpha: 0.2) : AppColors.navy.withValues(alpha: 0.08),
         child: InkWell(
-          onTap: widget.useNumericInput
-              ? null  // For numeric input, tapping the card does nothing
-              : (isSelected || widget.disabled ? null : widget.onAdd),
+          onTap: isSelected || widget.disabled ? null : widget.onAdd,
           borderRadius: AppRadius.mediumBR,
-          child: Container(
-            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.md),
-            decoration: BoxDecoration(
-              borderRadius: AppRadius.mediumBR,
-              border: Border.all(
-                color: isSelected ? AppColors.gold : AppColors.grey200,
-                width: isSelected ? 2 : 1,
-              ),
-            ),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  width: 58,
-                  height: 58,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: CatalogueItem.iconBackgroundColor(widget.item.category, selected: isSelected),
-                    border: Border.all(
-                      color: CatalogueItem.iconBorderColor(widget.item.category, selected: isSelected),
-                      width: 2,
-                    ),
-                  ),
-                  child: Icon(
-                    widget.item.icon,
-                    size: 29,
-                    color: CatalogueItem.iconAccentColor(widget.item.category, selected: isSelected),
-                  ),
-                ),
-                const SizedBox(height: AppSpacing.sm),
-                Text(
-                  widget.item.name,
-                  style: TextStyle(fontFamily: 'Inter',
-                    fontSize: AppTextStyles.labelSize,
-                    fontWeight: AppTextStyles.bold,
-                    color: AppColors.navy,
-                  ),
-                  textAlign: TextAlign.center,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                if (widget.showPrice && widget.item.price != null) ...[
-                  const SizedBox(height: AppSpacing.xs),
-                  Text(
-                    '£${widget.item.price!.toStringAsFixed(2)}',
-                    style: TextStyle(fontFamily: 'Inter',
-                      fontSize: AppTextStyles.captionSize,
-                      color: AppColors.grey600,
-                      fontWeight: AppTextStyles.medium,
-                    ),
-                  ),
-                ],
-                const SizedBox(height: AppSpacing.sm),
-                if (widget.useNumericInput)
-                  _NumericQuantityField(
-                    controller: _qtyController,
-                    onChanged: (value) {
-                      final qty = int.tryParse(value) ?? 0;
-                      widget.onQuantityChanged(qty);
-                    },
-                  )
-                else if (isSelected)
-                  _QuantityStepper(
-                    quantity: widget.quantity,
-                    onIncrement: widget.onIncrement,
-                    onDecrement: widget.onDecrement,
-                  )
-                else
-                  Container(
-                    padding: EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-                    decoration: BoxDecoration(
-                      color: AppColors.navy.withValues(alpha: 0.08),
-                      borderRadius: AppRadius.largeBR,
-                    ),
-                    child: Text(
-                      'Tap to add',
-                      style: TextStyle(fontFamily: 'Inter',
-                        fontSize: AppTextStyles.captionSize,
-                        color: AppColors.navy,
-                        fontWeight: AppTextStyles.medium,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
+          child: cardBody,
         ),
       ),
     );
