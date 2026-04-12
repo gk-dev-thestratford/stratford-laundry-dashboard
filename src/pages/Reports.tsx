@@ -504,25 +504,24 @@ export default function Reports() {
         )}
       </div>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="lg:col-span-2 flex justify-end">
-          <button
-            onClick={() => setShowNet(v => !v)}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${showNet ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
-          >
-            {showNet ? 'NET' : 'inc VAT'}
-          </button>
-        </div>
-
+      {/* Charts — top row */}
+      <div className="flex justify-end">
+        <button
+          onClick={() => setShowNet(v => !v)}
+          className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${showNet ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+        >
+          {showNet ? 'NET' : 'inc VAT'}
+        </button>
+      </div>
+      <div className={`grid grid-cols-1 ${topUpYearTotal > 0 ? 'lg:grid-cols-3' : 'lg:grid-cols-2'} gap-4`}>
         {/* Monthly Orders */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
           <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Orders ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={monthlyData} barSize={20}>
+            <BarChart data={monthlyData} barSize={16}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={30} allowDecimals={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} width={30} allowDecimals={false} />
               <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
               <Bar dataKey="orders" radius={[3, 3, 0, 0]}>
                 {monthlyData.map((_, i) => (
@@ -537,10 +536,10 @@ export default function Reports() {
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
           <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Cost {showNet ? 'NET' : 'inc VAT'} ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={monthlyData} barSize={20}>
+            <BarChart data={monthlyData} barSize={16}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-              <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
+              <XAxis dataKey="month" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} width={45} tickFormatter={(v: number) => `£${v}`} />
               <Tooltip
                 contentStyle={{ fontSize: 12, borderRadius: 8 }}
                 formatter={(value: any) => [`£${Number(value).toFixed(2)}`, showNet ? 'Cost NET' : 'Cost inc VAT']}
@@ -554,30 +553,33 @@ export default function Reports() {
           </ResponsiveContainer>
         </div>
 
-        {/* Unused Minimum TopUp */}
+        {/* Minimum TopUp Charges */}
         {topUpYearTotal > 0 && (
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-semibold text-gray-900">Minimum TopUp Charges {showNet ? 'NET' : 'inc VAT'} ({year})</h3>
-              <span className="text-xs text-amber-600 font-medium">Year total: £{(showNet ? topUpYearTotalNet : topUpYearTotal).toFixed(2)}</span>
+              <h3 className="text-sm font-semibold text-gray-900">TopUp Charges {showNet ? 'NET' : 'inc VAT'} ({year})</h3>
+              <span className="text-xs text-amber-600 font-medium">£{(showNet ? topUpYearTotalNet : topUpYearTotal).toFixed(2)}</span>
             </div>
             <ResponsiveContainer width="100%" height={180}>
-              <BarChart data={topUpMonthly} barSize={14}>
+              <BarChart data={topUpMonthly} barSize={12}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-                <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
+                <XAxis dataKey="month" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} width={45} tickFormatter={(v: number) => `£${v}`} />
                 <Tooltip
                   contentStyle={{ fontSize: 12, borderRadius: 8 }}
                   formatter={(value: any) => `£${Number(value).toFixed(2)}`}
                 />
-                <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 4, fontSize: 11 }} />
+                <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 4, fontSize: 10 }} />
                 <Bar dataKey={showNet ? 'kitchenUniformsNet' : 'kitchenUniforms'} name="Kitchen Uniforms" stackId="topup" fill="#1B2A4A" radius={[0, 0, 0, 0]} />
                 <Bar dataKey={showNet ? 'linenNapkinsNet' : 'linenNapkins'} name="Linen Napkins" stackId="topup" fill="#D97706" radius={[3, 3, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
         )}
+      </div>
 
+      {/* Charts — department row */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Orders by Department */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
           <h3 className="text-sm font-semibold text-gray-900 mb-4">Orders by Department</h3>
