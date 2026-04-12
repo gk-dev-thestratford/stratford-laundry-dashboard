@@ -82,7 +82,7 @@ export default function ReconciliationHistory() {
     }
   }
 
-  function exportExcel(h: SavedReconciliation) {
+  async function exportExcel(h: SavedReconciliation) {
     const summarySheet = [{
       'Invoice Number': h.invoice_number,
       'Invoice Date': h.invoice_date,
@@ -107,9 +107,34 @@ export default function ReconciliationHistory() {
       'Total NET (\u00a3)': d.totalCostNet,
       'Total inc VAT (\u00a3)': d.totalCostGross,
     }))
+
+    // Fetch all orders that were matched to this reconciliation
+    const { data: reconOrders } = await supabase
+      .from('orders').select('*, department:departments(name), order_items(*)')
+      .eq('reconciliation_id', h.id)
+      .order('created_at', { ascending: true })
+
+    const ordersSheet = (reconOrders ?? []).map(o => {
+      const itemTotal = (o.order_items ?? []).reduce((s: number, i: any) =>
+        s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
+      const cost = o.total_price ?? (itemTotal > 0 ? Math.round(itemTotal * 100) / 100 : 0)
+      const description = (o.order_items ?? []).map((i: any) =>
+        `${i.quantity_sent ?? 0}x ${i.item_name}`).join(', ')
+      return {
+        'Date': format(new Date(o.created_at), 'dd/MM/yyyy'),
+        'Docket': o.docket_number,
+        'Department': o.department?.name || '—',
+        'Type': o.order_type,
+        'Description': description || '—',
+        'NET (\u00a3)': cost,
+        'Gross (\u00a3)': +(cost * 1.2).toFixed(2),
+      }
+    })
+
     const wb = utils.book_new()
     utils.book_append_sheet(wb, utils.json_to_sheet(summarySheet), 'Summary')
     if (deptSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(deptSheet), 'Department Breakdown')
+    if (ordersSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(ordersSheet), 'Reconciled Orders')
     writeFile(wb, `reconciliation-${h.invoice_number || 'report'}-${format(new Date(h.created_at), 'yyyy-MM-dd')}.xlsx`)
   }
 

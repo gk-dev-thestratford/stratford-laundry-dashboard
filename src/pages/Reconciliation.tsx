@@ -497,12 +497,10 @@ export default function Reconciliation() {
       }
       const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
         .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
-        .is('reconciliation_id', null)
         .order('created_at', { ascending: true })
       fetchedOrders = data ?? []
     } else {
       const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-        .is('reconciliation_id', null)
         .order('created_at', { ascending: false }).limit(500)
       fetchedOrders = data ?? []
     }
@@ -536,12 +534,10 @@ export default function Reconciliation() {
         }
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
           .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
-          .is('reconciliation_id', null)
           .order('created_at', { ascending: true })
         fetchedOrders = data ?? []
       } else {
         const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .is('reconciliation_id', null)
           .order('created_at', { ascending: false }).limit(500)
         fetchedOrders = data ?? []
       }
