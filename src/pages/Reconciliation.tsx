@@ -999,6 +999,9 @@ export default function Reconciliation() {
     }
 
     if (savedRec) {
+      // Remove any existing TopUp rows for this invoice (prevents duplicates on re-save)
+      await supabase.from('reconciliation_topups').delete().eq('invoice_number', invoice.invoiceNumber)
+
       const topUpRows: any[] = []
       if (napkinSummary) {
         for (const w of napkinSummary.weeks) {

@@ -23,6 +23,7 @@ export default function Reports() {
   const [discrepancyFilter, setDiscrepancyFilter] = useState<'all' | 'discrepancies'>('all')
   const [breakdownDeptId, setBreakdownDeptId] = useState<string>('_all')
   const [outstandingExpanded, setOutstandingExpanded] = useState(false)
+  const [showNet, setShowNet] = useState(false)
 
   const [topUpData, setTopUpData] = useState<any[]>([])
 
@@ -103,24 +104,26 @@ export default function Reports() {
   // ── Monthly TopUp data (from reconciliation_topups table) ──
   const topUpMonthly = useMemo(() => {
     return Array.from({ length: 12 }, (_, m) => {
-      let kitchenUniforms = 0, linenNapkins = 0
+      let uniformsNet = 0, napkinsNet = 0
       for (const row of topUpData) {
         const date = row.week_start ? new Date(row.week_start) : new Date(row.created_at)
         if (date.getMonth() === m) {
-          if (row.category === 'Kitchen Uniforms') kitchenUniforms += row.topup_gross
-          else if (row.category === 'Linen Napkins') linenNapkins += row.topup_gross
+          if (row.category === 'Kitchen Uniforms') uniformsNet += Number(row.topup_net)
+          else if (row.category === 'Linen Napkins') napkinsNet += Number(row.topup_net)
         }
       }
       return {
         month: MONTHS[m + 1] as string,
-        kitchenUniforms: Number(kitchenUniforms.toFixed(2)),
-        linenNapkins: Number(linenNapkins.toFixed(2)),
-        total: Number((kitchenUniforms + linenNapkins).toFixed(2)),
+        kitchenUniforms: Number((uniformsNet * 1.2).toFixed(2)),
+        linenNapkins: Number((napkinsNet * 1.2).toFixed(2)),
+        kitchenUniformsNet: Number(uniformsNet.toFixed(2)),
+        linenNapkinsNet: Number(napkinsNet.toFixed(2)),
       }
     })
   }, [topUpData])
 
-  const topUpYearTotal = useMemo(() => topUpMonthly.reduce((s, m) => s + m.total, 0), [topUpMonthly])
+  const topUpYearTotal = useMemo(() => topUpMonthly.reduce((s, m) => s + m.kitchenUniforms + m.linenNapkins, 0), [topUpMonthly])
+  const topUpYearTotalNet = useMemo(() => topUpMonthly.reduce((s, m) => s + m.kitchenUniformsNet + m.linenNapkinsNet, 0), [topUpMonthly])
 
   // ── Department breakdown ──
   const deptData = useMemo(() => {
@@ -141,7 +144,7 @@ export default function Reports() {
   }, [filtered])
 
   const deptChartData = useMemo(() => deptData.map(d => ({ name: d.name, orders: d.orders })), [deptData])
-  const deptCostChartData = useMemo(() => deptData.filter(d => d.cost > 0).map(d => ({ name: d.name, costIncVat: Number((d.cost * 1.2).toFixed(2)) })), [deptData])
+  const deptCostChartData = useMemo(() => deptData.filter(d => d.cost > 0).map(d => ({ name: d.name, costNet: Number(d.cost.toFixed(2)), costIncVat: Number((d.cost * 1.2).toFixed(2)) })), [deptData])
 
   // ── Item breakdown by month per department ──
   const ITEM_COLORS = ['#1B2A4A', '#C9A84C', '#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6', '#6366F1', '#F97316', '#84CC16', '#A855F7', '#0EA5E9']
@@ -503,6 +506,15 @@ export default function Reports() {
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="lg:col-span-2 flex justify-end">
+          <button
+            onClick={() => setShowNet(v => !v)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${showNet ? 'bg-navy text-white border-navy' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+          >
+            {showNet ? 'NET' : 'inc VAT'}
+          </button>
+        </div>
+
         {/* Monthly Orders */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
           <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Orders ({year})</h3>
@@ -521,9 +533,9 @@ export default function Reports() {
           </ResponsiveContainer>
         </div>
 
-        {/* Monthly Cost inc VAT */}
+        {/* Monthly Cost */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
-          <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Cost inc VAT ({year})</h3>
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Monthly Cost {showNet ? 'NET' : 'inc VAT'} ({year})</h3>
           <ResponsiveContainer width="100%" height={180}>
             <BarChart data={monthlyData} barSize={20}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
@@ -531,9 +543,9 @@ export default function Reports() {
               <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
               <Tooltip
                 contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                formatter={(value: any) => [`£${Number(value).toFixed(2)}`, 'Cost inc VAT']}
+                formatter={(value: any) => [`£${Number(value).toFixed(2)}`, showNet ? 'Cost NET' : 'Cost inc VAT']}
               />
-              <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[3, 3, 0, 0]}>
+              <Bar dataKey={showNet ? 'cost' : 'costIncVat'} name={showNet ? 'Cost NET' : 'Cost inc VAT'} radius={[3, 3, 0, 0]}>
                 {monthlyData.map((_, i) => (
                   <Cell key={i} fill={month > 0 && i === month - 1 ? '#C9A84C' : '#10B981'} />
                 ))}
@@ -542,14 +554,14 @@ export default function Reports() {
           </ResponsiveContainer>
         </div>
 
-        {/* Unused Minimum TopUp inc VAT */}
+        {/* Unused Minimum TopUp */}
         {topUpYearTotal > 0 && (
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-semibold text-gray-900">Unused Minimum TopUp inc VAT ({year})</h3>
-              <span className="text-xs text-amber-600 font-medium">Year total: £{topUpYearTotal.toFixed(2)}</span>
+              <h3 className="text-sm font-semibold text-gray-900">Minimum TopUp Charges {showNet ? 'NET' : 'inc VAT'} ({year})</h3>
+              <span className="text-xs text-amber-600 font-medium">Year total: £{(showNet ? topUpYearTotalNet : topUpYearTotal).toFixed(2)}</span>
             </div>
-            <ResponsiveContainer width="100%" height={200}>
+            <ResponsiveContainer width="100%" height={180}>
               <BarChart data={topUpMonthly} barSize={14}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
                 <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
@@ -558,9 +570,9 @@ export default function Reports() {
                   contentStyle={{ fontSize: 12, borderRadius: 8 }}
                   formatter={(value: any) => `£${Number(value).toFixed(2)}`}
                 />
-                <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 8, fontSize: 12 }} />
-                <Bar dataKey="kitchenUniforms" name="Kitchen Uniforms" stackId="topup" fill="#1B2A4A" radius={[0, 0, 0, 0]} />
-                <Bar dataKey="linenNapkins" name="Linen Napkins" stackId="topup" fill="#D97706" radius={[3, 3, 0, 0]} />
+                <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 4, fontSize: 11 }} />
+                <Bar dataKey={showNet ? 'kitchenUniformsNet' : 'kitchenUniforms'} name="Kitchen Uniforms" stackId="topup" fill="#1B2A4A" radius={[0, 0, 0, 0]} />
+                <Bar dataKey={showNet ? 'linenNapkinsNet' : 'linenNapkins'} name="Linen Napkins" stackId="topup" fill="#D97706" radius={[3, 3, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -588,9 +600,9 @@ export default function Reports() {
           )}
         </div>
 
-        {/* Cost by Department inc VAT */}
+        {/* Cost by Department */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
-          <h3 className="text-sm font-semibold text-gray-900 mb-4">Cost by Department inc VAT</h3>
+          <h3 className="text-sm font-semibold text-gray-900 mb-4">Cost by Department {showNet ? 'NET' : 'inc VAT'}</h3>
           {deptCostChartData.length > 0 ? (
             <ResponsiveContainer width="100%" height={Math.max(180, deptCostChartData.length * 36)}>
               <BarChart data={deptCostChartData} layout="vertical" barSize={16}>
@@ -599,9 +611,9 @@ export default function Reports() {
                 <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={110} />
                 <Tooltip
                   contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                  formatter={(value: any) => [`£${Number(value).toFixed(2)}`, 'Cost inc VAT']}
+                  formatter={(value: any) => [`£${Number(value).toFixed(2)}`, showNet ? 'Cost NET' : 'Cost inc VAT']}
                 />
-                <Bar dataKey="costIncVat" name="Cost inc VAT" radius={[0, 3, 3, 0]}>
+                <Bar dataKey={showNet ? 'costNet' : 'costIncVat'} name={showNet ? 'Cost NET' : 'Cost inc VAT'} radius={[0, 3, 3, 0]}>
                   {deptCostChartData.map((_, i) => (
                     <Cell key={i} fill={DEPT_COLORS[i % DEPT_COLORS.length]} />
                   ))}
