@@ -639,8 +639,61 @@ export default function Reconciliation() {
       if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
     }
 
+    // Save weekly minimum TopUp data for historical reporting
+    if (savedRec) {
+      const topUpRows: any[] = []
+
+      // Napkin TopUp weeks
+      if (napkinSummary) {
+        for (const w of napkinSummary.weeks) {
+          if (w.topUpNet <= 0) continue
+          topUpRows.push({
+            reconciliation_id: savedRec.id,
+            invoice_number: invoice.invoiceNumber,
+            category: 'Linen Napkins',
+            week_date_range: w.dateRange,
+            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
+            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
+            topup_net: +w.topUpNet.toFixed(2),
+            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
+            sent_qty: w.invoiceSentQty,
+            topup_qty: w.topUpQty,
+          })
+        }
+      }
+
+      // Uniform TopUp weeks
+      if (uniformMinSummary) {
+        for (const w of uniformMinSummary.weeks) {
+          if (w.topUpNet <= 0) continue
+          const totalSent = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.invoiceSent[k], 0)
+          const totalTopUpQty = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.topUp[k], 0)
+          topUpRows.push({
+            reconciliation_id: savedRec.id,
+            invoice_number: invoice.invoiceNumber,
+            category: 'Kitchen Uniforms',
+            week_date_range: w.dateRange,
+            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
+            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
+            topup_net: +w.topUpNet.toFixed(2),
+            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
+            sent_qty: totalSent,
+            topup_qty: totalTopUpQty,
+            details: Object.fromEntries(uniformMinSummary.ITEM_KEYS.map(k => [
+              k, { sent: w.invoiceSent[k], topUp: w.topUp[k] }
+            ])),
+          })
+        }
+      }
+
+      if (topUpRows.length > 0) {
+        const { error: topUpErr } = await supabase.from('reconciliation_topups').insert(topUpRows)
+        if (topUpErr) console.error('Failed to save TopUp data:', topUpErr)
+      }
+    }
+
     setSaving(false); setSaved(true); loadHistory()
-  }, [result, invoice, file, loadHistory])
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary])
 
   const filteredRows = useMemo(() => {
     if (!result) return []

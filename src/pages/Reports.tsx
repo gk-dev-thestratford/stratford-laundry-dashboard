@@ -24,15 +24,21 @@ export default function Reports() {
   const [breakdownDeptId, setBreakdownDeptId] = useState<string>('_all')
   const [outstandingExpanded, setOutstandingExpanded] = useState(false)
 
+  const [topUpData, setTopUpData] = useState<any[]>([])
+
   const fetchData = useCallback(async () => {
     setLoading(true)
-    const { data } = await supabase
-      .from('orders')
-      .select('*, department:departments(*), order_items(*)')
-      .gte('created_at', `${year}-01-01T00:00:00.000Z`)
-      .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
-      .order('created_at', { ascending: true })
-    setOrders(data ?? [])
+    const [ordersRes, topUpRes] = await Promise.all([
+      supabase.from('orders').select('*, department:departments(*), order_items(*)')
+        .gte('created_at', `${year}-01-01T00:00:00.000Z`)
+        .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
+        .order('created_at', { ascending: true }),
+      supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at')
+        .gte('created_at', `${year}-01-01T00:00:00.000Z`)
+        .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
+    ])
+    setOrders(ordersRes.data ?? [])
+    setTopUpData(topUpRes.data ?? [])
     setLoading(false)
   }, [year])
 
@@ -93,6 +99,28 @@ export default function Reports() {
       return { month: MONTHS[m + 1] as string, orders: mo.length, sent, received, outstanding: sent - received, cost: Number(cost.toFixed(2)), costIncVat: Number((cost * 1.2).toFixed(2)) }
     })
   }, [orders])
+
+  // ── Monthly TopUp data (from reconciliation_topups table) ──
+  const topUpMonthly = useMemo(() => {
+    return Array.from({ length: 12 }, (_, m) => {
+      let kitchenUniforms = 0, linenNapkins = 0
+      for (const row of topUpData) {
+        const date = row.week_start ? new Date(row.week_start) : new Date(row.created_at)
+        if (date.getMonth() === m) {
+          if (row.category === 'Kitchen Uniforms') kitchenUniforms += row.topup_gross
+          else if (row.category === 'Linen Napkins') linenNapkins += row.topup_gross
+        }
+      }
+      return {
+        month: MONTHS[m + 1] as string,
+        kitchenUniforms: Number(kitchenUniforms.toFixed(2)),
+        linenNapkins: Number(linenNapkins.toFixed(2)),
+        total: Number((kitchenUniforms + linenNapkins).toFixed(2)),
+      }
+    })
+  }, [topUpData])
+
+  const topUpYearTotal = useMemo(() => topUpMonthly.reduce((s, m) => s + m.total, 0), [topUpMonthly])
 
   // ── Department breakdown ──
   const deptData = useMemo(() => {
@@ -513,6 +541,30 @@ export default function Reports() {
             </BarChart>
           </ResponsiveContainer>
         </div>
+
+        {/* Unused Minimum TopUp inc VAT */}
+        {topUpYearTotal > 0 && (
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-semibold text-gray-900">Unused Minimum TopUp inc VAT ({year})</h3>
+              <span className="text-xs text-amber-600 font-medium">Year total: £{topUpYearTotal.toFixed(2)}</span>
+            </div>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={topUpMonthly} barSize={14}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(value: any, name: string) => [`£${Number(value).toFixed(2)}`, name]}
+                />
+                <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 8, fontSize: 12 }} />
+                <Bar dataKey="kitchenUniforms" name="Kitchen Uniforms" stackId="topup" fill="#1B2A4A" radius={[0, 0, 0, 0]} />
+                <Bar dataKey="linenNapkins" name="Linen Napkins" stackId="topup" fill="#D97706" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
 
         {/* Orders by Department */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
