@@ -60,12 +60,23 @@ export interface NapkinDeptAllocation {
   totalCost: number
 }
 
+export interface NapkinWeekSummary {
+  dateRange: string
+  invoiceSentQty: number
+  topUpQty: number
+  topUpNet: number
+  totalChargedQty: number
+  totalNet: number
+  deptBreakdown: { deptName: string; sentQty: number; topUpAlloc: number; totalCost: number }[]
+}
+
 export function generateReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
-  uniformMinWeeks?: UniformMinWeek[]
+  uniformMinWeeks?: UniformMinWeek[],
+  napkinWeeks?: NapkinWeekSummary[]
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
@@ -225,6 +236,63 @@ export function generateReconciliationPdf(
   y = (doc as any).lastAutoTable.finalY + 8
 
 
+  // ── Napkin Weekly Minimum TopUp Breakdown ──
+  if (napkinWeeks && napkinWeeks.length > 0) {
+    y = (doc as any).lastAutoTable?.finalY ?? y
+    if (y > doc.internal.pageSize.getHeight() - 60) { doc.addPage(); y = 20 }
+    y += 8
+    doc.setTextColor(NAVY)
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.text('Napkin Minimum \u2014 Weekly TopUp Breakdown', 14, y)
+    y += 4
+
+    const weekBody = napkinWeeks.map(w => [
+      w.dateRange,
+      w.invoiceSentQty.toLocaleString(),
+      w.topUpQty.toLocaleString(),
+      w.totalChargedQty.toLocaleString(),
+      `\u00a3${w.topUpNet.toFixed(2)}`,
+      `\u00a3${w.totalNet.toFixed(2)}`,
+    ])
+    const totSentQty = napkinWeeks.reduce((s, w) => s + w.invoiceSentQty, 0)
+    const totTopUpQty = napkinWeeks.reduce((s, w) => s + w.topUpQty, 0)
+    const totChargedQty = napkinWeeks.reduce((s, w) => s + w.totalChargedQty, 0)
+    const totTopUpNet = napkinWeeks.reduce((s, w) => s + w.topUpNet, 0)
+    const totNet = napkinWeeks.reduce((s, w) => s + w.totalNet, 0)
+    weekBody.push([
+      `Total (${napkinWeeks.length} weeks)`,
+      totSentQty.toLocaleString(), totTopUpQty.toLocaleString(), totChargedQty.toLocaleString(),
+      `\u00a3${totTopUpNet.toFixed(2)}`, `\u00a3${totNet.toFixed(2)}`,
+    ])
+
+    autoTable(doc, {
+      startY: y,
+      head: [['Week', 'Sent', 'TopUp Qty', 'Total Charged', 'TopUp NET', 'Total NET']],
+      body: weekBody,
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: '#FAFAFA' },
+      columnStyles: {
+        1: { halign: 'right' },
+        2: { halign: 'right' },
+        3: { halign: 'right' },
+        4: { halign: 'right' },
+        5: { halign: 'right', fontStyle: 'bold' },
+      },
+      margin: { left: 14, right: 14 },
+      didParseCell: (data) => {
+        if (data.section === 'body' && data.row.index === weekBody.length - 1) {
+          data.cell.styles.fontStyle = 'bold'
+          data.cell.styles.fillColor = LIGHT_GRAY
+        }
+        if (data.section === 'body' && data.column.index === 4 && data.row.index < weekBody.length - 1) {
+          data.cell.styles.textColor = '#D97706'
+        }
+      },
+    })
+  }
+
   // ── Napkin Department Cost Allocation ──
   if (napkinDeptAllocation && napkinDeptAllocation.length > 0) {
     y = (doc as any).lastAutoTable?.finalY ?? y
@@ -347,9 +415,10 @@ export function downloadReconciliationPdf(
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
-  uniformMinWeeks?: UniformMinWeek[]
+  uniformMinWeeks?: UniformMinWeek[],
+  napkinWeeks?: NapkinWeekSummary[]
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -359,8 +428,9 @@ export function generateReconciliationPdfBlob(
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
-  uniformMinWeeks?: UniformMinWeek[]
+  uniformMinWeeks?: UniformMinWeek[],
+  napkinWeeks?: NapkinWeekSummary[]
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks)
   return doc.output('blob')
 }

@@ -594,7 +594,18 @@ export default function Reconciliation() {
         })),
         topUpNet: w.topUpNet,
       }))
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf)
+      const napkinWeeksForPdf = napkinSummary?.weeks.map(w => ({
+        dateRange: w.dateRange,
+        invoiceSentQty: w.invoiceSentQty,
+        topUpQty: w.topUpQty,
+        topUpNet: w.topUpNet,
+        totalChargedQty: w.totalChargedQty,
+        totalNet: w.totalNet,
+        deptBreakdown: w.deptBreakdown.map(d => ({
+          deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
+        })),
+      }))
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -1462,7 +1473,18 @@ export default function Reconciliation() {
       })),
       topUpNet: w.topUpNet,
     }))
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf)
+    const napkinWeeksForPdf = napkinSummary?.weeks.map(w => ({
+      dateRange: w.dateRange,
+      invoiceSentQty: w.invoiceSentQty,
+      topUpQty: w.topUpQty,
+      topUpNet: w.topUpNet,
+      totalChargedQty: w.totalChargedQty,
+      totalNet: w.totalNet,
+      deptBreakdown: w.deptBreakdown.map(d => ({
+        deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
+      })),
+    }))
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
   }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary])
 
   // ── Resolution badge helper ──
