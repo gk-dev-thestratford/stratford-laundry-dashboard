@@ -1118,7 +1118,7 @@ export default function Reconciliation() {
   const [priceUpdateError, setPriceUpdateError] = useState<string | null>(null)
 
   // ── Action: update prices to match invoice ──
-  // Distributes invoice total across items at 2dp, adjusting the last item to absorb rounding.
+  // Sets per-item unit price (full precision) and total_price (authoritative, 2dp).
   const handleUpdatePrice = useCallback(async (row: ReconciliationRow) => {
     if (!row.order || !invoice) return
     const orderId = row.order.id
@@ -1158,39 +1158,18 @@ export default function Reconciliation() {
         return
       }
 
-      const basePrice = Math.round(invoiceNet / totalQty * 100) / 100
-      let runningPennies = 0
+      const unitPrice = invoiceNet / totalQty
       const errors: string[] = []
       for (let idx = 0; idx < validItems.length; idx++) {
         const item = validItems[idx]
-        const qty = item.quantity_sent ?? 0
-        let price: number
-        if (idx === validItems.length - 1) {
-          const remainderPennies = Math.round(invoiceNet * 100) - runningPennies
-          price = Math.round(remainderPennies / qty) / 100
-        } else {
-          price = basePrice
-          runningPennies += Math.round(price * qty * 100)
-        }
         const { error: itemErr, data: updatedRows } = await supabase.from('order_items')
-          .update({ price_at_time: price }).eq('id', item.id).select('id')
+          .update({ price_at_time: unitPrice }).eq('id', item.id).select('id')
         if (itemErr) errors.push(`Item "${item.item_name}": ${itemErr.message}`)
         else if (!updatedRows || updatedRows.length === 0) errors.push(`Item "${item.item_name}": update had no effect (possible RLS policy)`)
       }
 
       const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
       if (orderErr) errors.push(`Order total: ${orderErr.message}`)
-
-      // Verify: re-fetch items and check the computed total actually matches
-      const { data: verifyItems } = await supabase.from('order_items').select('*').eq('order_id', orderId)
-      if (verifyItems) {
-        const verifyTotal = Math.round(verifyItems.reduce((s: number, i: any) =>
-          s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0) * 100) / 100
-        const expectedTotal = +invoiceNet.toFixed(2)
-        if (Math.abs(verifyTotal - expectedTotal) > 0.01) {
-          errors.push(`Verification failed: items sum to £${verifyTotal.toFixed(2)} but expected £${expectedTotal.toFixed(2)}. Item prices may not have saved.`)
-        }
-      }
 
       if (errors.length > 0) {
         setPriceUpdateError(`Docket ${docket}: ${errors.join('; ')}`)
@@ -1274,25 +1253,14 @@ export default function Reconciliation() {
       // Create order items from parsed invoice line items
       if (newOrder && row.invoiceLine.items.length > 0) {
         const totalItemQty = row.invoiceLine.items.reduce((s, it) => s + it.quantity, 0)
-        const basePrice = totalItemQty > 0 ? Math.round(row.invoiceLine.net / totalItemQty * 100) / 100 : row.invoiceLine.net
-        let runningPennies = 0
-        const itemInserts = row.invoiceLine.items.map((it, idx) => {
-          let price: number
-          if (idx === row.invoiceLine.items.length - 1) {
-            const remainderPennies = Math.round(row.invoiceLine.net * 100) - runningPennies
-            price = Math.round(remainderPennies / it.quantity) / 100
-          } else {
-            price = basePrice
-            runningPennies += Math.round(price * it.quantity * 100)
-          }
-          return {
+        const unitPrice = totalItemQty > 0 ? row.invoiceLine.net / totalItemQty : row.invoiceLine.net
+        const itemInserts = row.invoiceLine.items.map((it) => ({
             order_id: newOrder.id,
             item_name: it.name,
             quantity_sent: it.quantity,
             quantity_received: it.quantity,
-            price_at_time: price,
-          }
-        })
+            price_at_time: unitPrice,
+        }))
         await supabase.from('order_items').insert(itemInserts)
       } else if (newOrder) {
         // No parsed items — create a single generic item
