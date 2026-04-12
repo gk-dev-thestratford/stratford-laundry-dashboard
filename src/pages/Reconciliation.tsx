@@ -127,13 +127,49 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
       counts.set(row.order.department.name, (counts.get(row.order.department.name) || 0) + 1)
     }
 
+    const NAPKIN_TOPUP_DEPTS = ['Kitchen E20 Front', 'Lounge', 'Events']
+    const MAIN_KITCHEN_NAME = 'Main Kitchen'
+
     for (const topUp of topUpCharges) {
       const secType = topUp.sectionType || 'staff'
       const orderType = sectionTypeToOrderType(secType as InvoiceSectionType)
       const deptCounts = sectionDeptCounts.get(secType) || sectionDeptCounts.get(orderType)
 
-      if (deptCounts && deptCounts.size > 0) {
-        // Distribute TopUp proportionally across all departments by order count
+      if (secType === 'staff') {
+        // Uniform TopUp goes 100% to Main Kitchen
+        const targetName = MAIN_KITCHEN_NAME
+        if (!deptMap.has(targetName)) {
+          deptMap.set(targetName, {
+            departmentName: targetName, departmentId: null,
+            orderCount: 0, invoiceNet: 0, invoiceGross: 0,
+            systemTotal: 0, difference: 0, allocatedTopUp: 0,
+            totalCostNet: 0, totalCostGross: 0,
+          })
+        }
+        deptMap.get(targetName)!.allocatedTopUp += topUp.net
+      } else if (secType === 'napkins' && deptCounts && deptCounts.size > 0) {
+        // Napkin TopUp distributed proportionally only across eligible departments
+        const eligibleCounts = new Map<string, number>()
+        for (const [name, count] of deptCounts) {
+          if (NAPKIN_TOPUP_DEPTS.includes(name)) eligibleCounts.set(name, count)
+        }
+        const totalCount = Array.from(eligibleCounts.values()).reduce((s, c) => s + c, 0)
+        if (totalCount > 0) {
+          for (const [name, count] of eligibleCounts) {
+            const share = +(topUp.net * count / totalCount).toFixed(2)
+            if (!deptMap.has(name)) {
+              deptMap.set(name, {
+                departmentName: name, departmentId: null,
+                orderCount: 0, invoiceNet: 0, invoiceGross: 0,
+                systemTotal: 0, difference: 0, allocatedTopUp: 0,
+                totalCostNet: 0, totalCostGross: 0,
+              })
+            }
+            deptMap.get(name)!.allocatedTopUp += share
+          }
+        }
+      } else if (deptCounts && deptCounts.size > 0) {
+        // Other sections: distribute TopUp proportionally across all departments
         const totalCount = Array.from(deptCounts.values()).reduce((s, c) => s + c, 0)
         for (const [name, count] of deptCounts) {
           const share = +(topUp.net * count / totalCount).toFixed(2)
@@ -745,11 +781,16 @@ export default function Reconciliation() {
       }
 
       // Calculate department breakdown with cost allocation
-      const totalSent = Array.from(deptMap.values()).reduce((s, d) => s + d.qty, 0)
+      // TopUp only allocated to eligible napkin departments
+      const NAPKIN_TOPUP_DEPTS = ['Kitchen E20 Front', 'Lounge', 'Events']
+      const eligibleSent = Array.from(deptMap.values())
+        .filter(d => NAPKIN_TOPUP_DEPTS.includes(d.name))
+        .reduce((s, d) => s + d.qty, 0)
       week.deptBreakdown = Array.from(deptMap.entries()).map(([id, d]) => {
-        const pctShare = totalSent > 0 ? d.qty / totalSent * 100 : 0
+        const isEligible = NAPKIN_TOPUP_DEPTS.includes(d.name)
+        const pctShare = isEligible && eligibleSent > 0 ? d.qty / eligibleSent * 100 : 0
         const actualCost = +(d.qty * UNIT_RATE).toFixed(2)
-        const topUpAlloc = +(pctShare / 100 * week.topUpNet).toFixed(2)
+        const topUpAlloc = isEligible ? +(pctShare / 100 * week.topUpNet).toFixed(2) : 0
         return {
           deptId: id === '_none' ? null : id,
           deptName: d.name,
