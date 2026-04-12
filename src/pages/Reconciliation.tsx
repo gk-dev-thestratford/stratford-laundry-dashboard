@@ -424,6 +424,8 @@ export default function Reconciliation() {
   const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
   const [hskLinenNames, setHskLinenNames] = useState<Set<string>>(new Set())
   const [broaderSearch, setBroaderSearch] = useState(false)
+  const [deptBreakdownOpen, setDeptBreakdownOpen] = useState(true)
+  const [uniformMinOpen, setUniformMinOpen] = useState(true)
 
   // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
   useEffect(() => {
@@ -1697,12 +1699,12 @@ export default function Reconciliation() {
 
       {/* Department Breakdown */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
-          <ChevronRight className="w-4 h-4 text-gray-500" />
+        <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2 cursor-pointer select-none" onClick={() => setDeptBreakdownOpen(v => !v)}>
+          <ChevronRight className={`w-4 h-4 text-gray-500 transition-transform ${deptBreakdownOpen ? 'rotate-90' : ''}`} />
           <h3 className="text-sm font-semibold text-gray-900">Department Breakdown</h3>
           {totalTopUp > 0 && <span className="text-xs text-gray-400 ml-2">(TopUp allocated by service type)</span>}
         </div>
-        <div className="overflow-x-auto">
+        {deptBreakdownOpen && <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-gray-200 bg-gray-50">
               <th className="px-4 py-2.5 text-left font-medium text-gray-600">Department / Line</th>
@@ -1737,7 +1739,7 @@ export default function Reconciliation() {
               <td className="px-4 py-3 text-right">{'\u00a3'}{departmentDisplayRows.reduce((s, r) => s + r.totalGross, 0).toFixed(2)}</td>
             </tr></tfoot>
           </table>
-        </div>
+        </div>}
       </div>
 
       {/* Napkin Usage Summary */}
@@ -1888,16 +1890,16 @@ export default function Reconciliation() {
       {/* Chef Uniform Minimum Usage */}
       {uniformMinSummary && (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between">
+          <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between cursor-pointer select-none" onClick={() => setUniformMinOpen(v => !v)}>
             <div className="flex items-center gap-2">
-              <ChevronRight className="w-4 h-4 text-gray-500" />
+              <ChevronRight className={`w-4 h-4 text-gray-500 transition-transform ${uniformMinOpen ? 'rotate-90' : ''}`} />
               <h3 className="text-sm font-semibold text-gray-900">Chef Uniform Minimum Usage — Main Kitchen</h3>
             </div>
             <span className="text-xs text-gray-500">
               Weekly min: Jacket {uniformMinSummary.MINIMUMS['chef jacket']} | Apron {uniformMinSummary.MINIMUMS['apron']} | Trouser {uniformMinSummary.MINIMUMS['chef trouser']}
             </span>
           </div>
-          <div className="overflow-x-auto">
+          {uniformMinOpen && <><div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead><tr className="border-b border-gray-200 bg-gray-50">
                 <th className="px-3 py-2 text-left font-medium text-gray-600" rowSpan={2}>Week</th>
@@ -1959,6 +1961,7 @@ export default function Reconciliation() {
               Total unused capacity cost: {'\u00a3'}{uniformMinSummary.unusedCost.toFixed(2)}
             </div>
           </div>
+          </>}
         </div>
       )}
 
