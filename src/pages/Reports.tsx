@@ -556,7 +556,7 @@ export default function Reports() {
                 <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v: number) => `£${v}`} />
                 <Tooltip
                   contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                  formatter={(value: any, name: string) => [`£${Number(value).toFixed(2)}`, name]}
+                  formatter={(value: any) => `£${Number(value).toFixed(2)}`}
                 />
                 <Legend iconType="circle" iconSize={8} wrapperStyle={{ paddingTop: 8, fontSize: 12 }} />
                 <Bar dataKey="kitchenUniforms" name="Kitchen Uniforms" stackId="topup" fill="#1B2A4A" radius={[0, 0, 0, 0]} />

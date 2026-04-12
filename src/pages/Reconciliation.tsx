@@ -558,143 +558,6 @@ export default function Reconciliation() {
     setChallengedItems(new Set()); setAddModal(null)
   }
 
-  const saveReconciliation = useCallback(async () => {
-    if (!result || !invoice) return
-    setSaving(true)
-    const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
-    // Detect invoice category from filename or invoice title
-    const fileName = (file?.name || '').toLowerCase()
-    const invoiceCategory = fileName.includes('bathrobe') ? 'Bathrobes'
-      : fileName.includes('napkin') ? 'Napkins'
-      : fileName.includes('table cloth') || fileName.includes('tablecloth') ? 'Table Cloths'
-      : fileName.includes('hsk') || fileName.includes('linen') ? 'HSK Linen'
-      : fileName.includes('guest') ? 'Guest Laundry'
-      : fileName.includes('staff') || fileName.includes('uniform') ? 'Staff Uniforms'
-      : 'Other'
-    const { data: { user } } = await supabase.auth.getUser()
-    const ts = Date.now()
-
-    // Upload invoice PDF to storage if we have the file
-    let invoicePath: string | null = null
-    if (file) {
-      const path = `invoices/${ts}-${file.name}`
-      const { error: uploadErr } = await supabase.storage.from('reconciliations').upload(path, file, { contentType: 'application/pdf' })
-      if (!uploadErr) invoicePath = path
-    }
-
-    // Generate and upload reconciliation PDF report
-    let reportPath: string | null = null
-    try {
-      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
-      const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
-        dateRange: w.dateRange,
-        items: uniformMinSummary.ITEM_KEYS.map(k => ({
-          key: k.charAt(0).toUpperCase() + k.slice(1),
-          sent: w.invoiceSent[k], topUp: w.topUp[k], min: uniformMinSummary.MINIMUMS[k],
-        })),
-        topUpNet: w.topUpNet,
-      }))
-      const napkinWeeksForPdf = napkinSummary?.weeks.map(w => ({
-        dateRange: w.dateRange,
-        invoiceSentQty: w.invoiceSentQty,
-        topUpQty: w.topUpQty,
-        topUpNet: w.topUpNet,
-        totalChargedQty: w.totalChargedQty,
-        totalNet: w.totalNet,
-        deptBreakdown: w.deptBreakdown.map(d => ({
-          deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
-        })),
-      }))
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
-      const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
-      const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
-      if (!rptErr) reportPath = rptName
-    } catch (e) {
-      console.error('Failed to upload PDF report:', e)
-    }
-
-    const { data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert({
-      invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
-      invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
-      invoice_net: +result.invoiceTotal.toFixed(2), invoice_gross: +(result.invoiceTotal * 1.2).toFixed(2),
-      system_total: +result.systemTotal.toFixed(2), topup_total: +totalTopUp.toFixed(2),
-      matched_count: result.stats.matched, mismatch_count: result.stats.priceMismatch,
-      not_found_count: result.stats.notFound, missing_count: result.stats.missing,
-      invoice_file_path: invoicePath,
-      report_file_path: reportPath,
-      invoice_category: invoiceCategory,
-      department_breakdown: result.departmentBreakdown.map(d => ({
-        departmentName: d.departmentName, orderCount: d.orderCount,
-        invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
-        allocatedTopUp: d.allocatedTopUp, totalCostNet: d.totalCostNet, totalCostGross: d.totalCostGross,
-      })),
-    }).select('id').single()
-    if (saveErr) console.error('Failed to save reconciliation:', saveErr)
-
-    // Issue 4: Mark matched orders as reconciled so they don't appear in future reconciliations
-    if (savedRec && result.matchedOrderIds.length > 0) {
-      const { error: stampErr } = await supabase.from('orders')
-        .update({ reconciliation_id: savedRec.id })
-        .in('id', result.matchedOrderIds)
-      if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
-    }
-
-    // Save weekly minimum TopUp data for historical reporting
-    if (savedRec) {
-      const topUpRows: any[] = []
-
-      // Napkin TopUp weeks
-      if (napkinSummary) {
-        for (const w of napkinSummary.weeks) {
-          if (w.topUpNet <= 0) continue
-          topUpRows.push({
-            reconciliation_id: savedRec.id,
-            invoice_number: invoice.invoiceNumber,
-            category: 'Linen Napkins',
-            week_date_range: w.dateRange,
-            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
-            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
-            topup_net: +w.topUpNet.toFixed(2),
-            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
-            sent_qty: w.invoiceSentQty,
-            topup_qty: w.topUpQty,
-          })
-        }
-      }
-
-      // Uniform TopUp weeks
-      if (uniformMinSummary) {
-        for (const w of uniformMinSummary.weeks) {
-          if (w.topUpNet <= 0) continue
-          const totalSent = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.invoiceSent[k], 0)
-          const totalTopUpQty = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.topUp[k], 0)
-          topUpRows.push({
-            reconciliation_id: savedRec.id,
-            invoice_number: invoice.invoiceNumber,
-            category: 'Kitchen Uniforms',
-            week_date_range: w.dateRange,
-            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
-            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
-            topup_net: +w.topUpNet.toFixed(2),
-            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
-            sent_qty: totalSent,
-            topup_qty: totalTopUpQty,
-            details: Object.fromEntries(uniformMinSummary.ITEM_KEYS.map(k => [
-              k, { sent: w.invoiceSent[k], topUp: w.topUp[k] }
-            ])),
-          })
-        }
-      }
-
-      if (topUpRows.length > 0) {
-        const { error: topUpErr } = await supabase.from('reconciliation_topups').insert(topUpRows)
-        if (topUpErr) console.error('Failed to save TopUp data:', topUpErr)
-      }
-    }
-
-    setSaving(false); setSaved(true); loadHistory()
-  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary])
-
   const filteredRows = useMemo(() => {
     if (!result) return []
     if (filter === 'all') return result.rows
@@ -1056,6 +919,134 @@ export default function Reconciliation() {
       unusedCost: ITEM_KEYS.reduce((s, k) => s + unusedCapacity[k] * PRICES[k], 0),
     }
   }, [result, invoice, orders])
+
+  // ── Save reconciliation ──
+  const saveReconciliation = useCallback(async () => {
+    if (!result || !invoice) return
+    setSaving(true)
+    const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
+    const fileName = (file?.name || '').toLowerCase()
+    const invoiceCategory = fileName.includes('bathrobe') ? 'Bathrobes'
+      : fileName.includes('napkin') ? 'Napkins'
+      : fileName.includes('table cloth') || fileName.includes('tablecloth') ? 'Table Cloths'
+      : fileName.includes('hsk') || fileName.includes('linen') ? 'HSK Linen'
+      : fileName.includes('guest') ? 'Guest Laundry'
+      : fileName.includes('staff') || fileName.includes('uniform') ? 'Staff Uniforms'
+      : 'Other'
+    const { data: { user } } = await supabase.auth.getUser()
+    const ts = Date.now()
+
+    let invoicePath: string | null = null
+    if (file) {
+      const path = `invoices/${ts}-${file.name}`
+      const { error: uploadErr } = await supabase.storage.from('reconciliations').upload(path, file, { contentType: 'application/pdf' })
+      if (!uploadErr) invoicePath = path
+    }
+
+    let reportPath: string | null = null
+    try {
+      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
+      const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
+        dateRange: w.dateRange,
+        items: uniformMinSummary.ITEM_KEYS.map(k => ({
+          key: k.charAt(0).toUpperCase() + k.slice(1),
+          sent: w.invoiceSent[k], topUp: w.topUp[k], min: uniformMinSummary.MINIMUMS[k],
+        })),
+        topUpNet: w.topUpNet,
+      }))
+      const napkinWeeksForPdf = napkinSummary?.weeks.map(w => ({
+        dateRange: w.dateRange,
+        invoiceSentQty: w.invoiceSentQty,
+        topUpQty: w.topUpQty,
+        topUpNet: w.topUpNet,
+        totalChargedQty: w.totalChargedQty,
+        totalNet: w.totalNet,
+        deptBreakdown: w.deptBreakdown.map(d => ({
+          deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
+        })),
+      }))
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
+      const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
+      const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
+      if (!rptErr) reportPath = rptName
+    } catch (e) {
+      console.error('Failed to upload PDF report:', e)
+    }
+
+    const { data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert({
+      invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
+      invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
+      invoice_net: +result.invoiceTotal.toFixed(2), invoice_gross: +(result.invoiceTotal * 1.2).toFixed(2),
+      system_total: +result.systemTotal.toFixed(2), topup_total: +totalTopUp.toFixed(2),
+      matched_count: result.stats.matched, mismatch_count: result.stats.priceMismatch,
+      not_found_count: result.stats.notFound, missing_count: result.stats.missing,
+      invoice_file_path: invoicePath,
+      report_file_path: reportPath,
+      invoice_category: invoiceCategory,
+      department_breakdown: result.departmentBreakdown.map(d => ({
+        departmentName: d.departmentName, orderCount: d.orderCount,
+        invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
+        allocatedTopUp: d.allocatedTopUp, totalCostNet: d.totalCostNet, totalCostGross: d.totalCostGross,
+      })),
+    }).select('id').single()
+    if (saveErr) console.error('Failed to save reconciliation:', saveErr)
+
+    if (savedRec && result.matchedOrderIds.length > 0) {
+      const { error: stampErr } = await supabase.from('orders')
+        .update({ reconciliation_id: savedRec.id })
+        .in('id', result.matchedOrderIds)
+      if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
+    }
+
+    if (savedRec) {
+      const topUpRows: any[] = []
+      if (napkinSummary) {
+        for (const w of napkinSummary.weeks) {
+          if (w.topUpNet <= 0) continue
+          topUpRows.push({
+            reconciliation_id: savedRec.id,
+            invoice_number: invoice.invoiceNumber,
+            category: 'Linen Napkins',
+            week_date_range: w.dateRange,
+            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
+            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
+            topup_net: +w.topUpNet.toFixed(2),
+            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
+            sent_qty: w.invoiceSentQty,
+            topup_qty: w.topUpQty,
+          })
+        }
+      }
+      if (uniformMinSummary) {
+        for (const w of uniformMinSummary.weeks) {
+          if (w.topUpNet <= 0) continue
+          const totalSent = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.invoiceSent[k], 0)
+          const totalTopUpQty = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.topUp[k], 0)
+          topUpRows.push({
+            reconciliation_id: savedRec.id,
+            invoice_number: invoice.invoiceNumber,
+            category: 'Kitchen Uniforms',
+            week_date_range: w.dateRange,
+            week_start: w.weekStart?.toISOString().slice(0, 10) ?? null,
+            week_end: w.weekEnd?.toISOString().slice(0, 10) ?? null,
+            topup_net: +w.topUpNet.toFixed(2),
+            topup_gross: +(w.topUpNet * 1.2).toFixed(2),
+            sent_qty: totalSent,
+            topup_qty: totalTopUpQty,
+            details: Object.fromEntries(uniformMinSummary.ITEM_KEYS.map(k => [
+              k, { sent: w.invoiceSent[k], topUp: w.topUp[k] }
+            ])),
+          })
+        }
+      }
+      if (topUpRows.length > 0) {
+        const { error: topUpErr } = await supabase.from('reconciliation_topups').insert(topUpRows)
+        if (topUpErr) console.error('Failed to save TopUp data:', topUpErr)
+      }
+    }
+
+    setSaving(false); setSaved(true); loadHistory()
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
