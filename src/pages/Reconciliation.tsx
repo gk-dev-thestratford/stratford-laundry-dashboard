@@ -1360,6 +1360,14 @@ export default function Reconciliation() {
         createdAt = period ? period.start.toISOString() : new Date().toISOString()
       }
 
+      // Clamp date to invoice period — if the line date falls outside, use the closest period boundary
+      // This prevents orders from being created outside the reconciliation fetch window
+      if (period) {
+        const d = new Date(createdAt)
+        if (d < period.start) createdAt = period.start.toISOString()
+        else if (d > period.end) createdAt = period.end.toISOString()
+      }
+
       // Create order
       const { data: newOrder, error: orderErr } = await supabase.from('orders').insert({
         docket_number: docket,
