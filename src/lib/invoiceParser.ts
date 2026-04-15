@@ -481,3 +481,98 @@ export function derivePeriodFromLines(invoice: ParsedInvoice): { start: Date; en
     end: new Date(sorted[sorted.length - 1].getFullYear(), sorted[sorted.length - 1].getMonth(), sorted[sorted.length - 1].getDate(), 23, 59, 59),
   }
 }
+
+// ── D140 Opera PMS Report Parser ──
+
+export interface D140Transaction {
+  date: string
+  time: string
+  roomNumber: string
+  guestName: string
+  amount: number
+  isCredit: boolean
+  description: string
+}
+
+export interface D140Report {
+  transactions: D140Transaction[]
+  grandTotal: number
+  period: { from: string; to: string }
+}
+
+export async function extractAndParseD140(file: File): Promise<D140Report> {
+  const lines = await extractPdfLines(file)
+  return parseD140Report(lines)
+}
+
+export function parseD140Report(lines: string[]): D140Report {
+  const transactions: D140Transaction[] = []
+  let grandTotal = 0
+  let periodFrom = '', periodTo = ''
+
+  // Extract period from filter line: "From Date 01-03-26 To Date 31-03-26"
+  for (const line of lines) {
+    const periodM = line.match(/From\s+Date\s+(\d{2}-\d{2}-\d{2,4})\s+To\s+Date\s+(\d{2}-\d{2}-\d{2,4})/i)
+    if (periodM) {
+      periodFrom = periodM[1]
+      periodTo = periodM[2]
+    }
+  }
+
+  // Parse transaction lines: "DD-MM-YY HH:MM ROOM_NO NAME MKT_CODE 70100 Laundry..."
+  // The D140 PDF text extraction produces lines where date, room, name, amounts appear
+  // We look for the pattern: date + time + room number + name + amount
+  const dateTimeRx = /^(\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+/
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+
+    // Grand total
+    const totalM = line.match(/Grand\s+Total\s+([\d,.-]+)/i)
+    if (totalM) {
+      grandTotal = parseFloat(totalM[1].replace(',', ''))
+      continue
+    }
+
+    const dtMatch = line.match(dateTimeRx)
+    if (!dtMatch) continue
+
+    const date = dtMatch[1]
+    const time = dtMatch[2]
+    const rest = line.slice(dtMatch[0].length)
+
+    // Extract room number (3-4 digits)
+    const roomM = rest.match(/^(\d{3,4})\s+/)
+    if (!roomM) continue
+    const roomNumber = roomM[1]
+    const afterRoom = rest.slice(roomM[0].length)
+
+    // Extract guest name (up to the market code which is 2-3 uppercase letters)
+    const nameM = afterRoom.match(/^(.+?)\s+([A-Z]{2,4})\s+(?:70100|701\d{2})/)
+    if (!nameM) continue
+    const guestName = nameM[1].trim()
+
+    // Extract amount — look for GBP followed by a number (possibly negative)
+    const amtM = line.match(/GBP\s+([-\s]?[\d,]+\.\d{2})/)
+    if (!amtM) continue
+    const amtStr = amtM[1].replace(/[\s,]/g, '')
+    const amount = parseFloat(amtStr)
+    if (isNaN(amount)) continue
+
+    transactions.push({
+      date,
+      time,
+      roomNumber,
+      guestName,
+      amount: Math.abs(amount),
+      isCredit: amount < 0,
+      description: 'Laundry - Dry Cleaning',
+    })
+  }
+
+  return {
+    transactions,
+    grandTotal,
+    period: { from: periodFrom, to: periodTo },
+  }
+}

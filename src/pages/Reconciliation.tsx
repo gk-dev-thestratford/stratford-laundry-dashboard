@@ -5,6 +5,7 @@ import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
+  extractAndParseD140, type D140Report, type D140Transaction,
 } from '../lib/invoiceParser'
 import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals } from '../lib/pdfReport'
 import type { Order, OrderType, Department } from '../types'
@@ -431,6 +432,8 @@ export default function Reconciliation() {
   const [broaderSearch, setBroaderSearch] = useState(false)
   const [deptBreakdownOpen, setDeptBreakdownOpen] = useState(true)
   const [uniformMinOpen, setUniformMinOpen] = useState(true)
+  const [d140Report, setD140Report] = useState<D140Report | null>(null)
+  const [d140Loading, setD140Loading] = useState(false)
 
   // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
   useEffect(() => {
@@ -563,7 +566,75 @@ export default function Reconciliation() {
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
+    setD140Report(null)
   }
+
+  const isGuestInvoice = invoice?.sections.some(s => s.type === 'guest') ?? false
+
+  const handleD140File = useCallback(async (f: File) => {
+    if (!f.name.toLowerCase().endsWith('.pdf')) return
+    setD140Loading(true)
+    try {
+      const report = await extractAndParseD140(f)
+      setD140Report(report)
+      console.log(`[D140] Parsed ${report.transactions.length} transactions, total £${report.grandTotal}`)
+    } catch (e) {
+      console.error('Failed to parse D140 report:', e)
+    } finally {
+      setD140Loading(false)
+    }
+  }, [])
+
+  // Cross-reference guest invoice lines with D140 Opera transactions
+  const guestMarginData = useMemo(() => {
+    if (!result || !d140Report || !isGuestInvoice) return null
+    const guestRows = result.rows.filter(r => r.sectionType === 'guest_laundry' || r.invoiceLine.sectionType === 'guest')
+    const d140ByRoom = new Map<string, D140Transaction[]>()
+    for (const t of d140Report.transactions) {
+      if (!d140ByRoom.has(t.roomNumber)) d140ByRoom.set(t.roomNumber, [])
+      d140ByRoom.get(t.roomNumber)!.push(t)
+    }
+
+    const matched: { invoiceLine: typeof guestRows[0]; d140: D140Transaction; margin: number; marginPct: number }[] = []
+    const invoiceOnly: typeof guestRows[0][] = []
+    const d140Only: D140Transaction[] = []
+    const usedD140 = new Set<number>()
+
+    for (const row of guestRows) {
+      const room = row.invoiceLine.ticket
+      const candidates = d140ByRoom.get(room) ?? []
+      let bestIdx = -1
+      for (let i = 0; i < candidates.length; i++) {
+        if (usedD140.has(i)) continue
+        // Match by room number (already matched) — take first unused
+        bestIdx = i
+        break
+      }
+      if (bestIdx >= 0) {
+        const d140 = candidates[bestIdx]
+        usedD140.add(bestIdx)
+        const margin = d140.amount - row.invoiceLine.net
+        const marginPct = d140.amount > 0 ? (margin / d140.amount) * 100 : 0
+        matched.push({ invoiceLine: row, d140, margin: +margin.toFixed(2), marginPct: +marginPct.toFixed(1) })
+      } else {
+        invoiceOnly.push(row)
+      }
+    }
+
+    // Find D140 entries not matched to any invoice line
+    for (const [room, txns] of d140ByRoom) {
+      for (let i = 0; i < txns.length; i++) {
+        if (!usedD140.has(i) && !txns[i].isCredit) d140Only.push(txns[i])
+      }
+    }
+
+    const totalCost = matched.reduce((s, m) => s + m.invoiceLine.invoiceLine.net, 0)
+    const totalRevenue = matched.reduce((s, m) => s + m.d140.amount, 0)
+    const totalMargin = totalRevenue - totalCost
+    const avgMarginPct = totalRevenue > 0 ? (totalMargin / totalRevenue) * 100 : 0
+
+    return { matched, invoiceOnly, d140Only, totalCost, totalRevenue, totalMargin, avgMarginPct }
+  }, [result, d140Report, isGuestInvoice])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
@@ -2133,6 +2204,90 @@ export default function Reconciliation() {
           <button onClick={() => setPriceUpdateError(null)} className="p-1 rounded hover:bg-red-100">
             <X className="w-4 h-4 text-red-400" />
           </button>
+        </div>
+      )}
+
+      {/* D140 Opera Report — Guest Laundry Revenue Cross-Reference */}
+      {isGuestInvoice && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900">Guest Revenue Cross-Reference</h3>
+              <p className="text-xs text-gray-400 mt-0.5">Upload D140 Opera PMS report to verify guest charges and profit margins</p>
+            </div>
+            {d140Report && (
+              <div className="flex items-center gap-3 text-xs">
+                <span className="text-gray-500">{d140Report.transactions.length} transactions</span>
+                <span className="font-medium text-navy">{'\u00a3'}{d140Report.grandTotal.toFixed(2)} revenue</span>
+                <button onClick={() => setD140Report(null)} className="text-gray-400 hover:text-gray-600">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+          {!d140Report ? (
+            <div className="p-5">
+              <label className="flex items-center justify-center gap-2 px-4 py-6 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-navy/40 hover:bg-gray-50 transition-colors">
+                <Upload className="w-5 h-5 text-gray-400" />
+                <span className="text-sm text-gray-500">{d140Loading ? 'Parsing...' : 'Drop D140 report PDF here or click to upload'}</span>
+                <input type="file" accept=".pdf" className="hidden" onChange={e => { if (e.target.files?.[0]) handleD140File(e.target.files[0]) }} />
+              </label>
+            </div>
+          ) : guestMarginData && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-gray-200 bg-gray-50">
+                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Room</th>
+                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Guest</th>
+                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Date</th>
+                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Cost (Invoice)</th>
+                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Revenue (D140)</th>
+                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin</th>
+                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin %</th>
+                </tr></thead>
+                <tbody>
+                  {guestMarginData.matched.map((m, i) => (
+                    <tr key={i} className="border-b border-gray-100">
+                      <td className="px-3 py-2 font-mono font-medium text-navy">{m.invoiceLine.invoiceLine.ticket}</td>
+                      <td className="px-3 py-2 text-gray-700">{m.d140.guestName}</td>
+                      <td className="px-3 py-2 text-gray-500">{m.invoiceLine.invoiceLine.date}</td>
+                      <td className="px-3 py-2 text-right">{'\u00a3'}{m.invoiceLine.invoiceLine.net.toFixed(2)}</td>
+                      <td className="px-3 py-2 text-right font-medium">{'\u00a3'}{m.d140.amount.toFixed(2)}</td>
+                      <td className="px-3 py-2 text-right text-green-600 font-medium">{'\u00a3'}{m.margin.toFixed(2)}</td>
+                      <td className={`px-3 py-2 text-right font-medium ${m.marginPct < 35 ? 'text-red-600' : m.marginPct < 40 ? 'text-amber-600' : 'text-green-600'}`}>
+                        {m.marginPct.toFixed(1)}%
+                      </td>
+                    </tr>
+                  ))}
+                  {guestMarginData.invoiceOnly.map((row, i) => (
+                    <tr key={`inv-${i}`} className="border-b border-gray-100 bg-amber-50/50">
+                      <td className="px-3 py-2 font-mono text-navy">{row.invoiceLine.ticket}</td>
+                      <td className="px-3 py-2 text-gray-500" colSpan={2}>{row.invoiceLine.guestInfo || row.invoiceLine.description}</td>
+                      <td className="px-3 py-2 text-right">{'\u00a3'}{row.invoiceLine.net.toFixed(2)}</td>
+                      <td className="px-3 py-2 text-right text-amber-600" colSpan={3}>No D140 charge found</td>
+                    </tr>
+                  ))}
+                  {guestMarginData.d140Only.map((t, i) => (
+                    <tr key={`d140-${i}`} className="border-b border-gray-100 bg-blue-50/50">
+                      <td className="px-3 py-2 font-mono text-navy">{t.roomNumber}</td>
+                      <td className="px-3 py-2 text-gray-700">{t.guestName}</td>
+                      <td className="px-3 py-2 text-gray-500">{t.date}</td>
+                      <td className="px-3 py-2 text-right text-blue-600" colSpan={4}>D140 charge but not on invoice — {'\u00a3'}{t.amount.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot><tr className="bg-gray-50 font-medium">
+                  <td colSpan={3} className="px-3 py-2.5 text-right text-gray-700">Totals</td>
+                  <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalCost.toFixed(2)}</td>
+                  <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalRevenue.toFixed(2)}</td>
+                  <td className="px-3 py-2.5 text-right text-green-600">{'\u00a3'}{guestMarginData.totalMargin.toFixed(2)}</td>
+                  <td className={`px-3 py-2.5 text-right ${guestMarginData.avgMarginPct < 35 ? 'text-red-600' : 'text-green-600'}`}>
+                    {guestMarginData.avgMarginPct.toFixed(1)}%
+                  </td>
+                </tr></tfoot>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
