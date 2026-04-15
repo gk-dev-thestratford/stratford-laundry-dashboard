@@ -1740,16 +1740,6 @@ export default function Reconciliation() {
   const parsedVsStatedGap = statedNet > 0 ? Math.abs(statedNet - grandInvoiceNet) : 0
   const originalDiff = +(result.invoiceTotal - result.systemTotal).toFixed(2)
 
-  // Single source of truth for financial totals — shared with PDF/Excel reports
-  const financials: FinancialTotals = {
-    lineItemsNet: +result.invoiceTotal.toFixed(2),
-    topUpNet: +totalTopUp.toFixed(2),
-    invoiceNet: +(statedNet > 0 ? statedNet : grandInvoiceNet).toFixed(2),
-    invoiceVat: +(invoice.totals.vat > 0 ? invoice.totals.vat : (statedNet > 0 ? statedNet : grandInvoiceNet) * 0.2).toFixed(2),
-    invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : (statedNet > 0 ? statedNet : grandInvoiceNet) * 1.2).toFixed(2),
-    systemNet: +result.systemTotal.toFixed(2),
-  }
-
   return (
     <div className="space-y-6 pb-20">
       {/* Header */}
