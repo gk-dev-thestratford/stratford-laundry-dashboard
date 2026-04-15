@@ -340,14 +340,14 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]
 
-    // Grand totals
-    const netM = line.match(/^Net\s+£\s*([\d,]+\.\d{2})/i)
-    if (netM) totalNet = parseFloat(netM[1].replace(',', ''))
+    // Grand totals — match anywhere in line (footer layout varies across PDFs)
+    const netM = line.match(/\bNet\s+£\s*([\d,]+\.\d{2})/i)
+    if (netM && !line.match(/Invoice\s*NET|System\s*NET|Items?\s*NET/i)) totalNet = parseFloat(netM[1].replace(',', ''))
 
-    const vatM = line.match(/^VAT\s+£\s*([\d,]+\.\d{2})/i)
-    if (vatM) totalVat = parseFloat(vatM[1].replace(',', ''))
+    const vatM = line.match(/\bVAT\s+£\s*([\d,]+\.\d{2})/i)
+    if (vatM && !line.match(/\d{2}\/\d{2}/)) totalVat = parseFloat(vatM[1].replace(',', ''))
 
-    const grossM = line.match(/^Total\s+£\s*([\d,]+\.\d{2})/i)
+    const grossM = line.match(/\bTotal\s+£\s*([\d,]+\.\d{2})$/i)
     if (grossM) totalGross = parseFloat(grossM[1].replace(',', ''))
 
     // Capture section total (e.g. "Total 03/26 11072x Napkins £ 2,226.97 £445.39 £2,672.36")
