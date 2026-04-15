@@ -434,6 +434,7 @@ export default function Reconciliation() {
   const [uniformMinOpen, setUniformMinOpen] = useState(true)
   const [d140Report, setD140Report] = useState<D140Report | null>(null)
   const [d140Loading, setD140Loading] = useState(false)
+  const [showD140Prompt, setShowD140Prompt] = useState(false)
 
   // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
   useEffect(() => {
@@ -566,7 +567,7 @@ export default function Reconciliation() {
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
-    setD140Report(null)
+    setD140Report(null); setShowD140Prompt(false)
   }
 
   const isGuestInvoice = invoice?.sections.some(s => s.type === 'guest') ?? false
@@ -1164,6 +1165,8 @@ export default function Reconciliation() {
     }
 
     setSaving(false); setSaved(true); loadHistory()
+    // Prompt for D140 upload after saving a guest invoice
+    if (invoice.sections.some(s => s.type === 'guest')) setShowD140Prompt(true)
   }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary])
 
   // ── Adjusted totals considering resolutions ──
@@ -2207,90 +2210,6 @@ export default function Reconciliation() {
         </div>
       )}
 
-      {/* D140 Opera Report — Guest Laundry Revenue Cross-Reference */}
-      {isGuestInvoice && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-semibold text-gray-900">Guest Revenue Cross-Reference</h3>
-              <p className="text-xs text-gray-400 mt-0.5">Upload D140 Opera PMS report to verify guest charges and profit margins</p>
-            </div>
-            {d140Report && (
-              <div className="flex items-center gap-3 text-xs">
-                <span className="text-gray-500">{d140Report.transactions.length} transactions</span>
-                <span className="font-medium text-navy">{'\u00a3'}{d140Report.grandTotal.toFixed(2)} revenue</span>
-                <button onClick={() => setD140Report(null)} className="text-gray-400 hover:text-gray-600">
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
-          </div>
-          {!d140Report ? (
-            <div className="p-5">
-              <label className="flex items-center justify-center gap-2 px-4 py-6 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-navy/40 hover:bg-gray-50 transition-colors">
-                <Upload className="w-5 h-5 text-gray-400" />
-                <span className="text-sm text-gray-500">{d140Loading ? 'Parsing...' : 'Drop D140 report PDF here or click to upload'}</span>
-                <input type="file" accept=".pdf" className="hidden" onChange={e => { if (e.target.files?.[0]) handleD140File(e.target.files[0]) }} />
-              </label>
-            </div>
-          ) : guestMarginData && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead><tr className="border-b border-gray-200 bg-gray-50">
-                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Room</th>
-                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Guest</th>
-                  <th className="px-3 py-2.5 text-left font-medium text-gray-600">Date</th>
-                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Cost (Invoice)</th>
-                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Revenue (D140)</th>
-                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin</th>
-                  <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin %</th>
-                </tr></thead>
-                <tbody>
-                  {guestMarginData.matched.map((m, i) => (
-                    <tr key={i} className="border-b border-gray-100">
-                      <td className="px-3 py-2 font-mono font-medium text-navy">{m.invoiceLine.invoiceLine.ticket}</td>
-                      <td className="px-3 py-2 text-gray-700">{m.d140.guestName}</td>
-                      <td className="px-3 py-2 text-gray-500">{m.invoiceLine.invoiceLine.date}</td>
-                      <td className="px-3 py-2 text-right">{'\u00a3'}{m.invoiceLine.invoiceLine.net.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-right font-medium">{'\u00a3'}{m.d140.amount.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-right text-green-600 font-medium">{'\u00a3'}{m.margin.toFixed(2)}</td>
-                      <td className={`px-3 py-2 text-right font-medium ${m.marginPct < 35 ? 'text-red-600' : m.marginPct < 40 ? 'text-amber-600' : 'text-green-600'}`}>
-                        {m.marginPct.toFixed(1)}%
-                      </td>
-                    </tr>
-                  ))}
-                  {guestMarginData.invoiceOnly.map((row, i) => (
-                    <tr key={`inv-${i}`} className="border-b border-gray-100 bg-amber-50/50">
-                      <td className="px-3 py-2 font-mono text-navy">{row.invoiceLine.ticket}</td>
-                      <td className="px-3 py-2 text-gray-500" colSpan={2}>{row.invoiceLine.guestInfo || row.invoiceLine.description}</td>
-                      <td className="px-3 py-2 text-right">{'\u00a3'}{row.invoiceLine.net.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-right text-amber-600" colSpan={3}>No D140 charge found</td>
-                    </tr>
-                  ))}
-                  {guestMarginData.d140Only.map((t, i) => (
-                    <tr key={`d140-${i}`} className="border-b border-gray-100 bg-blue-50/50">
-                      <td className="px-3 py-2 font-mono text-navy">{t.roomNumber}</td>
-                      <td className="px-3 py-2 text-gray-700">{t.guestName}</td>
-                      <td className="px-3 py-2 text-gray-500">{t.date}</td>
-                      <td className="px-3 py-2 text-right text-blue-600" colSpan={4}>D140 charge but not on invoice — {'\u00a3'}{t.amount.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot><tr className="bg-gray-50 font-medium">
-                  <td colSpan={3} className="px-3 py-2.5 text-right text-gray-700">Totals</td>
-                  <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalCost.toFixed(2)}</td>
-                  <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalRevenue.toFixed(2)}</td>
-                  <td className="px-3 py-2.5 text-right text-green-600">{'\u00a3'}{guestMarginData.totalMargin.toFixed(2)}</td>
-                  <td className={`px-3 py-2.5 text-right ${guestMarginData.avgMarginPct < 35 ? 'text-red-600' : 'text-green-600'}`}>
-                    {guestMarginData.avgMarginPct.toFixed(1)}%
-                  </td>
-                </tr></tfoot>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Search + Filter tabs */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="relative">
@@ -2703,6 +2622,100 @@ export default function Reconciliation() {
                 className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-orange-600 rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Send className="w-4 h-4" /> Send Challenge Email
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── D140 Opera Report Modal (post-save for guest invoices) ── */}
+      {showD140Prompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowD140Prompt(false)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold text-gray-900">Guest Revenue Verification</h3>
+                <p className="text-xs text-gray-500 mt-0.5">Upload D140 Opera PMS report to verify guest charges and profit margins</p>
+              </div>
+              <div className="flex items-center gap-2">
+                {d140Report && (
+                  <span className="text-xs text-navy font-medium">{d140Report.transactions.length} transactions | {'\u00a3'}{d140Report.grandTotal.toFixed(2)} revenue</span>
+                )}
+                <button onClick={() => setShowD140Prompt(false)} className="p-1 rounded hover:bg-gray-100">
+                  <X className="w-5 h-5 text-gray-400" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-auto">
+              {!d140Report ? (
+                <div className="p-8">
+                  <label className="flex flex-col items-center justify-center gap-3 px-6 py-10 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-navy/40 hover:bg-gray-50 transition-colors">
+                    <Upload className="w-8 h-8 text-gray-400" />
+                    <span className="text-sm text-gray-600 font-medium">{d140Loading ? 'Parsing D140 report...' : 'Click to upload D140 report PDF'}</span>
+                    <span className="text-xs text-gray-400">D140 Journal Cashier&TC report from Opera PMS</span>
+                    <input type="file" accept=".pdf" className="hidden" onChange={e => { if (e.target.files?.[0]) handleD140File(e.target.files[0]) }} />
+                  </label>
+                </div>
+              ) : guestMarginData && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead><tr className="border-b border-gray-200 bg-gray-50">
+                      <th className="px-3 py-2.5 text-left font-medium text-gray-600">Room</th>
+                      <th className="px-3 py-2.5 text-left font-medium text-gray-600">Guest</th>
+                      <th className="px-3 py-2.5 text-left font-medium text-gray-600">Date</th>
+                      <th className="px-3 py-2.5 text-right font-medium text-gray-600">Cost (Invoice)</th>
+                      <th className="px-3 py-2.5 text-right font-medium text-gray-600">Revenue (D140)</th>
+                      <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin</th>
+                      <th className="px-3 py-2.5 text-right font-medium text-gray-600">Margin %</th>
+                    </tr></thead>
+                    <tbody>
+                      {guestMarginData.matched.map((m, i) => (
+                        <tr key={i} className="border-b border-gray-100">
+                          <td className="px-3 py-2 font-mono font-medium text-navy">{m.invoiceLine.invoiceLine.ticket}</td>
+                          <td className="px-3 py-2 text-gray-700">{m.d140.guestName}</td>
+                          <td className="px-3 py-2 text-gray-500">{m.invoiceLine.invoiceLine.date}</td>
+                          <td className="px-3 py-2 text-right">{'\u00a3'}{m.invoiceLine.invoiceLine.net.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right font-medium">{'\u00a3'}{m.d140.amount.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-green-600 font-medium">{'\u00a3'}{m.margin.toFixed(2)}</td>
+                          <td className={`px-3 py-2 text-right font-medium ${m.marginPct < 35 ? 'text-red-600' : m.marginPct < 40 ? 'text-amber-600' : 'text-green-600'}`}>
+                            {m.marginPct.toFixed(1)}%
+                          </td>
+                        </tr>
+                      ))}
+                      {guestMarginData.invoiceOnly.map((row, i) => (
+                        <tr key={`inv-${i}`} className="border-b border-gray-100 bg-amber-50/50">
+                          <td className="px-3 py-2 font-mono text-navy">{row.invoiceLine.ticket}</td>
+                          <td className="px-3 py-2 text-gray-500" colSpan={2}>{row.invoiceLine.guestInfo || row.invoiceLine.description}</td>
+                          <td className="px-3 py-2 text-right">{'\u00a3'}{row.invoiceLine.net.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-amber-600" colSpan={3}>No D140 charge found</td>
+                        </tr>
+                      ))}
+                      {guestMarginData.d140Only.map((t, i) => (
+                        <tr key={`d140-${i}`} className="border-b border-gray-100 bg-blue-50/50">
+                          <td className="px-3 py-2 font-mono text-navy">{t.roomNumber}</td>
+                          <td className="px-3 py-2 text-gray-700">{t.guestName}</td>
+                          <td className="px-3 py-2 text-gray-500">{t.date}</td>
+                          <td className="px-3 py-2 text-right text-blue-600" colSpan={4}>D140 charge but not on invoice — {'\u00a3'}{t.amount.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot><tr className="bg-gray-50 font-medium">
+                      <td colSpan={3} className="px-3 py-2.5 text-right text-gray-700">Totals</td>
+                      <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalCost.toFixed(2)}</td>
+                      <td className="px-3 py-2.5 text-right">{'\u00a3'}{guestMarginData.totalRevenue.toFixed(2)}</td>
+                      <td className="px-3 py-2.5 text-right text-green-600">{'\u00a3'}{guestMarginData.totalMargin.toFixed(2)}</td>
+                      <td className={`px-3 py-2.5 text-right ${guestMarginData.avgMarginPct < 35 ? 'text-red-600' : 'text-green-600'}`}>
+                        {guestMarginData.avgMarginPct.toFixed(1)}%
+                      </td>
+                    </tr></tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+            <div className="p-4 border-t border-gray-200 flex justify-end gap-2">
+              <button onClick={() => setShowD140Prompt(false)}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+                {d140Report ? 'Close' : 'Skip'}
               </button>
             </div>
           </div>
