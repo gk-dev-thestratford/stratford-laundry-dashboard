@@ -1,4 +1,4 @@
-import { Search, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Search, ChevronLeft, ChevronRight, Calendar, X } from 'lucide-react'
 import { MONTHS, ORDER_STATUS_LABELS, ORDER_TYPE_LABELS } from '../types'
 import type { OrderStatus, OrderType, Department } from '../types'
 import type { Filters as FilterType } from '../hooks/useOrders'
@@ -107,6 +107,55 @@ export default function Filters({ filters, departments, onChange }: FiltersProps
         >
           Outstanding Only
         </button>
+      </div>
+
+      {/* Date quick filters + custom range */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Calendar className="w-4 h-4 text-gray-400" />
+        {([['sent_today', 'Sent Today'], ['modified_today', 'Modified Today'], ['received_today', 'Received Today']] as const).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => onChange({ ...filters, quickDate: filters.quickDate === key ? '' : key, dateFrom: '', dateTo: '' })}
+            className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+              filters.quickDate === key
+                ? 'bg-navy text-white border-navy'
+                : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+        <span className="text-gray-300 mx-1">|</span>
+        <select
+          value={filters.dateField}
+          onChange={(e) => onChange({ ...filters, dateField: e.target.value as 'created' | 'modified' })}
+          className="px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
+        >
+          <option value="created">Created</option>
+          <option value="modified">Modified</option>
+        </select>
+        <input
+          type="date"
+          value={filters.dateFrom}
+          onChange={(e) => onChange({ ...filters, dateFrom: e.target.value, quickDate: '' })}
+          className="px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
+        />
+        <span className="text-xs text-gray-400">to</span>
+        <input
+          type="date"
+          value={filters.dateTo}
+          onChange={(e) => onChange({ ...filters, dateTo: e.target.value, quickDate: '' })}
+          className="px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-gold"
+        />
+        {(filters.quickDate || filters.dateFrom || filters.dateTo) && (
+          <button
+            onClick={() => onChange({ ...filters, quickDate: '', dateFrom: '', dateTo: '' })}
+            className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded"
+            title="Clear date filters"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
     </div>
   )

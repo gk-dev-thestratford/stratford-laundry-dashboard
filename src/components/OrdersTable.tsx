@@ -1,7 +1,24 @@
-import { format } from 'date-fns'
+import { format, formatDistanceToNow, isToday, isYesterday } from 'date-fns'
 import StatusBadge from './StatusBadge'
 import { ORDER_TYPE_LABELS } from '../types'
 import type { Order, BulkEdits } from '../types'
+
+function lastModified(order: Order): { date: Date; label: string } | null {
+  const logs = order.status_log
+  if (logs && logs.length > 0) {
+    const latest = logs.reduce((best, l) => new Date(l.created_at) > new Date(best.created_at) ? l : best)
+    return { date: new Date(latest.created_at), label: latest.status }
+  }
+  if (order.updated_at) return { date: new Date(order.updated_at), label: 'updated' }
+  return null
+}
+
+function formatLastMod(info: { date: Date; label: string } | null): string {
+  if (!info) return '\u2014'
+  if (isToday(info.date)) return formatDistanceToNow(info.date, { addSuffix: true })
+  if (isYesterday(info.date)) return 'Yesterday ' + format(info.date, 'HH:mm')
+  return format(info.date, 'dd MMM HH:mm')
+}
 
 /** Compute order cost from item-level prices (works for uniforms AND linens) */
 function orderCost(o: Order, edits?: BulkEdits): number | null {
@@ -66,7 +83,8 @@ export default function OrdersTable({
             <col className="w-[100px]" />
             <col className="w-[100px]" />
             <col className="w-[100px]" />
-            <col className="w-[150px]" />
+            <col className="w-[140px]" />
+            <col className="w-[130px]" />
           </colgroup>
           <thead>
             <tr className="border-b border-gray-300 bg-gray-50">
@@ -87,13 +105,14 @@ export default function OrdersTable({
               <th className={`${TH} text-right`}>Total ex VAT</th>
               <th className={`${TH} text-right`}>Total inc VAT</th>
               <th className={`${TH} text-center`}>Status</th>
-              <th className={`${TH} text-left !border-r-0`}>Date</th>
+              <th className={`${TH} text-left`}>Date</th>
+              <th className={`${TH} text-left !border-r-0`}>Last Modified</th>
             </tr>
           </thead>
           <tbody>
             {orders.length === 0 ? (
               <tr>
-                <td colSpan={11} className="px-4 py-12 text-center text-gray-500">
+                <td colSpan={12} className="px-4 py-12 text-center text-gray-500">
                   No orders found
                 </td>
               </tr>
@@ -166,8 +185,14 @@ export default function OrdersTable({
                       <td className={`${TD} text-center`}>
                         <StatusBadge status={order.status} />
                       </td>
-                      <td className={`${TD} text-gray-500 whitespace-nowrap !border-r-0`}>
+                      <td className={`${TD} text-gray-500 whitespace-nowrap`}>
                         {format(new Date(order.created_at), 'dd MMM yyyy HH:mm')}
+                      </td>
+                      <td className={`${TD} text-gray-500 whitespace-nowrap text-xs !border-r-0`} title={(() => {
+                        const mod = lastModified(order)
+                        return mod ? `${format(mod.date, 'dd MMM yyyy HH:mm')} — ${mod.label}` : ''
+                      })()}>
+                        {formatLastMod(lastModified(order))}
                       </td>
                     </tr>
 

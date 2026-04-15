@@ -10,6 +10,10 @@ export interface Filters {
   search: string
   orderType: OrderType | 'all'
   outstanding: boolean // true = only show orders with outstanding items
+  quickDate: '' | 'sent_today' | 'modified_today' | 'received_today'
+  dateFrom: string // ISO date, e.g. '2026-03-01'
+  dateTo: string   // ISO date, e.g. '2026-03-31'
+  dateField: 'created' | 'modified'
 }
 
 async function getDashboardUserName(): Promise<string> {
@@ -32,6 +36,10 @@ export function useOrders() {
     search: '',
     orderType: 'all',
     outstanding: false,
+    quickDate: '',
+    dateFrom: '',
+    dateTo: '',
+    dateField: 'created',
   })
 
   const fetchDepartments = useCallback(async () => {
@@ -100,6 +108,48 @@ export function useOrders() {
           (i: any) => i.quantity_sent > (i.quantity_received ?? 0)
         )
       )
+    }
+
+    // Quick date filters (client-side — checks status_log timestamps)
+    if (filters.quickDate) {
+      const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0)
+      const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999)
+      if (filters.quickDate === 'sent_today') {
+        results = results.filter(o => {
+          const d = new Date(o.created_at)
+          return d >= todayStart && d <= todayEnd
+        })
+      } else if (filters.quickDate === 'modified_today') {
+        results = results.filter(o => {
+          const logs = o.status_log || []
+          return logs.some(l => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })
+        })
+      } else if (filters.quickDate === 'received_today') {
+        results = results.filter(o => {
+          const logs = o.status_log || []
+          return logs.some(l => l.status === 'received' && (() => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })())
+        })
+      }
+    }
+
+    // Custom date range filter (client-side for 'modified', server already handled 'created')
+    if (filters.dateFrom && filters.dateTo) {
+      const from = new Date(filters.dateFrom); from.setHours(0, 0, 0, 0)
+      const to = new Date(filters.dateTo); to.setHours(23, 59, 59, 999)
+      if (filters.dateField === 'modified') {
+        results = results.filter(o => {
+          const logs = o.status_log || []
+          if (logs.length === 0) return false
+          const latest = logs.reduce((best, l) => new Date(l.created_at) > new Date(best.created_at) ? l : best)
+          const d = new Date(latest.created_at)
+          return d >= from && d <= to
+        })
+      } else {
+        results = results.filter(o => {
+          const d = new Date(o.created_at)
+          return d >= from && d <= to
+        })
+      }
     }
 
     setOrders(results)
