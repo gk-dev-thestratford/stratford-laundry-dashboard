@@ -122,12 +122,12 @@ export function useOrders() {
       } else if (filters.quickDate === 'modified_today') {
         results = results.filter(o => {
           const logs = o.status_log || []
-          return logs.some(l => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })
+          return logs.some((l: any) => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })
         })
       } else if (filters.quickDate === 'received_today') {
         results = results.filter(o => {
           const logs = o.status_log || []
-          return logs.some(l => l.status === 'received' && (() => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })())
+          return logs.some((l: any) => l.status === 'received' && (() => { const d = new Date(l.created_at); return d >= todayStart && d <= todayEnd })())
         })
       }
     }
@@ -140,7 +140,7 @@ export function useOrders() {
         results = results.filter(o => {
           const logs = o.status_log || []
           if (logs.length === 0) return false
-          const latest = logs.reduce((best, l) => new Date(l.created_at) > new Date(best.created_at) ? l : best)
+          const latest = logs.reduce((best: any, l: any) => new Date(l.created_at) > new Date(best.created_at) ? l : best)
           const d = new Date(latest.created_at)
           return d >= from && d <= to
         })

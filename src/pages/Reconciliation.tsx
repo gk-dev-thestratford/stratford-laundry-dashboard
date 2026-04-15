@@ -623,7 +623,7 @@ export default function Reconciliation() {
     }
 
     // Find D140 entries not matched to any invoice line
-    for (const [room, txns] of d140ByRoom) {
+    for (const [, txns] of d140ByRoom) {
       for (let i = 0; i < txns.length; i++) {
         if (!usedD140.has(i) && !txns[i].isCredit) d140Only.push(txns[i])
       }
