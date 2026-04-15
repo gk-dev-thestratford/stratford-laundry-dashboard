@@ -383,118 +383,32 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
-  // Post-process: remove informational lines covered by minimum charges
-  // If a section's line sum exceeds the section total, find and remove the line(s)
-  // whose NET accounts for the difference (e.g. napkin usage lines covered by weekly minimum)
+  // Post-process: scale non-topup line NETs to match section stated totals.
+  // Napkin invoices list individual item lines AND weekly minimum topup charges.
+  // Some items are "informational" (covered by the minimum) so the section total
+  // is less than the sum of parsed lines. Rather than guessing which lines to remove,
+  // we scale all non-topup lines proportionally so they sum to the billed amount.
   for (const section of sections) {
     const sectionTotal = sectionTotals.get(section)
     if (sectionTotal == null) continue
-    let lineSum = Math.round(section.lines.reduce((s, l) => s + l.net, 0) * 100) / 100
-    let excess = Math.round((lineSum - sectionTotal) * 100) / 100
-    if (excess > 0.01) {
-      // Strategy 1: Find a single line whose NET matches the excess
-      const idx = section.lines.findIndex(l => Math.abs(l.net - excess) < 0.02)
-      if (idx !== -1) {
-        console.log(`[Parser] Removing informational line covered by minimum: ${section.lines[idx].description} £${section.lines[idx].net} (section total £${sectionTotal}, line sum £${lineSum})`)
-        section.lines.splice(idx, 1)
-      } else {
-        // Strategy 2: Find a pair of lines whose NET sums to the excess
-        let found = false
-        for (let i = 0; i < section.lines.length && !found; i++) {
-          for (let j = i + 1; j < section.lines.length && !found; j++) {
-            if (Math.abs(section.lines[i].net + section.lines[j].net - excess) < 0.02) {
-              console.log(`[Parser] Removing 2 informational lines: ${section.lines[i].description} £${section.lines[i].net} + ${section.lines[j].description} £${section.lines[j].net} (excess £${excess})`)
-              section.lines.splice(j, 1)
-              section.lines.splice(i, 1)
-              found = true
-            }
-          }
+    const topUpSum = Math.round(section.lines.filter(l => l.isTopUp).reduce((s, l) => s + l.net, 0) * 100) / 100
+    const itemSum = Math.round(section.lines.filter(l => !l.isTopUp).reduce((s, l) => s + l.net, 0) * 100) / 100
+    const targetItemSum = Math.round((sectionTotal - topUpSum) * 100) / 100
+    if (itemSum > 0 && Math.abs(itemSum - targetItemSum) > 0.5) {
+      const scale = targetItemSum / itemSum
+      console.log(`[Parser] Scaling "${section.name}" items: £${itemSum.toFixed(2)} → £${targetItemSum.toFixed(2)} (×${scale.toFixed(4)})`)
+      let runningTotal = 0
+      const nonTopUpLines = section.lines.filter(l => !l.isTopUp)
+      for (let i = 0; i < nonTopUpLines.length; i++) {
+        if (i < nonTopUpLines.length - 1) {
+          nonTopUpLines[i].net = Math.round(nonTopUpLines[i].net * scale * 100) / 100
+          runningTotal += nonTopUpLines[i].net
+        } else {
+          // Last line gets the remainder to avoid rounding drift
+          nonTopUpLines[i].net = Math.round((targetItemSum - runningTotal) * 100) / 100
         }
-        // Strategy 3: Greedily remove non-topup lines starting from smallest, that have
-        // a duplicate NET amount in the section (likely informational/summary lines)
-        if (!found) {
-          const netCounts = new Map<number, number>()
-          for (const l of section.lines) {
-            if (!l.isTopUp) netCounts.set(l.net, (netCounts.get(l.net) || 0) + 1)
-          }
-          // Sort candidate duplicates by NET ascending — remove smallest first
-          const candidates = section.lines
-            .map((l, i) => ({ l, i }))
-            .filter(({ l }) => !l.isTopUp && (netCounts.get(l.net) || 0) > 1)
-            .sort((a, b) => a.l.net - b.l.net)
-
-          const toRemove: number[] = []
-          let remaining = excess
-          for (const { l, i } of candidates) {
-            if (remaining < 0.01) break
-            if (l.net <= remaining + 0.02) {
-              toRemove.push(i)
-              remaining = Math.round((remaining - l.net) * 100) / 100
-            }
-          }
-          if (remaining < 0.02 && toRemove.length > 0) {
-            console.log(`[Parser] Removing ${toRemove.length} duplicate-NET lines to match section total (excess £${excess})`)
-            for (const i of toRemove.sort((a, b) => b - a)) {
-              section.lines.splice(i, 1)
-            }
-          } else {
-            console.warn(`[Parser] Section "${section.name}" has unresolved excess: parsed £${lineSum} vs stated £${sectionTotal} (gap £${excess})`)
-          }
-        }
-      }
-    }
-  }
-
-  // Diagnostic: log what was parsed
-  console.log(`[Parser] === PARSE SUMMARY ===`)
-  console.log(`[Parser] Stated totals: NET £${totalNet}, VAT £${totalVat}, GROSS £${totalGross}`)
-  for (const section of sections) {
-    const secItemsNet = section.lines.filter(l => !l.isTopUp).reduce((s, l) => s + l.net, 0)
-    const secTopUpNet = section.lines.filter(l => l.isTopUp).reduce((s, l) => s + l.net, 0)
-    const secTotal = sectionTotals.get(section)
-    console.log(`[Parser] Section "${section.name}": ${section.lines.length} lines, items £${secItemsNet.toFixed(2)}, topUp £${secTopUpNet.toFixed(2)}, total £${(secItemsNet + secTopUpNet).toFixed(2)}, stated section total: ${secTotal != null ? '£' + secTotal.toFixed(2) : 'N/A'}`)
-  }
-  const allLinesTotal = sections.reduce((s, sec) => s + sec.lines.reduce((s2, l) => s2 + l.net, 0), 0)
-  console.log(`[Parser] All sections total: £${allLinesTotal.toFixed(2)}`)
-  console.log(`[Parser] Gap (parsed - stated): £${totalNet > 0 ? (allLinesTotal - totalNet).toFixed(2) : 'N/A (no stated total)'}`)
-
-  // Grand total cross-check: if sum of all sections' lines exceeds stated NET,
-  // remove excess non-topup lines from the largest section (napkins typically have
-  // informational lines covered by weekly minimum charges)
-  if (totalNet > 0) {
-    const allLinesNet = sections.reduce((s, sec) => s + sec.lines.reduce((s2, l) => s2 + l.net, 0), 0)
-    const grandExcess = Math.round((allLinesNet - totalNet) * 100) / 100
-    if (grandExcess > 1) {
-      // Find the section with the most lines (most likely to have informational duplicates)
-      const largest = sections.reduce((best, sec) => sec.lines.length > best.lines.length ? sec : best, sections[0])
-      console.log(`[Parser] Grand total excess: parsed £${allLinesNet.toFixed(2)} vs stated £${totalNet.toFixed(2)} (gap £${grandExcess.toFixed(2)}). Trimming from "${largest.name}"`)
-
-      // Remove non-topup lines greedily from the largest section
-      let remaining = grandExcess
-      const toRemove: number[] = []
-      // Prefer removing lines whose NET has duplicates (likely informational)
-      const netCounts = new Map<number, number>()
-      for (const l of largest.lines) {
-        if (!l.isTopUp) netCounts.set(l.net, (netCounts.get(l.net) || 0) + 1)
-      }
-      const candidates = largest.lines
-        .map((l, i) => ({ l, i }))
-        .filter(({ l }) => !l.isTopUp && (netCounts.get(l.net) || 0) > 1)
-        .sort((a, b) => a.l.net - b.l.net)
-      for (const { l, i } of candidates) {
-        if (remaining < 0.5) break
-        if (l.net <= remaining + 0.02) {
-          toRemove.push(i)
-          remaining = Math.round((remaining - l.net) * 100) / 100
-        }
-      }
-      if (remaining < 1 && toRemove.length > 0) {
-        console.log(`[Parser] Removing ${toRemove.length} lines (£${(grandExcess - remaining).toFixed(2)}) to match grand total`)
-        for (const i of toRemove.sort((a, b) => b - a)) {
-          largest.lines.splice(i, 1)
-        }
-      } else {
-        console.warn(`[Parser] Could not fully resolve grand total excess: £${remaining.toFixed(2)} remaining`)
+        nonTopUpLines[i].vat = Math.round(nonTopUpLines[i].net * 0.2 * 100) / 100
+        nonTopUpLines[i].gross = Math.round(nonTopUpLines[i].net * 1.2 * 100) / 100
       }
     }
   }
