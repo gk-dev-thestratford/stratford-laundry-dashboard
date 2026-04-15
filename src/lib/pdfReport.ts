@@ -70,22 +70,32 @@ export interface NapkinWeekSummary {
   deptBreakdown: { deptName: string; sentQty: number; topUpAlloc: number; totalCost: number }[]
 }
 
+export interface FinancialTotals {
+  lineItemsNet: number
+  topUpNet: number
+  invoiceNet: number
+  invoiceVat: number
+  invoiceGross: number
+  systemNet: number
+}
+
 export function generateReconciliationPdf(
   invoice: ParsedInvoice,
   result: ReconciliationResultForPdf,
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
-  napkinWeeks?: NapkinWeekSummary[]
+  napkinWeeks?: NapkinWeekSummary[],
+  financials?: FinancialTotals
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
-  const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
-  // Use stated invoice totals; derive line items as grand - topup so rows add up
-  const grandNet = invoice.totals.net > 0 ? invoice.totals.net : (result.invoiceTotal + totalTopUp)
-  const grandVat = invoice.totals.vat > 0 ? invoice.totals.vat : +(grandNet * 0.2).toFixed(2)
-  const grandGross = invoice.totals.gross > 0 ? invoice.totals.gross : +(grandNet * 1.2).toFixed(2)
-  const lineItemsNet = +(grandNet - totalTopUp).toFixed(2)
+  // Use pre-computed financials from the reconciliation page (same as on-screen)
+  const totalTopUp = financials?.topUpNet ?? result.topUpCharges.reduce((s, l) => s + l.net, 0)
+  const lineItemsNet = financials?.lineItemsNet ?? result.invoiceTotal
+  const grandNet = financials?.invoiceNet ?? (result.invoiceTotal + totalTopUp)
+  const grandVat = financials?.invoiceVat ?? +(grandNet * 0.2).toFixed(2)
+  const grandGross = financials?.invoiceGross ?? +(grandNet * 1.2).toFixed(2)
   let y = 15
 
   // ── Header ──
@@ -151,7 +161,7 @@ export function generateReconciliationPdf(
       ['Invoice Line Items', lineItemsNet.toFixed(2), (lineItemsNet * 0.2).toFixed(2), (lineItemsNet * 1.2).toFixed(2)],
       ['TopUp Charges', totalTopUp.toFixed(2), (totalTopUp * 0.2).toFixed(2), (totalTopUp * 1.2).toFixed(2)],
       ['Grand Total (Invoice)', grandNet.toFixed(2), grandVat.toFixed(2), grandGross.toFixed(2)],
-      ['System Total', result.systemTotal.toFixed(2), (result.systemTotal * 0.2).toFixed(2), (result.systemTotal * 1.2).toFixed(2)],
+      ['System Total', (financials?.systemNet ?? result.systemTotal).toFixed(2), ((financials?.systemNet ?? result.systemTotal) * 0.2).toFixed(2), ((financials?.systemNet ?? result.systemTotal) * 1.2).toFixed(2)],
     ],
     theme: 'grid',
     styles: { fontSize: 8, cellPadding: 2 },
@@ -420,9 +430,10 @@ export function downloadReconciliationPdf(
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
-  napkinWeeks?: NapkinWeekSummary[]
+  napkinWeeks?: NapkinWeekSummary[],
+  financials?: FinancialTotals
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -433,8 +444,9 @@ export function generateReconciliationPdfBlob(
   displayRows: DepartmentDisplayRow[],
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
-  napkinWeeks?: NapkinWeekSummary[]
+  napkinWeeks?: NapkinWeekSummary[],
+  financials?: FinancialTotals
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials)
   return doc.output('blob')
 }

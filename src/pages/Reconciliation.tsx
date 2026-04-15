@@ -6,7 +6,7 @@ import {
   sectionTypeToOrderType,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
 } from '../lib/invoiceParser'
-import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow } from '../lib/pdfReport'
+import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals } from '../lib/pdfReport'
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -996,7 +996,18 @@ export default function Reconciliation() {
           deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
         })),
       }))
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
+      const saveTotalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
+      const saveStatedNet = invoice.totals.net
+      const saveGrandNet = saveStatedNet > 0 ? saveStatedNet : (result.invoiceTotal + saveTotalTopUp)
+      const saveFinancials: FinancialTotals = {
+        lineItemsNet: +result.invoiceTotal.toFixed(2),
+        topUpNet: +saveTotalTopUp.toFixed(2),
+        invoiceNet: +saveGrandNet.toFixed(2),
+        invoiceVat: +(invoice.totals.vat > 0 ? invoice.totals.vat : saveGrandNet * 0.2).toFixed(2),
+        invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : saveGrandNet * 1.2).toFixed(2),
+        systemNet: +result.systemTotal.toFixed(2),
+      }
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, saveFinancials)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -1598,8 +1609,8 @@ export default function Reconciliation() {
         deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
       })),
     }))
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf)
-  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary])
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, financials)
+  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary, financials])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
@@ -1717,6 +1728,16 @@ export default function Reconciliation() {
   const statedNet = invoice.totals.net
   const parsedVsStatedGap = statedNet > 0 ? Math.abs(statedNet - grandInvoiceNet) : 0
   const originalDiff = +(result.invoiceTotal - result.systemTotal).toFixed(2)
+
+  // Single source of truth for financial totals — shared with PDF/Excel reports
+  const financials: FinancialTotals = {
+    lineItemsNet: +result.invoiceTotal.toFixed(2),
+    topUpNet: +totalTopUp.toFixed(2),
+    invoiceNet: +(statedNet > 0 ? statedNet : grandInvoiceNet).toFixed(2),
+    invoiceVat: +(invoice.totals.vat > 0 ? invoice.totals.vat : (statedNet > 0 ? statedNet : grandInvoiceNet) * 0.2).toFixed(2),
+    invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : (statedNet > 0 ? statedNet : grandInvoiceNet) * 1.2).toFixed(2),
+    systemNet: +result.systemTotal.toFixed(2),
+  }
 
   return (
     <div className="space-y-6 pb-20">
