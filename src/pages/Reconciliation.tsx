@@ -21,6 +21,7 @@ interface ReconciliationRow {
   status: 'matched' | 'price_mismatch' | 'not_found'
   systemTotal: number
   difference: number
+  rowIndex: number
 }
 
 interface DepartmentBreakdown {
@@ -73,8 +74,8 @@ interface Resolution {
 }
 
 /** Unique key for a not_found invoice line */
-function notFoundKey(line: InvoiceLine): string {
-  return `${line.ticket}-${line.date}-${line.net}-${line.description || ''}`
+function notFoundKey(row: ReconciliationRow): string {
+  return `${row.invoiceLine.ticket}-${row.invoiceLine.date}-${row.invoiceLine.net}-${row.rowIndex}`
 }
 
 // ── Helpers ──
@@ -340,6 +341,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   const rows: ReconciliationRow[] = []
   const topUpCharges: InvoiceLine[] = []
   const matchedOrderIds = new Set<string>()
+  let rowCounter = 0
 
   for (const section of invoice.sections) {
     const orderType = sectionTypeToOrderType(section.type)
@@ -369,7 +371,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
       const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
       const status: ReconciliationRow['status'] = !order
         ? 'not_found' : Math.abs(diff) < 0.02 ? 'matched' : 'price_mismatch'
-      rows.push({ invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff })
+      rows.push({ invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex: rowCounter++ })
     }
   }
 
@@ -1089,7 +1091,7 @@ export default function Reconciliation() {
     // Not Found resolutions
     for (const row of result.rows) {
       if (row.status !== 'not_found') continue
-      const key = notFoundKey(row.invoiceLine)
+      const key = notFoundKey(row)
       const res = notFoundResolutions[key]
       if (res) {
         resolvedCount++
@@ -1191,7 +1193,7 @@ export default function Reconciliation() {
       'Invoice GROSS (\u00a3)': +r.invoiceLine.gross.toFixed(2),
       'System Total (\u00a3)': r.order ? +r.systemTotal.toFixed(2) : '',
       'Difference (\u00a3)': r.order ? +r.difference.toFixed(2) : '',
-      'Resolution': r.status === 'not_found' ? (notFoundResolutions[notFoundKey(r.invoiceLine)]?.type || '') : '',
+      'Resolution': r.status === 'not_found' ? (notFoundResolutions[notFoundKey(r)]?.type || '') : '',
       'Staff/Guest': r.order?.staff_name || r.order?.guest_name || '',
     }))), 'Detailed Items')
 
@@ -1216,7 +1218,7 @@ export default function Reconciliation() {
       'Issue': 'On invoice but not in system', 'Docket': r.invoiceLine.ticket, 'Department': '',
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': 0,
       'Difference (\u00a3)': +r.invoiceLine.net.toFixed(2), 'Description': r.invoiceLine.description,
-      'Resolution': notFoundResolutions[notFoundKey(r.invoiceLine)]?.type || 'Unresolved',
+      'Resolution': notFoundResolutions[notFoundKey(r)]?.type || 'Unresolved',
       'Recommended Action': 'Add to system / accept charge / challenge with supplier',
     }))
     result.missingFromInvoice.forEach(o => discRows.push({
@@ -1414,7 +1416,7 @@ export default function Reconciliation() {
       }
 
       // Mark as resolved
-      const key = notFoundKey(row.invoiceLine)
+      const key = notFoundKey(row)
       setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system' } }))
 
       // Re-reconcile to pick up the new order
@@ -1430,7 +1432,7 @@ export default function Reconciliation() {
 
   // ── Action: Accept charge (acknowledge invoice-only item as valid) ──
   const handleAcceptCharge = useCallback((row: ReconciliationRow) => {
-    const key = notFoundKey(row.invoiceLine)
+    const key = notFoundKey(row)
     setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'accepted' } }))
   }, [])
 
@@ -1495,7 +1497,7 @@ export default function Reconciliation() {
     lines.push('')
 
     // Challenged not-found items (on invoice but not in our system)
-    const challengedNF = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r.invoiceLine)}`))
+    const challengedNF = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r)}`))
     if (challengedNF.length > 0) {
       lines.push('ITEMS BILLED BUT NOT IN OUR RECORDS:')
       for (const r of challengedNF) {
@@ -1516,7 +1518,7 @@ export default function Reconciliation() {
     }
 
     // Challenged price mismatches
-    const challengedMM = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r.invoiceLine)}`))
+    const challengedMM = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r)}`))
     if (challengedMM.length > 0) {
       lines.push('PRICE DISCREPANCIES:')
       for (const r of challengedMM) {
@@ -2119,7 +2121,7 @@ export default function Reconciliation() {
               {filteredRows.length === 0
                 ? <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
                 : filteredRows.map((row, i) => {
-                const nfKey = notFoundKey(row.invoiceLine)
+                const nfKey = notFoundKey(row)
                 const nfRes = row.status === 'not_found' ? notFoundResolutions[nfKey] : undefined
                 const isChallenged = row.status === 'not_found'
                   ? challengedItems.has(`nf:${nfKey}`)
@@ -2430,9 +2432,9 @@ export default function Reconciliation() {
 
               {/* Preview challenged items */}
               {(() => {
-                const nfItems = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r.invoiceLine)}`))
+                const nfItems = result.rows.filter(r => r.status === 'not_found' && challengedItems.has(`nf:${notFoundKey(r)}`))
                 const missItems = result.missingFromInvoice.filter(o => challengedItems.has(`miss:${o.id}`))
-                const mmItems = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r.invoiceLine)}`))
+                const mmItems = result.rows.filter(r => r.status === 'price_mismatch' && challengedItems.has(`mm:${notFoundKey(r)}`))
                 return (
                   <div className="space-y-3">
                     {nfItems.length > 0 && (
