@@ -26,20 +26,36 @@ export default function Reports() {
   const [showNet, setShowNet] = useState(false)
 
   const [topUpData, setTopUpData] = useState<any[]>([])
+  const [recMonthMap, setRecMonthMap] = useState<Record<string, number>>({})
 
   const fetchData = useCallback(async () => {
     setLoading(true)
-    const [ordersRes, topUpRes] = await Promise.all([
+    const [ordersRes, topUpRes, recRes] = await Promise.all([
       supabase.from('orders').select('*, department:departments(*), order_items(*)')
         .gte('created_at', `${year}-01-01T00:00:00.000Z`)
         .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
         .order('created_at', { ascending: true }),
-      supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at')
+      supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at, reconciliation_id')
+        .gte('created_at', `${year}-01-01T00:00:00.000Z`)
+        .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
+      supabase.from('reconciliations').select('id, invoice_period')
         .gte('created_at', `${year}-01-01T00:00:00.000Z`)
         .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
     ])
     setOrders(ordersRes.data ?? [])
     setTopUpData(topUpRes.data ?? [])
+    // Build reconciliation_id → invoice month map from invoice_period (DD/MM/YY - DD/MM/YY or DD.MM.YY - DD.MM.YY)
+    const monthMap: Record<string, number> = {}
+    for (const rec of recRes.data ?? []) {
+      if (rec.id && rec.invoice_period) {
+        // Parse end date from period — the month (2nd group) determines which month this belongs to
+        const endMatch = rec.invoice_period.match(/(\d{1,2})[./](\d{1,2})[./](\d{2,4})\s*$/)
+        if (endMatch) {
+          monthMap[rec.id] = parseInt(endMatch[2], 10) - 1 // 0-indexed month
+        }
+      }
+    }
+    setRecMonthMap(monthMap)
     setLoading(false)
   }, [year])
 
@@ -102,12 +118,15 @@ export default function Reports() {
   }, [orders])
 
   // ── Monthly TopUp data (from reconciliation_topups table) ──
+  // Use invoice period month (via recMonthMap) so cross-month weeks are attributed correctly
   const topUpMonthly = useMemo(() => {
     return Array.from({ length: 12 }, (_, m) => {
       let uniformsNet = 0, napkinsNet = 0
       for (const row of topUpData) {
-        const date = row.week_start ? new Date(row.week_start) : new Date(row.created_at)
-        if (date.getMonth() === m) {
+        // Prefer invoice period month; fall back to week_start then created_at
+        const recMonth = row.reconciliation_id ? recMonthMap[row.reconciliation_id] : undefined
+        const rowMonth = recMonth ?? (row.week_start ? new Date(row.week_start) : new Date(row.created_at)).getMonth()
+        if (rowMonth === m) {
           if (row.category === 'Kitchen Uniforms') uniformsNet += Number(row.topup_net)
           else if (row.category === 'Linen Napkins') napkinsNet += Number(row.topup_net)
         }
@@ -120,7 +139,7 @@ export default function Reports() {
         linenNapkinsNet: Number(napkinsNet.toFixed(2)),
       }
     })
-  }, [topUpData])
+  }, [topUpData, recMonthMap])
 
   const topUpYearTotal = useMemo(() => topUpMonthly.reduce((s, m) => s + m.kitchenUniforms + m.linenNapkins, 0), [topUpMonthly])
   const topUpYearTotalNet = useMemo(() => topUpMonthly.reduce((s, m) => s + m.kitchenUniformsNet + m.linenNapkinsNet, 0), [topUpMonthly])

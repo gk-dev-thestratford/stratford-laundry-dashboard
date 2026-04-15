@@ -414,6 +414,7 @@ export default function Reconciliation() {
   const [orders, setOrders] = useState<Order[]>([])
   const [result, setResult] = useState<ReconciliationResult | null>(null)
   const [filter, setFilter] = useState<FilterTab>('all')
+  const [searchTerm, setSearchTerm] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -554,18 +555,44 @@ export default function Reconciliation() {
     setFile(null); setInvoice(null); setOrders([]); setResult(null)
     setError(''); setFilter('all'); setSaved(false); setBroaderSearch(false)
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
-    setAddModalDocket(''); setAddModalDate('')
+    setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
     setChallengedItems(new Set()); setAddModal(null)
   }
 
   const filteredRows = useMemo(() => {
     if (!result) return []
-    if (filter === 'all') return result.rows
-    if (filter === 'matched') return result.rows.filter(r => r.status === 'matched')
-    if (filter === 'mismatch') return result.rows.filter(r => r.status === 'price_mismatch')
-    if (filter === 'not_found') return result.rows.filter(r => r.status === 'not_found')
-    return []
-  }, [result, filter])
+    let rows = result.rows
+    if (filter === 'matched') rows = rows.filter(r => r.status === 'matched')
+    else if (filter === 'mismatch') rows = rows.filter(r => r.status === 'price_mismatch')
+    else if (filter === 'not_found') rows = rows.filter(r => r.status === 'not_found')
+    if (searchTerm) {
+      const s = searchTerm.toLowerCase()
+      rows = rows.filter(r =>
+        r.invoiceLine.description?.toLowerCase().includes(s) ||
+        r.invoiceLine.ticket?.toLowerCase().includes(s) ||
+        r.invoiceLine.guestInfo?.toLowerCase().includes(s) ||
+        r.order?.department?.name?.toLowerCase().includes(s) ||
+        r.order?.staff_name?.toLowerCase().includes(s) ||
+        r.order?.guest_name?.toLowerCase().includes(s) ||
+        r.invoiceLine.net.toFixed(2).includes(s) ||
+        r.systemTotal.toFixed(2).includes(s)
+      )
+    }
+    return rows
+  }, [result, filter, searchTerm])
+
+  const filteredMissing = useMemo(() => {
+    if (!result || !searchTerm) return result?.missingFromInvoice ?? []
+    const s = searchTerm.toLowerCase()
+    return result.missingFromInvoice.filter(o =>
+      o.docket_number?.toLowerCase().includes(s) ||
+      o.department?.name?.toLowerCase().includes(s) ||
+      o.staff_name?.toLowerCase().includes(s) ||
+      o.guest_name?.toLowerCase().includes(s) ||
+      (o.order_items || []).some(i => i.item_name?.toLowerCase().includes(s)) ||
+      computeOrderCost(o).toFixed(2).includes(s)
+    )
+  }, [result, searchTerm])
 
   const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
     if (!result) return []
@@ -2045,7 +2072,23 @@ export default function Reconciliation() {
         </div>
       )}
 
-      {/* Filter tabs */}
+      {/* Search + Filter tabs */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+          <input
+            type="text"
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            placeholder="Search by docket, description, price..."
+            className="pl-8 pr-3 py-1.5 text-xs border border-gray-300 rounded-lg w-64 focus:outline-none focus:ring-2 focus:ring-navy/30"
+          />
+          {searchTerm && (
+            <button onClick={() => setSearchTerm('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       <div className="flex gap-1.5 bg-gray-100 rounded-lg p-1 w-fit">
         {([['all', 'All', result.rows.length], ['matched', 'Matched', result.stats.matched],
           ['mismatch', 'Price Discrepancy', result.stats.priceMismatch], ['not_found', 'On Invoice Only', result.stats.notFound],
@@ -2054,6 +2097,7 @@ export default function Reconciliation() {
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${filter === key ? 'bg-white text-navy shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}
           >{label} ({count})</button>
         ))}
+      </div>
       </div>
 
       {/* Detail table — all tabs except missing */}
@@ -2203,9 +2247,9 @@ export default function Reconciliation() {
               <th className="px-3 py-3 text-center font-medium text-gray-600">Action</th>
             </tr></thead>
             <tbody>
-              {result.missingFromInvoice.length === 0
-                ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">All system orders found on invoice</td></tr>
-                : result.missingFromInvoice.map(o => {
+              {filteredMissing.length === 0
+                ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">{searchTerm ? 'No matching orders' : 'All system orders found on invoice'}</td></tr>
+                : filteredMissing.map(o => {
                 const resolution = missingResolutions[o.id]
                 const isChallenged = challengedItems.has(`miss:${o.id}`)
                 return (
