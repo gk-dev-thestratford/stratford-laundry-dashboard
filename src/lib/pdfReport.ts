@@ -81,7 +81,11 @@ export function generateReconciliationPdf(
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
   const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
-  const grandNet = result.invoiceTotal + totalTopUp
+  const parsedGrandNet = result.invoiceTotal + totalTopUp
+  // Use stated invoice totals when available; fall back to parsed
+  const grandNet = invoice.totals.net > 0 ? invoice.totals.net : parsedGrandNet
+  const grandVat = invoice.totals.vat > 0 ? invoice.totals.vat : +(grandNet * 0.2).toFixed(2)
+  const grandGross = invoice.totals.gross > 0 ? invoice.totals.gross : +(grandNet * 1.2).toFixed(2)
   let y = 15
 
   // ── Header ──
@@ -146,7 +150,7 @@ export function generateReconciliationPdf(
     body: [
       ['Invoice Line Items', result.invoiceTotal.toFixed(2), (result.invoiceTotal * 0.2).toFixed(2), (result.invoiceTotal * 1.2).toFixed(2)],
       ['TopUp Charges', totalTopUp.toFixed(2), (totalTopUp * 0.2).toFixed(2), (totalTopUp * 1.2).toFixed(2)],
-      ['Grand Total (Invoice)', grandNet.toFixed(2), (grandNet * 0.2).toFixed(2), (grandNet * 1.2).toFixed(2)],
+      ['Grand Total (Invoice)', grandNet.toFixed(2), grandVat.toFixed(2), grandGross.toFixed(2)],
       ['System Total', result.systemTotal.toFixed(2), (result.systemTotal * 0.2).toFixed(2), (result.systemTotal * 1.2).toFixed(2)],
     ],
     theme: 'grid',

@@ -1157,7 +1157,11 @@ export default function Reconciliation() {
     if (!result || !invoice) return
     const wb = utils.book_new()
     const totalTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
-    const grandNet = result.invoiceTotal + totalTopUp
+    const parsedGrandNet = result.invoiceTotal + totalTopUp
+    // Use stated invoice totals when available
+    const grandNet = invoice.totals.net > 0 ? invoice.totals.net : parsedGrandNet
+    const grandVat = invoice.totals.vat > 0 ? invoice.totals.vat : +(grandNet * 0.2).toFixed(2)
+    const grandGross = invoice.totals.gross > 0 ? invoice.totals.gross : +(grandNet * 1.2).toFixed(2)
 
     const summarySheet = utils.aoa_to_sheet([
       ['The Stratford \u2014 Laundry Reconciliation Report'],
@@ -1172,7 +1176,7 @@ export default function Reconciliation() {
       ['', 'NET (\u00a3)', 'VAT (\u00a3)', 'GROSS (\u00a3)'],
       ['Invoice Line Items', +result.invoiceTotal.toFixed(2), +(result.invoiceTotal * 0.2).toFixed(2), +(result.invoiceTotal * 1.2).toFixed(2)],
       ['Minimum TopUp Charges', +totalTopUp.toFixed(2), +(totalTopUp * 0.2).toFixed(2), +(totalTopUp * 1.2).toFixed(2)],
-      ['Grand Total (Invoice)', +grandNet.toFixed(2), +(grandNet * 0.2).toFixed(2), +(grandNet * 1.2).toFixed(2)],
+      ['Grand Total (Invoice)', +grandNet.toFixed(2), +grandVat.toFixed(2), +grandGross.toFixed(2)],
       ['System Total', +result.systemTotal.toFixed(2), +(result.systemTotal * 0.2).toFixed(2), +(result.systemTotal * 1.2).toFixed(2)],
       [],
       ['RECONCILIATION SUMMARY'],
