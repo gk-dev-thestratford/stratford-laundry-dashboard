@@ -445,6 +445,19 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
+  // Diagnostic: log what was parsed
+  console.log(`[Parser] === PARSE SUMMARY ===`)
+  console.log(`[Parser] Stated totals: NET £${totalNet}, VAT £${totalVat}, GROSS £${totalGross}`)
+  for (const section of sections) {
+    const secItemsNet = section.lines.filter(l => !l.isTopUp).reduce((s, l) => s + l.net, 0)
+    const secTopUpNet = section.lines.filter(l => l.isTopUp).reduce((s, l) => s + l.net, 0)
+    const secTotal = sectionTotals.get(section)
+    console.log(`[Parser] Section "${section.name}": ${section.lines.length} lines, items £${secItemsNet.toFixed(2)}, topUp £${secTopUpNet.toFixed(2)}, total £${(secItemsNet + secTopUpNet).toFixed(2)}, stated section total: ${secTotal != null ? '£' + secTotal.toFixed(2) : 'N/A'}`)
+  }
+  const allLinesTotal = sections.reduce((s, sec) => s + sec.lines.reduce((s2, l) => s2 + l.net, 0), 0)
+  console.log(`[Parser] All sections total: £${allLinesTotal.toFixed(2)}`)
+  console.log(`[Parser] Gap (parsed - stated): £${totalNet > 0 ? (allLinesTotal - totalNet).toFixed(2) : 'N/A (no stated total)'}`)
+
   // Grand total cross-check: if sum of all sections' lines exceeds stated NET,
   // remove excess non-topup lines from the largest section (napkins typically have
   // informational lines covered by weekly minimum charges)
