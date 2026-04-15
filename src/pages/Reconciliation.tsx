@@ -1609,8 +1609,19 @@ export default function Reconciliation() {
         deptName: d.deptName, sentQty: d.sentQty, topUpAlloc: d.topUpAlloc, totalCost: d.totalCost,
       })),
     }))
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, financials)
-  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary, financials])
+    const pdfTopUp = result.topUpCharges.reduce((s, l) => s + l.net, 0)
+    const pdfStatedNet = invoice.totals.net
+    const pdfGrandNet = pdfStatedNet > 0 ? pdfStatedNet : (result.invoiceTotal + pdfTopUp)
+    const pdfFinancials: FinancialTotals = {
+      lineItemsNet: +result.invoiceTotal.toFixed(2),
+      topUpNet: +pdfTopUp.toFixed(2),
+      invoiceNet: +pdfGrandNet.toFixed(2),
+      invoiceVat: +(invoice.totals.vat > 0 ? invoice.totals.vat : pdfGrandNet * 0.2).toFixed(2),
+      invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : pdfGrandNet * 1.2).toFixed(2),
+      systemNet: +result.systemTotal.toFixed(2),
+    }
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, pdfFinancials)
+  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
