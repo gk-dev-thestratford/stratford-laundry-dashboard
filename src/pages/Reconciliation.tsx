@@ -448,6 +448,8 @@ export default function Reconciliation() {
   const [showChallengePanel, setShowChallengePanel] = useState(false)
   const [challengeEmail, setChallengeEmail] = useState('')
 
+  const [showSaveConfirm, setShowSaveConfirm] = useState(false)
+
   // Add to System modal
   const [addModal, setAddModal] = useState<{ row: ReconciliationRow; index: number } | null>(null)
   const [addModalDept, setAddModalDept] = useState('')
@@ -558,7 +560,7 @@ export default function Reconciliation() {
     setError(''); setFilter('all'); setSaved(false); setBroaderSearch(false)
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
-    setChallengedItems(new Set()); setAddModal(null)
+    setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
   }
 
   const filteredRows = useMemo(() => {
@@ -1125,6 +1127,30 @@ export default function Reconciliation() {
       challengedCount: challengedItems.size,
     }
   }, [result, notFoundResolutions, missingResolutions, challengedItems])
+
+  // Count unresolved items for save validation
+  const unresolvedCounts = useMemo(() => {
+    if (!result) return { nfCount: 0, nfTotal: 0, missCount: 0, missTotal: 0 }
+    let nfCount = 0, nfTotal = 0
+    for (const row of result.rows) {
+      if (row.status !== 'not_found') continue
+      if (!notFoundResolutions[notFoundKey(row)]) { nfCount++; nfTotal += row.invoiceLine.net }
+    }
+    let missCount = 0, missTotal = 0
+    for (const o of result.missingFromInvoice) {
+      if (!missingResolutions[o.id]) { missCount++; missTotal += computeOrderCost(o) }
+    }
+    return { nfCount, nfTotal: +nfTotal.toFixed(2), missCount, missTotal: +missTotal.toFixed(2) }
+  }, [result, notFoundResolutions, missingResolutions])
+
+  const handleSaveClick = useCallback(() => {
+    const hasIssues = unresolvedCounts.nfCount > 0 || unresolvedCounts.missCount > 0 || Math.abs(adjustedTotals.unresolvedDiff) >= 1
+    if (hasIssues) {
+      setShowSaveConfirm(true)
+    } else {
+      saveReconciliation()
+    }
+  }, [unresolvedCounts, adjustedTotals, saveReconciliation])
 
   // ── Accounting Report Export ──
   const exportAccountingReport = useCallback(() => {
@@ -1703,7 +1729,7 @@ export default function Reconciliation() {
           <button onClick={handlePdfReport} className="flex items-center gap-2 px-4 py-2 text-sm text-white bg-navy rounded-lg hover:bg-navy-light">
             <FileText className="w-4 h-4" /> PDF Report
           </button>
-          <button onClick={saveReconciliation} disabled={saving || saved}
+          <button onClick={handleSaveClick} disabled={saving || saved}
             className={`flex items-center gap-2 px-3 py-2 text-sm rounded-lg transition-colors ${saved ? 'bg-green-100 text-green-700' : 'text-white bg-gold hover:bg-gold/90'} ${saving ? 'opacity-50' : ''}`}>
             {saved ? <CheckCircle className="w-4 h-4" /> : <Save className="w-4 h-4" />}
             {saved ? 'Saved' : saving ? 'Saving...' : 'Save'}
@@ -2494,6 +2520,63 @@ export default function Reconciliation() {
                 className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-orange-600 rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Send className="w-4 h-4" /> Send Challenge Email
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Save Confirmation Dialog ── */}
+      {showSaveConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowSaveConfirm(false)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-gray-200 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center flex-shrink-0">
+                <AlertTriangle className="w-5 h-5 text-amber-600" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-gray-900">Unresolved Discrepancies</h3>
+                <p className="text-xs text-gray-500 mt-0.5">Review before saving</p>
+              </div>
+            </div>
+            <div className="p-5 space-y-3 text-sm">
+              {unresolvedCounts.nfCount > 0 && (
+                <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg p-3">
+                  <XCircle className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium text-red-800">{unresolvedCounts.nfCount} "On Invoice Only" item{unresolvedCounts.nfCount > 1 ? 's' : ''} unresolved</p>
+                    <p className="text-red-600 text-xs mt-0.5">{'\u00a3'}{unresolvedCounts.nfTotal.toFixed(2)} NET billed but not matched to system orders</p>
+                  </div>
+                </div>
+              )}
+              {unresolvedCounts.missCount > 0 && (
+                <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
+                  <HelpCircle className="w-4 h-4 text-blue-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium text-blue-800">{unresolvedCounts.missCount} "In System Only" item{unresolvedCounts.missCount > 1 ? 's' : ''} unresolved</p>
+                    <p className="text-blue-600 text-xs mt-0.5">{'\u00a3'}{unresolvedCounts.missTotal.toFixed(2)} NET in system but not on invoice</p>
+                  </div>
+                </div>
+              )}
+              {Math.abs(adjustedTotals.unresolvedDiff) >= 1 && (
+                <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg p-3">
+                  <AlertTriangle className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium text-amber-800">Unresolved difference: {'\u00a3'}{Math.abs(adjustedTotals.unresolvedDiff).toFixed(2)}</p>
+                    <p className="text-amber-600 text-xs mt-0.5">Invoice and system totals do not match after resolutions</p>
+                  </div>
+                </div>
+              )}
+              <p className="text-gray-500 text-xs pt-1">You can still save, but these items will remain unresolved in the reconciliation record.</p>
+            </div>
+            <div className="p-4 border-t border-gray-200 flex gap-2 justify-end">
+              <button onClick={() => setShowSaveConfirm(false)}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+                Go Back
+              </button>
+              <button onClick={() => { setShowSaveConfirm(false); saveReconciliation() }}
+                className="px-4 py-2 text-sm font-medium text-white bg-amber-500 rounded-lg hover:bg-amber-600">
+                Save Anyway
               </button>
             </div>
           </div>
