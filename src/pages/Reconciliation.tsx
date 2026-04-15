@@ -74,7 +74,7 @@ interface Resolution {
 
 /** Unique key for a not_found invoice line */
 function notFoundKey(line: InvoiceLine): string {
-  return `${line.ticket}-${line.date}-${line.net}`
+  return `${line.ticket}-${line.date}-${line.net}-${line.description || ''}`
 }
 
 // ── Helpers ──
