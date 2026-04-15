@@ -445,6 +445,47 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
+  // Grand total cross-check: if sum of all sections' lines exceeds stated NET,
+  // remove excess non-topup lines from the largest section (napkins typically have
+  // informational lines covered by weekly minimum charges)
+  if (totalNet > 0) {
+    const allLinesNet = sections.reduce((s, sec) => s + sec.lines.reduce((s2, l) => s2 + l.net, 0), 0)
+    const grandExcess = Math.round((allLinesNet - totalNet) * 100) / 100
+    if (grandExcess > 1) {
+      // Find the section with the most lines (most likely to have informational duplicates)
+      const largest = sections.reduce((best, sec) => sec.lines.length > best.lines.length ? sec : best, sections[0])
+      console.log(`[Parser] Grand total excess: parsed £${allLinesNet.toFixed(2)} vs stated £${totalNet.toFixed(2)} (gap £${grandExcess.toFixed(2)}). Trimming from "${largest.name}"`)
+
+      // Remove non-topup lines greedily from the largest section
+      let remaining = grandExcess
+      const toRemove: number[] = []
+      // Prefer removing lines whose NET has duplicates (likely informational)
+      const netCounts = new Map<number, number>()
+      for (const l of largest.lines) {
+        if (!l.isTopUp) netCounts.set(l.net, (netCounts.get(l.net) || 0) + 1)
+      }
+      const candidates = largest.lines
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => !l.isTopUp && (netCounts.get(l.net) || 0) > 1)
+        .sort((a, b) => a.l.net - b.l.net)
+      for (const { l, i } of candidates) {
+        if (remaining < 0.5) break
+        if (l.net <= remaining + 0.02) {
+          toRemove.push(i)
+          remaining = Math.round((remaining - l.net) * 100) / 100
+        }
+      }
+      if (remaining < 1 && toRemove.length > 0) {
+        console.log(`[Parser] Removing ${toRemove.length} lines (£${(grandExcess - remaining).toFixed(2)}) to match grand total`)
+        for (const i of toRemove.sort((a, b) => b - a)) {
+          largest.lines.splice(i, 1)
+        }
+      } else {
+        console.warn(`[Parser] Could not fully resolve grand total excess: £${remaining.toFixed(2)} remaining`)
+      }
+    }
+  }
+
   return {
     invoiceNumber, invoiceDate, invoicePeriod,
     sections,
