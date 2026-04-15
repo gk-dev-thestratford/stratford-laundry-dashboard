@@ -389,14 +389,58 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   for (const section of sections) {
     const sectionTotal = sectionTotals.get(section)
     if (sectionTotal == null) continue
-    const lineSum = Math.round(section.lines.reduce((s, l) => s + l.net, 0) * 100) / 100
-    const excess = Math.round((lineSum - sectionTotal) * 100) / 100
+    let lineSum = Math.round(section.lines.reduce((s, l) => s + l.net, 0) * 100) / 100
+    let excess = Math.round((lineSum - sectionTotal) * 100) / 100
     if (excess > 0.01) {
-      // Find a line whose NET matches the excess — it's an informational/minimum-covered line
+      // Strategy 1: Find a single line whose NET matches the excess
       const idx = section.lines.findIndex(l => Math.abs(l.net - excess) < 0.02)
       if (idx !== -1) {
         console.log(`[Parser] Removing informational line covered by minimum: ${section.lines[idx].description} £${section.lines[idx].net} (section total £${sectionTotal}, line sum £${lineSum})`)
         section.lines.splice(idx, 1)
+      } else {
+        // Strategy 2: Find a pair of lines whose NET sums to the excess
+        let found = false
+        for (let i = 0; i < section.lines.length && !found; i++) {
+          for (let j = i + 1; j < section.lines.length && !found; j++) {
+            if (Math.abs(section.lines[i].net + section.lines[j].net - excess) < 0.02) {
+              console.log(`[Parser] Removing 2 informational lines: ${section.lines[i].description} £${section.lines[i].net} + ${section.lines[j].description} £${section.lines[j].net} (excess £${excess})`)
+              section.lines.splice(j, 1)
+              section.lines.splice(i, 1)
+              found = true
+            }
+          }
+        }
+        // Strategy 3: Greedily remove non-topup lines starting from smallest, that have
+        // a duplicate NET amount in the section (likely informational/summary lines)
+        if (!found) {
+          const netCounts = new Map<number, number>()
+          for (const l of section.lines) {
+            if (!l.isTopUp) netCounts.set(l.net, (netCounts.get(l.net) || 0) + 1)
+          }
+          // Sort candidate duplicates by NET ascending — remove smallest first
+          const candidates = section.lines
+            .map((l, i) => ({ l, i }))
+            .filter(({ l }) => !l.isTopUp && (netCounts.get(l.net) || 0) > 1)
+            .sort((a, b) => a.l.net - b.l.net)
+
+          const toRemove: number[] = []
+          let remaining = excess
+          for (const { l, i } of candidates) {
+            if (remaining < 0.01) break
+            if (l.net <= remaining + 0.02) {
+              toRemove.push(i)
+              remaining = Math.round((remaining - l.net) * 100) / 100
+            }
+          }
+          if (remaining < 0.02 && toRemove.length > 0) {
+            console.log(`[Parser] Removing ${toRemove.length} duplicate-NET lines to match section total (excess £${excess})`)
+            for (const i of toRemove.sort((a, b) => b - a)) {
+              section.lines.splice(i, 1)
+            }
+          } else {
+            console.warn(`[Parser] Section "${section.name}" has unresolved excess: parsed £${lineSum} vs stated £${sectionTotal} (gap £${excess})`)
+          }
+        }
       }
     }
   }

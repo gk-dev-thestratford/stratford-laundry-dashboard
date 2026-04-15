@@ -197,44 +197,45 @@ export function generateReconciliationPdf(
       ? `    ${row.departmentName} \u2014 ${row.lineLabel}`
       : `${row.departmentName} \u2014 ${row.lineLabel}`
 
+    const rowCostNet = row.invoiceNet
     deptBody.push([
       { content: label, styles: row.isTopUp ? { fontStyle: 'italic', textColor: '#6B7280' } : {} },
       isRealTopUp ? '\u2014' : String(row.orderCount),
-      row.invoiceNet.toFixed(2),
-      isRealTopUp ? '\u2014' : row.systemTotal.toFixed(2),
-      isRealTopUp ? '\u2014' : (Math.abs(row.difference) < 0.02 ? '\u2713' : row.difference.toFixed(2)),
+      isRealTopUp ? '\u2014' : row.invoiceNet.toFixed(2),
+      isRealTopUp ? row.invoiceNet.toFixed(2) : '\u2014',
+      rowCostNet.toFixed(2),
       row.totalGross.toFixed(2),
     ])
   }
 
   // Totals row
   const totalOrders = displayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)
-  const totalInvNet = displayRows.reduce((s, r) => s + r.invoiceNet, 0)
-  const totalSysNet = displayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.systemTotal, 0)
-  const totalDiff = displayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.difference, 0)
+  const totalItemsNet = displayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.invoiceNet, 0)
+  const totalTopUpAlloc = displayRows.filter(r => r.isTopUp).reduce((s, r) => s + r.invoiceNet, 0)
+  const totalCostNet = displayRows.reduce((s, r) => s + r.invoiceNet, 0)
   const totalGross = displayRows.reduce((s, r) => s + r.totalGross, 0)
   deptBody.push([
     { content: 'TOTAL', styles: { fontStyle: 'bold' } },
     String(totalOrders),
-    totalInvNet.toFixed(2),
-    totalSysNet.toFixed(2),
-    totalDiff.toFixed(2),
+    totalItemsNet.toFixed(2),
+    totalTopUpAlloc.toFixed(2),
+    totalCostNet.toFixed(2),
     totalGross.toFixed(2),
   ])
 
   autoTable(doc, {
     startY: y,
-    head: [['Department / Line', 'Orders', 'Invoice NET (\u00a3)', 'System NET (\u00a3)', 'Diff (\u00a3)', 'Total inc VAT (\u00a3)']],
+    head: [['Department / Line', 'Orders', 'Items NET (\u00a3)', 'TopUp Alloc (\u00a3)', 'Total Cost NET (\u00a3)', 'Total inc VAT (\u00a3)']],
     body: deptBody,
     theme: 'grid',
     styles: { fontSize: 7.5, cellPadding: 2 },
     headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold', fontSize: 7.5 },
     columnStyles: {
-      0: { cellWidth: 60 },
-      1: { halign: 'right', cellWidth: 18 },
-      2: { halign: 'right', cellWidth: 28 },
-      3: { halign: 'right', cellWidth: 28 },
-      4: { halign: 'right', cellWidth: 22 },
+      0: { cellWidth: 55 },
+      1: { halign: 'right', cellWidth: 16 },
+      2: { halign: 'right', cellWidth: 26 },
+      3: { halign: 'right', cellWidth: 26 },
+      4: { halign: 'right', cellWidth: 28 },
       5: { halign: 'right', cellWidth: 30 },
     },
     margin: { left: 14, right: 14 },
