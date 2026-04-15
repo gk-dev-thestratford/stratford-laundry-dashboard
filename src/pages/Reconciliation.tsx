@@ -275,22 +275,13 @@ function buildDepartmentDisplayRows(
 
     const hasSubBreakdown = linenCount > 0 && uniformCount > 0
     const label = departmentItemsLabel(allRows, dept.departmentName)
-    displayRows.push({
-      departmentName: dept.departmentName,
-      lineLabel: label,
-      isTopUp: false,
-      orderCount: dept.orderCount,
-      invoiceNet: dept.invoiceNet,
-      systemTotal: dept.systemTotal,
-      difference: dept.difference,
-      totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
-    })
 
     if (hasSubBreakdown) {
+      // Split into two sub-rows instead of one main row to avoid double-counting
       displayRows.push({
         departmentName: dept.departmentName,
         lineLabel: 'Staff Uniform',
-        isTopUp: true,
+        isTopUp: false,
         orderCount: uniformCount,
         invoiceNet: +uniformInvNet.toFixed(2),
         systemTotal: +uniformSysNet.toFixed(2),
@@ -300,12 +291,23 @@ function buildDepartmentDisplayRows(
       displayRows.push({
         departmentName: dept.departmentName,
         lineLabel: 'Other (HSK Linen)',
-        isTopUp: true,
+        isTopUp: false,
         orderCount: linenCount,
         invoiceNet: +linenInvNet.toFixed(2),
         systemTotal: +linenSysNet.toFixed(2),
         difference: +(linenInvNet - linenSysNet).toFixed(2),
         totalGross: +(linenInvNet * 1.2).toFixed(2),
+      })
+    } else {
+      displayRows.push({
+        departmentName: dept.departmentName,
+        lineLabel: label,
+        isTopUp: false,
+        orderCount: dept.orderCount,
+        invoiceNet: dept.invoiceNet,
+        systemTotal: dept.systemTotal,
+        difference: dept.difference,
+        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
       })
     }
     if (dept.allocatedTopUp > 0) {
