@@ -510,68 +510,100 @@ export function parseD140Report(lines: string[]): D140Report {
   let grandTotal = 0
   let periodFrom = '', periodTo = ''
 
-  // Extract period from filter line: "From Date 01-03-26 To Date 31-03-26"
+  console.log(`[D140] Parsing ${lines.length} lines`)
+  console.log('[D140] First 10 lines:', lines.slice(0, 10))
+
+  // Extract period from filter line
   for (const line of lines) {
     const periodM = line.match(/From\s+Date\s+(\d{2}-\d{2}-\d{2,4})\s+To\s+Date\s+(\d{2}-\d{2}-\d{2,4})/i)
-    if (periodM) {
-      periodFrom = periodM[1]
-      periodTo = periodM[2]
-    }
+    if (periodM) { periodFrom = periodM[1]; periodTo = periodM[2] }
   }
 
-  // Parse transaction lines: "DD-MM-YY HH:MM ROOM_NO NAME MKT_CODE 70100 Laundry..."
-  // The D140 PDF text extraction produces lines where date, room, name, amounts appear
-  // We look for the pattern: date + time + room number + name + amount
-  const dateTimeRx = /^(\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+/
+  // The D140 PDF has a complex table layout. The text extraction may produce lines
+  // in various formats. We use multiple strategies to find transaction data.
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
 
-    // Grand total
-    const totalM = line.match(/Grand\s+Total\s+([\d,.-]+)/i)
-    if (totalM) {
-      grandTotal = parseFloat(totalM[1].replace(',', ''))
-      continue
+    // Grand total — flexible matching
+    const totalM = line.match(/Grand\s*Total\s*(?:£?\s*)?([\d,]+\.\d{2})/i)
+    if (totalM) { grandTotal = parseFloat(totalM[1].replace(',', '')); continue }
+    // Also try: just a number after "Grand Total" somewhere
+    if (/grand\s*total/i.test(line)) {
+      const numM = line.match(/([\d,]+\.\d{2})/)
+      if (numM) grandTotal = parseFloat(numM[1].replace(',', ''))
     }
 
-    const dtMatch = line.match(dateTimeRx)
-    if (!dtMatch) continue
+    // Strategy 1: Full line with date-time-room-name pattern
+    // DD-MM-YY HH:MM ROOM NAME,FIRST,TITLE MKT 70100 ... GBP AMOUNT
+    const fullM = line.match(/(\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(\d{3,5})\s+(.+?)\s+(?:[A-Z]{2,4}\s+)?701\d{2}/)
+    if (fullM) {
+      const amtM = line.match(/([-\s]?[\d,]+\.\d{2})\s+[\d.]+\s*$/) || line.match(/GBP\s+([-\s]?[\d,]+\.\d{2})/) || line.match(/([-\s]?[\d,]+\.\d{2})/)
+      if (amtM) {
+        const amt = parseFloat(amtM[1].replace(/[\s,]/g, ''))
+        if (!isNaN(amt)) {
+          transactions.push({
+            date: fullM[1], time: fullM[2], roomNumber: fullM[3],
+            guestName: fullM[4].replace(/,/g, ' ').trim(),
+            amount: Math.abs(amt), isCredit: amt < 0,
+            description: 'Laundry - Dry Cleaning',
+          })
+          continue
+        }
+      }
+    }
 
-    const date = dtMatch[1]
-    const time = dtMatch[2]
-    const rest = line.slice(dtMatch[0].length)
+    // Strategy 2: Line starts with date (DD-MM-YY) — extract fields more flexibly
+    const dateM = line.match(/^(\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(\d{3,5})\s+/)
+    if (dateM) {
+      const rest = line.slice(dateM[0].length)
+      // Find an amount (number with decimals) — take the first significant one
+      const amounts = [...rest.matchAll(/([-\s]?[\d,]+\.\d{2})/g)].map(m => parseFloat(m[1].replace(/[\s,]/g, '')))
+      const debit = amounts.find(a => !isNaN(a) && Math.abs(a) > 0)
+      // Extract name: everything before "REG|ECM|ADP|GSP|HAC|GCO|BEN|PKG|SPE" market code
+      const nameM = rest.match(/^(.+?)\s+(?:REG|ECM|ADP|GSP|HAC|GCO|BEN|PKG|SPE)\b/i)
+      const guestName = nameM ? nameM[1].replace(/,/g, ' ').trim() : rest.split(/\s{2,}/)[0].replace(/,/g, ' ').trim()
+      if (debit != null) {
+        transactions.push({
+          date: dateM[1], time: dateM[2], roomNumber: dateM[3],
+          guestName, amount: Math.abs(debit), isCredit: debit < 0,
+          description: 'Laundry - Dry Cleaning',
+        })
+        continue
+      }
+    }
 
-    // Extract room number (3-4 digits)
-    const roomM = rest.match(/^(\d{3,4})\s+/)
-    if (!roomM) continue
-    const roomNumber = roomM[1]
-    const afterRoom = rest.slice(roomM[0].length)
-
-    // Extract guest name (up to the market code which is 2-3 uppercase letters)
-    const nameM = afterRoom.match(/^(.+?)\s+([A-Z]{2,4})\s+(?:70100|701\d{2})/)
-    if (!nameM) continue
-    const guestName = nameM[1].trim()
-
-    // Extract amount — look for GBP followed by a number (possibly negative)
-    const amtM = line.match(/GBP\s+([-\s]?[\d,]+\.\d{2})/)
-    if (!amtM) continue
-    const amtStr = amtM[1].replace(/[\s,]/g, '')
-    const amount = parseFloat(amtStr)
-    if (isNaN(amount)) continue
-
-    transactions.push({
-      date,
-      time,
-      roomNumber,
-      guestName,
-      amount: Math.abs(amount),
-      isCredit: amount < 0,
-      description: 'Laundry - Dry Cleaning',
-    })
+    // Strategy 3: Look for room numbers + amounts on lines that have "Laundry" or "70100"
+    if (/(?:laundry|70100)/i.test(line)) {
+      const roomAmtM = line.match(/(\d{3,5}).*?(\d+\.\d{2})/)
+      const dateInLine = line.match(/(\d{2}-\d{2}-\d{2})/)
+      if (roomAmtM && dateInLine) {
+        const amt = parseFloat(roomAmtM[2])
+        if (!isNaN(amt) && amt > 0) {
+          transactions.push({
+            date: dateInLine[1], time: '', roomNumber: roomAmtM[1],
+            guestName: '', amount: amt, isCredit: false,
+            description: 'Laundry - Dry Cleaning',
+          })
+        }
+      }
+    }
   }
 
+  // Deduplicate — same room + same date + same amount
+  const seen = new Set<string>()
+  const unique = transactions.filter(t => {
+    const key = `${t.date}-${t.roomNumber}-${t.amount}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+
+  console.log(`[D140] Parsed ${unique.length} transactions (${transactions.length} before dedup), grand total £${grandTotal}`)
+  if (unique.length > 0) console.log('[D140] First transaction:', unique[0])
+
   return {
-    transactions,
+    transactions: unique,
     grandTotal,
     period: { from: periodFrom, to: periodTo },
   }

@@ -593,8 +593,10 @@ export default function Reconciliation() {
   const guestMarginData = useMemo(() => {
     if (!result || !d140Report || !isGuestInvoice) return null
     const guestRows = result.rows.filter(r => r.sectionType === 'guest_laundry' || r.invoiceLine.sectionType === 'guest')
+    // Index D140 transactions by room number
     const d140ByRoom = new Map<string, D140Transaction[]>()
     for (const t of d140Report.transactions) {
+      if (t.isCredit) continue // skip corrections/refunds
       if (!d140ByRoom.has(t.roomNumber)) d140ByRoom.set(t.roomNumber, [])
       d140ByRoom.get(t.roomNumber)!.push(t)
     }
@@ -602,21 +604,14 @@ export default function Reconciliation() {
     const matched: { invoiceLine: typeof guestRows[0]; d140: D140Transaction; margin: number; marginPct: number }[] = []
     const invoiceOnly: typeof guestRows[0][] = []
     const d140Only: D140Transaction[] = []
-    const usedD140 = new Set<number>()
+    const usedD140 = new Set<D140Transaction>()
 
     for (const row of guestRows) {
       const room = row.invoiceLine.ticket
       const candidates = d140ByRoom.get(room) ?? []
-      let bestIdx = -1
-      for (let i = 0; i < candidates.length; i++) {
-        if (usedD140.has(i)) continue
-        // Match by room number (already matched) — take first unused
-        bestIdx = i
-        break
-      }
-      if (bestIdx >= 0) {
-        const d140 = candidates[bestIdx]
-        usedD140.add(bestIdx)
+      const d140 = candidates.find(t => !usedD140.has(t))
+      if (d140) {
+        usedD140.add(d140)
         const margin = d140.amount - row.invoiceLine.net
         const marginPct = d140.amount > 0 ? (margin / d140.amount) * 100 : 0
         matched.push({ invoiceLine: row, d140, margin: +margin.toFixed(2), marginPct: +marginPct.toFixed(1) })
@@ -626,10 +621,8 @@ export default function Reconciliation() {
     }
 
     // Find D140 entries not matched to any invoice line
-    for (const [, txns] of d140ByRoom) {
-      for (let i = 0; i < txns.length; i++) {
-        if (!usedD140.has(i) && !txns[i].isCredit) d140Only.push(txns[i])
-      }
+    for (const t of d140Report.transactions) {
+      if (!t.isCredit && !usedD140.has(t)) d140Only.push(t)
     }
 
     const totalCost = matched.reduce((s, m) => s + m.invoiceLine.invoiceLine.net, 0)
