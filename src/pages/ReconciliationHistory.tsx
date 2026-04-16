@@ -91,58 +91,127 @@ export default function ReconciliationHistory() {
   }
 
   async function exportExcel(h: SavedReconciliation) {
-    const summarySheet = [{
-      'Invoice Number': h.invoice_number,
-      'Invoice Date': h.invoice_date,
-      'Invoice Period': h.invoice_period,
-      'Reconciled On': format(new Date(h.created_at), 'dd/MM/yyyy HH:mm'),
-      'Reconciled By': h.created_by,
-      'Invoice NET (\u00a3)': h.invoice_net,
-      'Invoice Gross (\u00a3)': h.invoice_gross,
-      'System Total (\u00a3)': h.system_total,
-      'TopUp (\u00a3)': h.topup_total,
-      'Matched': h.matched_count,
-      'Price Mismatches': h.mismatch_count,
-      'Not Found': h.not_found_count,
-      'Missing': h.missing_count,
-    }]
-    const deptSheet = (h.department_breakdown || []).map(d => ({
-      'Department': d.departmentName,
-      'Orders': d.orderCount,
-      'Invoice NET (\u00a3)': d.invoiceNet,
-      'System Total (\u00a3)': d.systemTotal,
-      'TopUp (\u00a3)': d.allocatedTopUp,
-      'Total NET (\u00a3)': d.totalCostNet,
-      'Total inc VAT (\u00a3)': d.totalCostGross,
-    }))
+    const wb = utils.book_new()
 
-    // Fetch all orders that were matched to this reconciliation
+    // ── Sheet 1: Department Breakdown (matches PDF report format) ──
+    const deptRows: Record<string, string | number>[] = []
+    const breakdown = h.department_breakdown || []
+    for (const d of breakdown) {
+      deptRows.push({
+        'Department': d.departmentName,
+        'Orders': d.orderCount,
+        'Items NET (\u00a3)': d.invoiceNet,
+        'TopUp Alloc (\u00a3)': d.allocatedTopUp > 0 ? d.allocatedTopUp : 0,
+        'Total Cost NET (\u00a3)': d.totalCostNet,
+        'Total inc VAT (\u00a3)': d.totalCostGross,
+      })
+    }
+    // Totals row
+    if (deptRows.length > 0) {
+      deptRows.push({
+        'Department': 'TOTAL',
+        'Orders': breakdown.reduce((s, d) => s + d.orderCount, 0),
+        'Items NET (\u00a3)': +breakdown.reduce((s, d) => s + d.invoiceNet, 0).toFixed(2),
+        'TopUp Alloc (\u00a3)': +breakdown.reduce((s, d) => s + d.allocatedTopUp, 0).toFixed(2),
+        'Total Cost NET (\u00a3)': +breakdown.reduce((s, d) => s + d.totalCostNet, 0).toFixed(2),
+        'Total inc VAT (\u00a3)': +breakdown.reduce((s, d) => s + d.totalCostGross, 0).toFixed(2),
+      })
+    }
+    // Add header rows above the data
+    const deptSheetData = [
+      ['The Stratford \u2014 Reconciliation Report'],
+      [`Invoice: ${h.invoice_number}`, `Period: ${h.invoice_period}`, `Category: ${h.invoice_category || 'N/A'}`],
+      [`Reconciled: ${format(new Date(h.created_at), 'dd/MM/yyyy HH:mm')}`, `By: ${h.created_by}`],
+      [`Matched: ${h.matched_count}`, `Mismatches: ${h.mismatch_count}`, `Not Found: ${h.not_found_count}`, `Missing: ${h.missing_count}`],
+      [],
+    ]
+    const deptSheet = utils.aoa_to_sheet(deptSheetData)
+    if (deptRows.length > 0) {
+      utils.sheet_add_json(deptSheet, deptRows, { origin: 'A6' })
+    }
+    deptSheet['!cols'] = [{ wch: 25 }, { wch: 10 }, { wch: 15 }, { wch: 15 }, { wch: 18 }, { wch: 18 }]
+    utils.book_append_sheet(wb, deptSheet, 'Department Breakdown')
+
+    // ── Sheet 2: Reconciled Orders (all tickets with items from database) ──
     const { data: reconOrders } = await supabase
       .from('orders').select('*, department:departments(name), order_items(*)')
       .eq('reconciliation_id', h.id)
       .order('created_at', { ascending: true })
 
-    const ordersSheet = (reconOrders ?? []).map(o => {
-      const itemTotal = (o.order_items ?? []).reduce((s: number, i: any) =>
-        s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
-      const cost = o.total_price ?? (itemTotal > 0 ? Math.round(itemTotal * 100) / 100 : 0)
-      const description = (o.order_items ?? []).map((i: any) =>
-        `${i.quantity_sent ?? 0}x ${i.item_name}`).join(', ')
-      return {
-        'Date': format(new Date(o.created_at), 'dd/MM/yyyy'),
-        'Docket': o.docket_number,
-        'Department': o.department?.name || '—',
-        'Type': o.order_type,
-        'Description': description || '—',
-        'NET (\u00a3)': cost,
-        'Gross (\u00a3)': +(cost * 1.2).toFixed(2),
+    const ordersData: Record<string, string | number>[] = []
+    for (const o of reconOrders ?? []) {
+      const items = o.order_items ?? []
+      if (items.length === 0) {
+        // Order with no items — single row
+        const cost = o.total_price ?? 0
+        ordersData.push({
+          'Date': format(new Date(o.created_at), 'dd/MM/yyyy'),
+          'Docket': o.docket_number,
+          'Department': o.department?.name || '\u2014',
+          'Type': o.order_type,
+          'Staff / Guest': o.staff_name || o.guest_name || '\u2014',
+          'Item': '\u2014',
+          'Qty Sent': 0,
+          'Qty Received': 0,
+          'Unit Price (\u00a3)': 0,
+          'Line NET (\u00a3)': cost,
+          'Order NET (\u00a3)': cost,
+          'Order inc VAT (\u00a3)': +(cost * 1.2).toFixed(2),
+        })
+      } else {
+        // One row per item, with order totals on first row
+        const orderTotal = items.reduce((s: number, i: any) =>
+          s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
+        const cost = orderTotal > 0 ? +orderTotal.toFixed(2) : (o.total_price ?? 0)
+        items.forEach((item: any, idx: number) => {
+          const lineNet = +((item.price_at_time ?? 0) * (item.quantity_sent ?? 0)).toFixed(2)
+          ordersData.push({
+            'Date': idx === 0 ? format(new Date(o.created_at), 'dd/MM/yyyy') : '',
+            'Docket': idx === 0 ? o.docket_number : '',
+            'Department': idx === 0 ? (o.department?.name || '\u2014') : '',
+            'Type': idx === 0 ? o.order_type : '',
+            'Staff / Guest': idx === 0 ? (o.staff_name || o.guest_name || '\u2014') : '',
+            'Item': item.item_name,
+            'Qty Sent': item.quantity_sent ?? 0,
+            'Qty Received': item.quantity_received ?? 0,
+            'Unit Price (\u00a3)': item.price_at_time ?? 0,
+            'Line NET (\u00a3)': lineNet,
+            'Order NET (\u00a3)': idx === 0 ? cost : '',
+            'Order inc VAT (\u00a3)': idx === 0 ? +(cost * 1.2).toFixed(2) : '',
+          })
+        })
       }
-    })
+    }
+    if (ordersData.length > 0) {
+      const ordersSheet = utils.json_to_sheet(ordersData)
+      ordersSheet['!cols'] = [{ wch: 12 }, { wch: 10 }, { wch: 18 }, { wch: 14 }, { wch: 18 }, { wch: 20 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 14 }, { wch: 14 }]
+      utils.book_append_sheet(wb, ordersSheet, 'Reconciled Orders')
+    }
 
-    const wb = utils.book_new()
-    utils.book_append_sheet(wb, utils.json_to_sheet(summarySheet), 'Summary')
-    if (deptSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(deptSheet), 'Department Breakdown')
-    if (ordersSheet.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(ordersSheet), 'Reconciled Orders')
+    // ── Sheet 3: D140 Revenue Analysis (if available) ──
+    if (h.d140_summary) {
+      const d140Data = h.d140_summary.matched.map(m => ({
+        'Room': m.room,
+        'Guest': m.guestName,
+        'Date': m.date,
+        'Description': m.description || '',
+        'Cost (\u00a3)': m.cost,
+        'Revenue (\u00a3)': m.revenue,
+        'Margin (\u00a3)': m.margin,
+        'Margin %': m.marginPct,
+      }))
+      if (d140Data.length > 0) {
+        d140Data.push({
+          'Room': 'TOTAL', 'Guest': '', 'Date': '', 'Description': '',
+          'Cost (\u00a3)': h.d140_summary.totals.totalCost,
+          'Revenue (\u00a3)': h.d140_summary.totals.totalRevenue,
+          'Margin (\u00a3)': h.d140_summary.totals.totalMargin,
+          'Margin %': h.d140_summary.totals.avgMarginPct,
+        })
+        utils.book_append_sheet(wb, utils.json_to_sheet(d140Data), 'D140 Revenue')
+      }
+    }
+
     writeFile(wb, `reconciliation-${h.invoice_number || 'report'}-${format(new Date(h.created_at), 'yyyy-MM-dd')}.xlsx`)
   }
 
