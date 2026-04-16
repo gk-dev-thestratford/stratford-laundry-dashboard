@@ -33,6 +33,14 @@ interface SavedReconciliation {
     totalCostNet: number
     totalCostGross: number
   }[]
+  d140_summary: {
+    matched: { room: string; guestName: string; date: string; cost: number; revenue: number; margin: number; marginPct: number; description: string }[]
+    invoiceOnly: { room: string; description: string; cost: number }[]
+    d140Only: { room: string; guestName: string; date: string; revenue: number }[]
+    totals: { totalCost: number; totalRevenue: number; totalMargin: number; avgMarginPct: number; matchedCount: number; invoiceOnlyCount: number; d140OnlyCount: number }
+    d140GrandTotal: number
+  } | null
+  d140_margin_pct: number | null
 }
 
 export default function ReconciliationHistory() {
@@ -256,6 +264,11 @@ export default function ReconciliationHistory() {
                           : h.invoice_category === 'HSK Linen' ? 'bg-green-100 text-green-700'
                           : 'bg-gray-100 text-gray-700'
                         }`}>{h.invoice_category || 'Other'}</span>
+                        {h.d140_margin_pct != null && (
+                          <span className={`ml-1.5 inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium ${h.d140_margin_pct >= 40 ? 'bg-green-50 text-green-700' : h.d140_margin_pct >= 35 ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-700'}`}>
+                            {h.d140_margin_pct.toFixed(1)}% margin
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 font-mono font-medium text-navy">{h.invoice_number || '—'}</td>
                       <td className="px-4 py-3 text-gray-600">{h.invoice_period || '—'}</td>
@@ -339,6 +352,52 @@ export default function ReconciliationHistory() {
                             </tbody>
                           </table>
                           </>}
+                          {/* D140 Revenue Analysis */}
+                          {h.d140_summary && (
+                            <>
+                              <p className="text-xs font-semibold text-gray-500 uppercase mb-2 mt-4">D140 Revenue Analysis</p>
+                              <div className="flex gap-6 mb-3 text-xs flex-wrap">
+                                <div>Cost: <span className="font-semibold">{'\u00a3'}{h.d140_summary.totals.totalCost.toFixed(2)}</span></div>
+                                <div>Revenue: <span className="font-semibold">{'\u00a3'}{h.d140_summary.totals.totalRevenue.toFixed(2)}</span></div>
+                                <div>Margin: <span className="font-semibold text-green-600">{'\u00a3'}{h.d140_summary.totals.totalMargin.toFixed(2)}</span></div>
+                                <div>Avg Margin: <span className={`font-semibold ${h.d140_summary.totals.avgMarginPct >= 40 ? 'text-green-600' : h.d140_summary.totals.avgMarginPct >= 35 ? 'text-amber-600' : 'text-red-600'}`}>
+                                  {h.d140_summary.totals.avgMarginPct.toFixed(1)}%
+                                </span></div>
+                                <div>Matched: <span className="font-medium">{h.d140_summary.totals.matchedCount}</span></div>
+                                {h.d140_summary.totals.invoiceOnlyCount > 0 && (
+                                  <div className="text-amber-600">{h.d140_summary.totals.invoiceOnlyCount} invoice-only</div>
+                                )}
+                                {h.d140_summary.totals.d140OnlyCount > 0 && (
+                                  <div className="text-blue-600">{h.d140_summary.totals.d140OnlyCount} D140-only</div>
+                                )}
+                                <div className="text-gray-400">D140 Total: {'\u00a3'}{h.d140_summary.d140GrandTotal.toFixed(2)}</div>
+                              </div>
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="text-gray-500">
+                                    <th className="py-1 pr-3 text-left font-medium">Room</th>
+                                    <th className="py-1 pr-3 text-left font-medium">Guest</th>
+                                    <th className="py-1 pr-3 text-right font-medium">Cost</th>
+                                    <th className="py-1 pr-3 text-right font-medium">Revenue</th>
+                                    <th className="py-1 pr-3 text-right font-medium">Margin</th>
+                                    <th className="py-1 text-right font-medium">%</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {h.d140_summary.matched.map((m, i) => (
+                                    <tr key={i} className="border-t border-gray-100">
+                                      <td className="py-1 pr-3 font-mono">{m.room}</td>
+                                      <td className="py-1 pr-3">{m.guestName}</td>
+                                      <td className="py-1 pr-3 text-right">{'\u00a3'}{m.cost.toFixed(2)}</td>
+                                      <td className="py-1 pr-3 text-right font-medium">{'\u00a3'}{m.revenue.toFixed(2)}</td>
+                                      <td className="py-1 pr-3 text-right text-green-600">{'\u00a3'}{m.margin.toFixed(2)}</td>
+                                      <td className={`py-1 text-right font-medium ${m.marginPct >= 40 ? 'text-green-600' : m.marginPct >= 35 ? 'text-amber-600' : 'text-red-600'}`}>{m.marginPct.toFixed(1)}%</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </>
+                          )}
                         </td>
                       </tr>
                     )}

@@ -435,6 +435,9 @@ export default function Reconciliation() {
   const [d140Report, setD140Report] = useState<D140Report | null>(null)
   const [d140Loading, setD140Loading] = useState(false)
   const [showD140Prompt, setShowD140Prompt] = useState(false)
+  const [lastSavedRecId, setLastSavedRecId] = useState<string | null>(null)
+  const [d140Saving, setD140Saving] = useState(false)
+  const [d140Saved, setD140Saved] = useState(false)
 
   // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
   useEffect(() => {
@@ -567,7 +570,7 @@ export default function Reconciliation() {
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
-    setD140Report(null); setShowD140Prompt(false)
+    setD140Report(null); setShowD140Prompt(false); setLastSavedRecId(null); setD140Saved(false)
   }
 
   const isGuestInvoice = invoice?.sections.some(s => s.type === 'guest') ?? false
@@ -636,6 +639,53 @@ export default function Reconciliation() {
 
     return { matched, invoiceOnly, d140Only, totalCost, totalRevenue, totalMargin, avgMarginPct }
   }, [result, d140Report, isGuestInvoice])
+
+  const handleSaveD140 = useCallback(async () => {
+    if (!guestMarginData || !lastSavedRecId || !d140Report) return
+    setD140Saving(true)
+    const d140Summary = {
+      matched: guestMarginData.matched.map(m => ({
+        room: m.invoiceLine.invoiceLine.ticket,
+        guestName: m.d140.guestName,
+        date: m.invoiceLine.invoiceLine.date,
+        cost: m.invoiceLine.invoiceLine.net,
+        revenue: m.d140.amount,
+        margin: m.margin,
+        marginPct: m.marginPct,
+        description: m.invoiceLine.invoiceLine.description,
+      })),
+      invoiceOnly: guestMarginData.invoiceOnly.map(row => ({
+        room: row.invoiceLine.ticket,
+        description: row.invoiceLine.guestInfo || row.invoiceLine.description,
+        cost: row.invoiceLine.net,
+      })),
+      d140Only: guestMarginData.d140Only.map(t => ({
+        room: t.roomNumber, guestName: t.guestName, date: t.date, revenue: t.amount,
+      })),
+      totals: {
+        totalCost: +guestMarginData.totalCost.toFixed(2),
+        totalRevenue: +guestMarginData.totalRevenue.toFixed(2),
+        totalMargin: +guestMarginData.totalMargin.toFixed(2),
+        avgMarginPct: +guestMarginData.avgMarginPct.toFixed(1),
+        matchedCount: guestMarginData.matched.length,
+        invoiceOnlyCount: guestMarginData.invoiceOnly.length,
+        d140OnlyCount: guestMarginData.d140Only.length,
+      },
+      d140Period: d140Report.period,
+      d140TransactionCount: d140Report.transactions.length,
+      d140GrandTotal: d140Report.grandTotal,
+    }
+    const { error } = await supabase.from('reconciliations').update({
+      d140_summary: d140Summary,
+      d140_total_revenue: +guestMarginData.totalRevenue.toFixed(2),
+      d140_total_cost: +guestMarginData.totalCost.toFixed(2),
+      d140_total_margin: +guestMarginData.totalMargin.toFixed(2),
+      d140_margin_pct: +guestMarginData.avgMarginPct.toFixed(1),
+    }).eq('id', lastSavedRecId)
+    if (error) console.error('Failed to save D140 analysis:', error)
+    else setD140Saved(true)
+    setD140Saving(false)
+  }, [guestMarginData, lastSavedRecId, d140Report])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
@@ -1106,6 +1156,7 @@ export default function Reconciliation() {
       })),
     }).select('id').single()
     if (saveErr) console.error('Failed to save reconciliation:', saveErr)
+    if (savedRec) setLastSavedRecId(savedRec.id)
 
     if (savedRec && result.matchedOrderIds.length > 0) {
       const { error: stampErr } = await supabase.from('orders')
@@ -2713,6 +2764,17 @@ export default function Reconciliation() {
               )}
             </div>
             <div className="p-4 border-t border-gray-200 flex justify-end gap-2">
+              {d140Report && guestMarginData && lastSavedRecId && !d140Saved && (
+                <button onClick={handleSaveD140} disabled={d140Saving}
+                  className="px-4 py-2 text-sm font-medium text-white bg-navy rounded-lg hover:bg-navy-light disabled:opacity-50">
+                  {d140Saving ? 'Saving...' : 'Save D140 Analysis'}
+                </button>
+              )}
+              {d140Saved && (
+                <span className="px-4 py-2 text-sm font-medium text-green-700 bg-green-100 rounded-lg flex items-center gap-1">
+                  <CheckCircle className="w-4 h-4" /> Saved
+                </span>
+              )}
               <button onClick={() => setShowD140Prompt(false)}
                 className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
                 {d140Report ? 'Close' : 'Skip'}
