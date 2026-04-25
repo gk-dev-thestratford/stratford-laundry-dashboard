@@ -41,13 +41,15 @@ class SupabaseService {
     await _client!.from('order_status_log').upsert(log);
   }
 
-  /// Insert a status log — ignores duplicates (no UPDATE needed, avoids RLS issue).
+  /// Insert a status log — ignores duplicates, re-throws real errors.
   Future<void> insertStatusLog(Map<String, dynamic> log) async {
     if (!isInitialized) return;
     try {
       await _client!.from('order_status_log').insert(log);
-    } catch (_) {
-      // Ignore duplicate key errors — log was already synced
+    } on PostgrestException catch (e) {
+      if (e.code == '23505') return; // duplicate key = already synced, safe to ignore
+      debugPrint('[Supabase] insertStatusLog failed: ${e.message}');
+      rethrow;
     }
   }
 

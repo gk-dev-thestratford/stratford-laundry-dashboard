@@ -84,6 +84,14 @@ class SyncService {
     _pushPending();
   }
 
+  /// Push pending sync items and WAIT for completion.
+  /// Use this when downstream actions depend on sync being done (e.g. daily report).
+  Future<void> pushPendingAndWait() async {
+    if (ConnectivityService.instance.currentStatus != ConnectivityStatus.online) return;
+    if (!SupabaseService.instance.isInitialized) return;
+    await _pushPending();
+  }
+
   /// Force a full sync — pull reference data + push pending items.
   /// Can be called from UI (e.g. refresh button).
   Future<void> fullSync() async {
@@ -337,14 +345,18 @@ class SyncService {
           _failCounts[itemId] = count;
           debugPrint('[Push] FAILED $operation $tableName (attempt $count/$_maxRetries): $e');
 
-          // Give up after max retries OR on known permanent data errors
+          // Only abandon on known permanent data errors — NOT on transient failures
           final isDataError = e.toString().contains('22P02') || // invalid UUID
               e.toString().contains('23') || // integrity constraint
               e.toString().contains('42');   // syntax/schema error
-          if (isDataError || count >= _maxRetries) {
+          if (isDataError) {
             await DatabaseService.instance.markSynced(itemId);
             _failCounts.remove(itemId);
-            debugPrint('[Push] Abandoned after ${isDataError ? 'data error' : '$count failures'}');
+            debugPrint('[Push] Abandoned permanently: data error');
+          } else if (count >= _maxRetries) {
+            // Reset fail count but leave item in queue for next sync cycle
+            _failCounts.remove(itemId);
+            debugPrint('[Push] Skipping after $count failures — will retry next cycle');
           }
         }
       }

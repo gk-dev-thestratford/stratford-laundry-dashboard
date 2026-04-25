@@ -335,8 +335,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
           jsonEncode({'id': orderId, 'status': finalStatus}));
     }
 
-    // Push immediately — don't wait for the 30s timer
-    SyncService.instance.pushPendingNow();
+    // Push immediately and WAIT for sync to complete before sending report
+    await SyncService.instance.pushPendingAndWait();
 
     // Send the daily collection report email now (instead of scheduled 3pm cron)
     SupabaseService.instance.invokeDailyReport();
