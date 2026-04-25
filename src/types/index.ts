@@ -125,3 +125,24 @@ export interface BulkEdits {
   orders: Record<string, { docket_number?: string }>
   items: Record<string, { price_at_time?: number; order_id: string }>
 }
+
+export type AnnouncementSeverity = 'info' | 'warning' | 'critical'
+
+export interface Announcement {
+  id: string
+  title: string
+  body: string | null
+  starts_at: string  // ISO timestamp (UTC)
+  ends_at: string
+  severity: AnnouncementSeverity
+  is_active: boolean
+  created_by: string | null
+  created_at: string
+  updated_at: string
+}
+
+export const ANNOUNCEMENT_SEVERITY_LABELS: Record<AnnouncementSeverity, string> = {
+  info: 'Info',
+  warning: 'Warning',
+  critical: 'Critical',
+}
