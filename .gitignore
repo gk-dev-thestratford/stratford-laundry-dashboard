@@ -37,3 +37,6 @@ windows/
 
 # Supabase local
 supabase/
+
+# Claude Code agent worktrees (local only)
+.claude/worktrees/

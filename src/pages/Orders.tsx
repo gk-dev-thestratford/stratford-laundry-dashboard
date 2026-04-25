@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import { Plus, Download, Trash2, RefreshCw, Pencil, Save, X, Mail, CheckCircle } from 'lucide-react'
+import { supabase } from '../lib/supabase'
 import { useOrders } from '../hooks/useOrders'
 import Filters from '../components/Filters'
 import OrdersTable from '../components/OrdersTable'
@@ -121,41 +122,38 @@ export default function Orders() {
     return rows
   }
 
-  function handleSendEmail() {
+  async function handleSendEmail() {
     if (!emailTo.trim()) return
     const rows = getOutstandingEmailData()
     if (rows.length === 0) return
 
     setEmailSending(true)
 
-    const subject = `Outstanding Laundry Items — ${rows.reduce((s, r) => s + r.outstanding, 0)} item(s) requiring investigation`
-    const body = [
-      'Dear Team,',
-      '',
-      'Please find below a list of outstanding laundry items that require investigation:',
-      '',
-      ...rows.map(r =>
-        `• Docket: ${r.docket} | Dept: ${r.department} | Item: ${r.item} | Sent: ${r.sent} | Received: ${r.received} | Outstanding: ${r.outstanding}`
-      ),
-      '',
-      `Total outstanding items: ${rows.reduce((s, r) => s + r.outstanding, 0)}`,
-      `Across ${new Set(rows.map(r => r.docket)).size} order(s)`,
-      '',
-      'Please investigate and advise on the status of these items.',
-      '',
-      'Kind regards,',
-      'The Stratford Laundry Team',
-    ].join('\n')
+    try {
+      const { data, error } = await supabase.functions.invoke('email-outstanding', {
+        body: { to: emailTo.trim(), items: rows },
+      })
 
-    window.location.href = `mailto:${encodeURIComponent(emailTo)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
+      if (error || data?.error) {
+        const errMsg = error?.message || data?.error || 'Unknown error'
+        console.error('Email send failed:', errMsg)
+        alert(`Failed to send email: ${errMsg}`)
+        setEmailSending(false)
+        return
+      }
 
-    setEmailSending(false)
-    setEmailSent(true)
-    setTimeout(() => {
-      setShowEmailModal(false)
-      setEmailSent(false)
-      setEmailTo('')
-    }, 2000)
+      setEmailSending(false)
+      setEmailSent(true)
+      setTimeout(() => {
+        setShowEmailModal(false)
+        setEmailSent(false)
+        setEmailTo('')
+      }, 2000)
+    } catch (err) {
+      console.error('Email send error:', err)
+      alert('Failed to send email. Please try again.')
+      setEmailSending(false)
+    }
   }
 
   // ── Standard export (all filtered orders with item-level detail) ──
