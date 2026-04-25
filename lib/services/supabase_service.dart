@@ -108,6 +108,20 @@ class SupabaseService {
     return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders, can_reject_orders');
   }
 
+  // ── Announcements ──
+
+  /// Fetch all announcements (active + upcoming) so the tablet can pre-cache
+  /// upcoming ones and switch them on automatically when the start time hits.
+  Future<List<Map<String, dynamic>>> fetchAnnouncements() async {
+    if (!isInitialized) return [];
+    return await _client!
+        .from('announcements')
+        .select()
+        .eq('is_active', true)
+        .gte('ends_at', DateTime.now().subtract(const Duration(hours: 1)).toIso8601String())
+        .order('starts_at', ascending: true);
+  }
+
   // ── Edge Functions ──
 
   /// Invoke the daily-report Edge Function to send collection report emails

@@ -11,6 +11,7 @@ import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
+import '../../widgets/announcement_banner.dart';
 import '../../widgets/success_toast.dart';
 import '../../widgets/sync_indicator.dart';
 
@@ -749,6 +750,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                 ],
               ),
             ),
+          ),
+          // ── Active announcements (auto-hides when nothing scheduled) ──
+          const AnnouncementBanner(
+            padding: EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.md, AppSpacing.lg, 0),
           ),
           // ── Body content ──
           ..._buildBodyContent(isLandscape),

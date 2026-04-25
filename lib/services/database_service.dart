@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 import 'dart:convert';
 import '../models/department.dart';
 import '../models/catalogue_item.dart';
+import '../models/announcement.dart';
 
 class DatabaseService {
   static Database? _database;
@@ -22,7 +23,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 7,
+      version: 8,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -78,6 +79,21 @@ class DatabaseService {
       await db.execute('CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_order_status_log_order_id ON order_status_log(order_id)');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_order_status_log_created_at ON order_status_log(created_at)');
+    }
+    if (oldVersion < 8) {
+      // Scheduled message cards pushed from the dashboard
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS announcements (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          body TEXT,
+          starts_at TEXT NOT NULL,
+          ends_at TEXT NOT NULL,
+          severity TEXT NOT NULL DEFAULT 'info',
+          is_active INTEGER NOT NULL DEFAULT 1
+        )
+      ''');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_announcements_window ON announcements(starts_at, ends_at) WHERE is_active = 1');
     }
   }
 
@@ -205,6 +221,19 @@ class DatabaseService {
         value TEXT NOT NULL
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE announcements (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'info',
+        is_active INTEGER NOT NULL DEFAULT 1
+      )
+    ''');
+    await db.execute('CREATE INDEX idx_announcements_window ON announcements(starts_at, ends_at) WHERE is_active = 1');
 
     // Indexes for the queries that are run on every dashboard load
     await db.execute('CREATE INDEX idx_orders_status_created_at ON orders(status, created_at)');
@@ -913,6 +942,45 @@ class DatabaseService {
   }
 
   /// Remove sync queue entries that have already been synced and are older than [days] days.
+  // ── Announcements ──
+
+  /// Returns all locally-cached announcements that are visible at [now] —
+  /// i.e. is_active AND now is in [starts_at, ends_at).
+  Future<List<Announcement>> getActiveAnnouncements({DateTime? now}) async {
+    final t = now ?? DateTime.now();
+    final db = await database;
+    final iso = t.toIso8601String();
+    final rows = await db.query(
+      'announcements',
+      where: 'is_active = 1 AND starts_at <= ? AND ends_at > ?',
+      whereArgs: [iso, iso],
+      orderBy: "case severity when 'critical' then 0 when 'warning' then 1 else 2 end, starts_at desc",
+    );
+    return rows.map((r) => Announcement.fromMap(r)).toList();
+  }
+
+  /// Replace local announcements with the remote set (full pull).
+  Future<int> syncAnnouncements(List<Map<String, dynamic>> remote) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('announcements');
+      final batch = txn.batch();
+      for (final row in remote) {
+        batch.insert('announcements', {
+          'id': row['id'],
+          'title': row['title'] ?? '',
+          'body': row['body'],
+          'starts_at': row['starts_at'],
+          'ends_at': row['ends_at'],
+          'severity': row['severity'] ?? 'info',
+          'is_active': (row['is_active'] == true) ? 1 : 0,
+        });
+      }
+      await batch.commit(noResult: true);
+    });
+    return remote.length;
+  }
+
   // ── App Metadata (key/value bookkeeping) ──
 
   /// Read a metadata value. Returns null if the key doesn't exist.

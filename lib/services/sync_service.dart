@@ -246,6 +246,17 @@ class SyncService {
       debugPrint('[Sync] Failed to sync admin users: $e');
     }
 
+    try {
+      final remoteAnnouncements = await SupabaseService.instance.fetchAnnouncements();
+      debugPrint('[Sync] Pulled ${remoteAnnouncements.length} announcements');
+      // Always sync — including the empty case — so locally-cached but
+      // remotely-deleted announcements get cleared.
+      await DatabaseService.instance.syncAnnouncements(remoteAnnouncements);
+      didSync = true;
+    } catch (e) {
+      debugPrint('[Sync] Failed to sync announcements: $e');
+    }
+
     // Pull orders (with nested order_items). Incremental by default — only
     // download orders modified since the last successful pull. Once per day
     // we do a FULL pull and orphan-cleanup so orders deleted on the web get

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/screen_scaffold.dart';
+import '../../widgets/announcement_banner.dart';
 import '../../providers/order_provider.dart';
 
 class OrderTypeScreen extends ConsumerWidget {
@@ -21,22 +22,36 @@ class OrderTypeScreen extends ConsumerWidget {
     return ScreenScaffold(
       title: 'New Laundry Order',
       subtitle: 'Step 1 of 4 — Select Order Type',
-      child: Center(
-        child: SingleChildScrollView(
-          padding: EdgeInsets.symmetric(
-            horizontal: isLandscape ? AppSpacing.xxl : AppSpacing.lg,
-            vertical: AppSpacing.lg,
+      child: Column(
+        children: [
+          AnnouncementBanner(
+            padding: EdgeInsets.fromLTRB(
+              isLandscape ? AppSpacing.xxl : AppSpacing.lg,
+              AppSpacing.md,
+              isLandscape ? AppSpacing.xxl : AppSpacing.lg,
+              0,
+            ),
           ),
-          child: isLandscape
-              ? Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: _buildCards(context, ref, isLandscape),
-                )
-              : Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: _buildCards(context, ref, isLandscape),
+          Expanded(
+            child: Center(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.symmetric(
+                  horizontal: isLandscape ? AppSpacing.xxl : AppSpacing.lg,
+                  vertical: AppSpacing.lg,
                 ),
-        ),
+                child: isLandscape
+                    ? Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: _buildCards(context, ref, isLandscape),
+                      )
+                    : Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: _buildCards(context, ref, isLandscape),
+                      ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
