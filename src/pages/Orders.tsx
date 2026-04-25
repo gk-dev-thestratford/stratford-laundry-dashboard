@@ -1,4 +1,5 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Plus, Download, Trash2, RefreshCw, Pencil, Save, X, Mail, CheckCircle } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useOrders } from '../hooks/useOrders'
@@ -6,6 +7,8 @@ import Filters from '../components/Filters'
 import OrdersTable from '../components/OrdersTable'
 import OrderDetail from '../components/OrderDetail'
 import CreateOrderModal from '../components/CreateOrderModal'
+import { showStatusToast } from '../components/StatusToast'
+import { logActivity, useSessionActivity } from '../hooks/useSessionActivity'
 import type { Order, OrderStatus, BulkEdits } from '../types'
 import { ORDER_STATUS_LABELS, ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -27,6 +30,34 @@ export default function Orders() {
   const [detailOrder, setDetailOrder] = useState<Order | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [bulkStatus, setBulkStatus] = useState<OrderStatus | ''>('')
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Deep-link: when navigated from the Activity panel (?open=<id>), open that order's detail.
+  useEffect(() => {
+    const openId = searchParams.get('open')
+    if (!openId) return
+    const found = orders.find((o) => o.id === openId)
+    if (found) {
+      setDetailOrder(found)
+      // Clear param so re-renders don't keep re-triggering
+      setSearchParams({}, { replace: true })
+      return
+    }
+    // Order not in current filter results — fetch it directly
+    let cancelled = false
+    ;(async () => {
+      const { data } = await supabase
+        .from('orders')
+        .select('*, department:departments(*), order_items(*), status_log:order_status_log(*)')
+        .eq('id', openId)
+        .single()
+      if (!cancelled && data) {
+        setDetailOrder(data as Order)
+        setSearchParams({}, { replace: true })
+      }
+    })()
+    return () => { cancelled = true }
+  }, [searchParams, orders, setSearchParams])
 
   // Bulk edit state
   const [bulkEdit, setBulkEdit] = useState(false)
@@ -41,6 +72,10 @@ export default function Orders() {
   const [emailTo, setEmailTo] = useState('')
   const [emailSending, setEmailSending] = useState(false)
   const [emailSent, setEmailSent] = useState(false)
+
+  // Post-bulk nudge: ask if they want to send the daily report
+  const [nudge, setNudge] = useState<null | { count: number; status: OrderStatus }>(null)
+  const { reportSentToday } = useSessionActivity()
 
   const editCount = Object.keys(bulkEdits.orders).length + Object.keys(bulkEdits.items).length
 
@@ -89,15 +124,54 @@ export default function Orders() {
   async function handleBulkStatus() {
     if (!bulkStatus || selectedIds.size === 0) return
     if (!window.confirm(`Update ${selectedIds.size} order(s) to "${ORDER_STATUS_LABELS[bulkStatus]}"?`)) return
-    setBulkProgress({ done: 0, total: selectedIds.size })
+    const targetIds = Array.from(selectedIds)
+    const targetStatus = bulkStatus
+    setBulkProgress({ done: 0, total: targetIds.length })
     await bulkUpdateStatus(
-      Array.from(selectedIds),
-      bulkStatus,
+      targetIds,
+      targetStatus,
       (done, total) => setBulkProgress({ done, total }),
     )
     setBulkProgress(null)
     setSelectedIds(new Set())
     setBulkStatus('')
+
+    // Activity log + summary toast
+    if (targetIds.length === 1) {
+      const o = orders.find((x) => x.id === targetIds[0])
+      logActivity({
+        type: 'status_change',
+        status: targetStatus,
+        orderId: targetIds[0],
+        docketNumber: o?.docket_number,
+      })
+      showStatusToast({
+        status: targetStatus,
+        docketNumber: o?.docket_number,
+      })
+    } else {
+      logActivity({
+        type: 'bulk_status_change',
+        status: targetStatus,
+        bulkOrderIds: targetIds,
+        bulkCount: targetIds.length,
+      })
+      showStatusToast({
+        status: targetStatus,
+        customLabel: `${targetIds.length} orders → ${ORDER_STATUS_LABELS[targetStatus]}`,
+      })
+    }
+
+    // Nudge: if 3+ orders just changed to a daily-report-relevant status and
+    // no report has been sent today, ask if they want to send it now.
+    const reportRelevant: OrderStatus[] = ['collected', 'received']
+    if (
+      targetIds.length >= 3 &&
+      reportRelevant.includes(targetStatus) &&
+      !reportSentToday
+    ) {
+      setNudge({ count: targetIds.length, status: targetStatus })
+    }
   }
 
   // ── Email outstanding items ──
@@ -382,9 +456,20 @@ export default function Orders() {
           order={detailOrder}
           departments={departments}
           onClose={() => setDetailOrder(null)}
-          onStatusChange={(id, status, reason) => {
-            updateOrderStatus(id, status, reason)
+          onStatusChange={async (id, status, reason) => {
+            const docket = detailOrder?.docket_number
+            await updateOrderStatus(id, status, reason)
             setDetailOrder(null)
+            logActivity({
+              type: 'status_change',
+              status,
+              orderId: id,
+              docketNumber: docket,
+            })
+            showStatusToast({
+              status,
+              docketNumber: docket,
+            })
           }}
           onSave={updateOrder}
           onSaveItem={updateOrderItem}
@@ -398,6 +483,39 @@ export default function Orders() {
           onClose={() => setShowCreate(false)}
           onCreated={fetchOrders}
         />
+      )}
+
+      {/* Post-bulk daily-report nudge */}
+      {nudge && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-[55] p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="px-6 py-5">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                {nudge.count} orders marked {ORDER_STATUS_LABELS[nudge.status]}
+              </h3>
+              <p className="text-sm text-gray-600 dark:text-gray-300 mt-2">
+                Want to send the daily report now? You can also do it later from the Activity panel on the right.
+              </p>
+            </div>
+            <div className="px-6 py-3 bg-gray-50 dark:bg-gray-700/30 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setNudge(null)}
+                className="px-4 py-2 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg"
+              >
+                Later
+              </button>
+              <button
+                onClick={() => {
+                  setNudge(null)
+                  window.dispatchEvent(new CustomEvent('open-daily-report'))
+                }}
+                className="px-5 py-2 text-sm font-medium text-white bg-navy hover:bg-navy-light rounded-lg"
+              >
+                Send Now
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Email Outstanding modal */}

@@ -9,6 +9,7 @@ import Catalogue from './pages/Catalogue'
 import Reconciliation from './pages/Reconciliation'
 import ReconciliationHistory from './pages/ReconciliationHistory'
 import LinenPool from './pages/LinenPool'
+import StatusToast from './components/StatusToast'
 
 export default function App() {
   const { user, dashboardUser, loading, signIn, signOut } = useAuth()
@@ -39,6 +40,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
+      <StatusToast />
     </HashRouter>
   )
 }

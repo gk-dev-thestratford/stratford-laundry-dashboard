@@ -82,12 +82,16 @@ export interface DashboardUser {
   is_active: boolean
 }
 
+// NOTE: key order matters — drives the visual order of status filter dropdowns,
+// the bulk-status dropdown, and the Activity panel category groups. Ordered to
+// match daily procedure: In Processing comes before Approved because staff
+// handle in-processing items (mark Received) before approved items (mark Collected).
 export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   submitted: 'Submitted',
-  approved: 'Approved',
+  in_processing: 'In Processing',
   rejected: 'Rejected',
   collected: 'Collected',
-  in_processing: 'In Processing',
+  approved: 'Approved',
   received: 'Received',
   completed: 'Returned',
   picked_up: 'Picked Up',
@@ -95,10 +99,10 @@ export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
 
 export const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
   submitted: 'bg-blue-100 text-blue-800',
-  approved: 'bg-green-100 text-green-800',
+  in_processing: 'bg-orange-100 text-orange-800',
   rejected: 'bg-red-100 text-red-800',
   collected: 'bg-yellow-100 text-yellow-800',
-  in_processing: 'bg-orange-100 text-orange-800',
+  approved: 'bg-green-100 text-green-800',
   received: 'bg-purple-100 text-purple-800',
   completed: 'bg-teal-100 text-teal-800',
   picked_up: 'bg-gray-100 text-gray-800',

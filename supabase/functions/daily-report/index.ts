@@ -1,6 +1,12 @@
 // Supabase Edge Function: Combined daily laundry report
 // Sends ONE email with: Outstanding Items, Collected, Received, Napkin Returns
-// Scheduled to run once per day at 2pm UK time via pg_cron.
+//
+// Two modes:
+//  1. Cron / no body  — fetches today's data from the DB and emails it.
+//  2. Manual / POST with JSON body — uses the provided payload as-is so the email
+//     matches exactly what the dashboard previewed. Body shape:
+//       { collectedOrders, receivedOrders, napkinReturns,
+//         recipients?: string[], senderName?: string }
 //
 // Deploy: supabase functions deploy daily-report
 
@@ -42,7 +48,7 @@ async function sendEmail(to: string, subject: string, html: string): Promise<{ o
   return { ok: true };
 }
 
-// ── UK-timezone-aware midnight ISO string ──
+// ── UK-timezone-aware midnight as a UTC ISO string (BST/GMT correct) ──
 function getUKMidnightISO(): string {
   const now = new Date();
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -54,7 +60,20 @@ function getUKMidnightISO(): string {
   const y = parts.find((p) => p.type === "year")!.value;
   const m = parts.find((p) => p.type === "month")!.value;
   const d = parts.find((p) => p.type === "day")!.value;
-  return `${y}-${m}-${d}T00:00:00.000Z`;
+
+  // Candidate: that calendar date at UTC midnight. During BST this is 01:00 UK,
+  // not 00:00 UK. Read what UK calls that instant — its hour reveals the offset.
+  const candidate = new Date(`${y}-${m}-${d}T00:00:00Z`);
+  const ukHourAtCandidate = parseInt(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/London",
+      hour: "numeric",
+      hour12: false,
+    }).format(candidate),
+    10,
+  );
+  // UK midnight in UTC = candidate − offset hours.
+  return new Date(candidate.getTime() - ukHourAtCandidate * 3_600_000).toISOString();
 }
 
 // ── Fetch orders that moved into a status TODAY (UK time) ──
@@ -355,15 +374,41 @@ function buildDailyReport(
   `;
 }
 
-serve(async (_req: Request) => {
+interface ManualPayload {
+  collectedOrders?: any[];
+  receivedOrders?: any[];
+  napkinReturns?: any[];
+  recipients?: string[];
+  senderName?: string;
+}
+
+async function readPayload(req: Request): Promise<ManualPayload | null> {
+  if (req.method !== "POST") return null;
   try {
-    // Fetch all data for the report
-    const collectedOrders = await fetchTodaysOrders("collected");
-    const receivedOrders = await fetchTodaysOrders("received");
-    const napkinReturns = await fetchTodaysNapkinReturns();
+    const ct = req.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) return null;
+    const body = await req.json();
+    if (body && typeof body === "object") return body as ManualPayload;
+  } catch {
+    // ignore — fall through to cron mode
+  }
+  return null;
+}
+
+serve(async (req: Request) => {
+  try {
+    const payload = await readPayload(req);
+
+    // Mode selection: payload data wins; otherwise fetch today's from DB.
+    const collectedOrders = payload?.collectedOrders ?? await fetchTodaysOrders("collected");
+    const receivedOrders = payload?.receivedOrders ?? await fetchTodaysOrders("received");
+    const napkinReturns = payload?.napkinReturns ?? await fetchTodaysNapkinReturns();
     const outstandingItems = extractOutstandingItems(receivedOrders);
 
-    // Build single combined report
+    const recipients = (payload?.recipients && payload.recipients.length > 0)
+      ? payload.recipients
+      : REPORT_EMAILS;
+
     const reportHtml = buildDailyReport(collectedOrders, receivedOrders, outstandingItems, napkinReturns);
 
     const today = new Date().toLocaleDateString("en-GB", { timeZone: "Europe/London" });
@@ -373,15 +418,20 @@ serve(async (_req: Request) => {
     if (outstandingItems.length > 0) parts.push(`${outstandingItems.reduce((s, i) => s + i.outstanding, 0)} outstanding`);
     if (napkinReturns.length > 0) parts.push(`${napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0)} napkins`);
 
-    const subject = `Daily Laundry Report — ${today}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+    const senderTag = payload?.senderName ? ` — sent by ${payload.senderName}` : "";
+    const subject = `Daily Laundry Report — ${today}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}${senderTag}`;
 
-    const emailsSent: string[] = [];
-    for (const email of REPORT_EMAILS) {
+    const emailsSent: { to: string; ok: boolean; error?: string }[] = [];
+    for (const email of recipients) {
       const result = await sendEmail(email, subject, reportHtml);
-      emailsSent.push(`${email}:${result.ok ? "sent" : "failed"}`);
+      emailsSent.push({ to: email, ok: result.ok, error: result.error });
     }
 
-    return new Response(JSON.stringify({ success: true, emails: emailsSent }), { status: 200 });
+    const allOk = emailsSent.every((r) => r.ok);
+    return new Response(
+      JSON.stringify({ success: allOk, emails: emailsSent, mode: payload ? "manual" : "cron" }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
   } catch (err) {
     console.error("Daily report error:", err);
     return new Response(JSON.stringify({ error: String(err) }), { status: 500 });

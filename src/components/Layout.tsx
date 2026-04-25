@@ -2,6 +2,8 @@ import { NavLink, Outlet } from 'react-router-dom'
 import { Hotel, ClipboardList, BarChart3, Users, Package, FileCheck, Clock, LogOut, Menu, X, Sun, Moon, UtensilsCrossed } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import type { DashboardUser } from '../types'
+import ActivityPanel from './ActivityPanel'
+import DailyReportModal from './DailyReportModal'
 
 interface LayoutProps {
   user: DashboardUser | null
@@ -44,6 +46,15 @@ function useDarkMode() {
 export default function Layout({ user, onSignOut }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [dark, toggleDark] = useDarkMode()
+  const [reportModalOpen, setReportModalOpen] = useState(false)
+
+  // Listen for "open-daily-report" events dispatched from anywhere (e.g. the
+  // post-bulk nudge in Orders.tsx) so the modal opens consistently.
+  useEffect(() => {
+    const handler = () => setReportModalOpen(true)
+    window.addEventListener('open-daily-report', handler)
+    return () => window.removeEventListener('open-daily-report', handler)
+  }, [])
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex">
@@ -135,6 +146,9 @@ export default function Layout({ user, onSignOut }: LayoutProps) {
           <Outlet />
         </main>
       </div>
+
+      <ActivityPanel enabled={!!user} onSendReport={() => setReportModalOpen(true)} />
+      {reportModalOpen && <DailyReportModal onClose={() => setReportModalOpen(false)} />}
     </div>
   )
 }
