@@ -67,15 +67,20 @@ void main() async {
   await SupabaseService.instance.initialize();
   debugPrint('[Init] Supabase initialized: ${SupabaseService.instance.isInitialized}');
 
-  // Pull fresh reference data from Supabase before UI loads
-  // No connectivity gate — just try it. 5s timeout so it doesn't block forever.
+  // Kick off reference-data pull, but DO NOT block the UI on it. The login
+  // screen reads admins from local SQLite which works offline, and the
+  // background sync service will refresh the rest. Previously this awaited
+  // a 5s startup sync, then SyncService.initialize() kicked off another
+  // full sync — both of which competed with the login query for the
+  // SQLite write-lock and made first-load feel like 15-20s.
   if (SupabaseService.instance.isInitialized) {
-    try {
-      final result = await initialSync().timeout(const Duration(seconds: 5));
-      debugPrint('[Init] Startup sync completed: $result');
-    } catch (e) {
-      debugPrint('[Init] Startup sync failed/timed out: $e');
-    }
+    unawaited(
+      initialSync().timeout(const Duration(seconds: 8)).then(
+        (result) => debugPrint('[Init] Startup sync completed: $result'),
+        onError: (Object e) =>
+            debugPrint('[Init] Startup sync failed/timed out: $e'),
+      ),
+    );
   }
 
   // Start sync service — keeps data fresh in background, pushes pending changes

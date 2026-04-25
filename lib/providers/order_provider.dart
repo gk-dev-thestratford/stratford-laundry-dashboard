@@ -78,15 +78,33 @@ class OrderNotifier extends StateNotifier<OrderDraft> {
     );
   }
 
-  /// Submit order to local database (and queue for sync)
+  /// Submit order to local database (and queue for sync).
+  ///
+  /// Includes a recency guard: if a non-rejected order with the same docket
+  /// number was created locally in the last 60 seconds, return that existing
+  /// order's ID instead of creating a duplicate. This is a safety net for the
+  /// rare case where the UI submit-guard is bypassed (e.g. by hitting Submit
+  /// across two screens, or by a sync-queue retry that races a fresh submit).
   Future<String> submitOrder() async {
     final db = DatabaseService.instance;
+    final docket = state.docketNumber ?? '';
+    if (docket.isNotEmpty) {
+      final existing = await db.findRecentOrderByDocket(
+        docket,
+        within: const Duration(seconds: 60),
+      );
+      if (existing != null) {
+        reset();
+        return existing;
+      }
+    }
+
     final orderId = _uuid.v4();
     final now = DateTime.now().toIso8601String();
 
     final orderMap = {
       'id': orderId,
-      'docket_number': state.docketNumber ?? '',
+      'docket_number': docket,
       'order_type': state.orderType ?? '',
       'department_id': state.departmentId,
       'staff_name': state.isGuestOrder ? state.guestName : state.staffName,

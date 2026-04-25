@@ -22,7 +22,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 6,
+      version: 7,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -61,6 +61,23 @@ class DatabaseService {
           PRIMARY KEY (item_id, department_id)
         )
       ''');
+    }
+    if (oldVersion < 7) {
+      // Key-value table for sync bookkeeping (last-pull timestamps, etc.)
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS app_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
+      // Speeds up dashboard tab queries (filter by status, sort by created_at),
+      // search-by-docket, and the per-order item/log fetches.
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_orders_status_created_at ON orders(status, created_at)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_orders_docket_number ON orders(docket_number)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_orders_updated_at ON orders(updated_at)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_order_status_log_order_id ON order_status_log(order_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_order_status_log_created_at ON order_status_log(created_at)');
     }
   }
 
@@ -182,6 +199,21 @@ class DatabaseService {
       )
     ''');
 
+    await db.execute('''
+      CREATE TABLE app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
+
+    // Indexes for the queries that are run on every dashboard load
+    await db.execute('CREATE INDEX idx_orders_status_created_at ON orders(status, created_at)');
+    await db.execute('CREATE INDEX idx_orders_docket_number ON orders(docket_number)');
+    await db.execute('CREATE INDEX idx_orders_updated_at ON orders(updated_at)');
+    await db.execute('CREATE INDEX idx_order_items_order_id ON order_items(order_id)');
+    await db.execute('CREATE INDEX idx_order_status_log_order_id ON order_status_log(order_id)');
+    await db.execute('CREATE INDEX idx_order_status_log_created_at ON order_status_log(created_at)');
+
     // Seed data
     await _seedDepartments(db);
     await _seedCatalogueItems(db);
@@ -244,6 +276,28 @@ class DatabaseService {
     final db = await database;
     await db.insert('orders', order);
     return order['id'] as String;
+  }
+
+  /// Returns the ID of a non-rejected order with the same docket number
+  /// created locally within [within], or null if none exists. Used as a
+  /// duplicate-submit safety net at order submission time.
+  Future<String?> findRecentOrderByDocket(
+    String docketNumber, {
+    Duration within = const Duration(seconds: 60),
+  }) async {
+    if (docketNumber.isEmpty) return null;
+    final db = await database;
+    final cutoff = DateTime.now().subtract(within).toIso8601String();
+    final rows = await db.query(
+      'orders',
+      columns: ['id'],
+      where: "docket_number = ? AND created_at >= ? AND status <> 'rejected'",
+      whereArgs: [docketNumber, cutoff],
+      orderBy: 'created_at DESC',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['id'] as String;
   }
 
   Future<void> insertOrderItems(List<Map<String, dynamic>> items) async {
@@ -582,12 +636,27 @@ class DatabaseService {
 
   /// Merge remote orders + their items into local SQLite.
   /// Skips orders that have pending (unsynced) changes in the sync queue.
-  Future<int> syncOrders(List<Map<String, dynamic>> remoteOrders) async {
-    if (remoteOrders.isEmpty) return 0;
+  /// Merge remote orders + their items into local SQLite in a single
+  /// transaction. The previous implementation opened one transaction per
+  /// order, which on a 1,100-row pull held the SQLite lock for many seconds
+  /// and made foreground reads (e.g. dashboard tab loads) wait. One
+  /// transaction with a batch insert is ~50× faster and releases the lock
+  /// in a fraction of the time.
+  ///
+  /// Set [deleteOrphans] to true only when [remoteOrders] represents the
+  /// FULL set of orders on the server (not an incremental `since` slice) —
+  /// otherwise we'd wrongly delete local rows that just weren't in the
+  /// recent batch.
+  Future<int> syncOrders(
+    List<Map<String, dynamic>> remoteOrders, {
+    bool deleteOrphans = false,
+  }) async {
+    if (remoteOrders.isEmpty && !deleteOrphans) return 0;
 
     final db = await database;
 
-    // Get IDs of orders with pending local changes
+    // Get IDs of orders with pending local changes — those are skipped to
+    // avoid clobbering local edits the user made while offline.
     final pendingItems = await getPendingSyncItems();
     final pendingOrderIds = <String>{};
     for (final item in pendingItems) {
@@ -597,18 +666,19 @@ class DatabaseService {
       }
     }
 
+    final nowIso = DateTime.now().toIso8601String();
+    final remoteIds = <String>{};
     int synced = 0;
 
-    for (final remote in remoteOrders) {
-      final orderId = remote['id'] as String;
+    await db.transaction((txn) async {
+      final batch = txn.batch();
 
-      // Skip orders with pending local changes
-      if (pendingOrderIds.contains(orderId)) continue;
+      for (final remote in remoteOrders) {
+        final orderId = remote['id'] as String;
+        remoteIds.add(orderId);
+        if (pendingOrderIds.contains(orderId)) continue;
 
-      final remoteItems = (remote['order_items'] as List<dynamic>?) ?? [];
-
-      await db.transaction((txn) async {
-        await txn.insert('orders', {
+        batch.insert('orders', {
           'id': orderId,
           'docket_number': remote['docket_number'] ?? '',
           'order_type': remote['order_type'] ?? 'uniform',
@@ -624,14 +694,15 @@ class DatabaseService {
               ? (remote['total_price'] as num).toDouble()
               : null,
           'parent_order_id': remote['parent_order_id'],
-          'created_at': remote['created_at'] ?? DateTime.now().toIso8601String(),
-          'updated_at': remote['updated_at'] ?? DateTime.now().toIso8601String(),
-          'synced_at': DateTime.now().toIso8601String(),
+          'created_at': remote['created_at'] ?? nowIso,
+          'updated_at': remote['updated_at'] ?? nowIso,
+          'synced_at': nowIso,
         }, conflictAlgorithm: ConflictAlgorithm.replace);
 
+        final remoteItems = (remote['order_items'] as List<dynamic>?) ?? [];
         for (final item in remoteItems) {
           if (item is! Map<String, dynamic>) continue;
-          await txn.insert('order_items', {
+          batch.insert('order_items', {
             'id': item['id'],
             'order_id': orderId,
             'item_id': item['item_id'] ?? '',
@@ -643,44 +714,54 @@ class DatabaseService {
                 : null,
           }, conflictAlgorithm: ConflictAlgorithm.replace);
         }
-      });
-      synced++;
-    }
 
-    // Remove local orders that no longer exist in Supabase (deleted on web)
-    final remoteIds = remoteOrders.map((o) => o['id'] as String).toSet();
-    final localOrders = await db.query('orders', columns: ['id']);
-    for (final local in localOrders) {
-      final localId = local['id'] as String;
-      if (!remoteIds.contains(localId) && !pendingOrderIds.contains(localId)) {
-        await db.delete('order_items', where: 'order_id = ?', whereArgs: [localId]);
-        await db.delete('order_status_log', where: 'order_id = ?', whereArgs: [localId]);
-        await db.delete('orders', where: 'id = ?', whereArgs: [localId]);
-        debugPrint('[Sync] Removed local order $localId (deleted remotely)');
+        synced++;
       }
-    }
+
+      if (deleteOrphans) {
+        // Remove local orders that no longer exist in Supabase (deleted on web).
+        // Only safe when the caller is certain remoteIds is the FULL server set.
+        final localOrders = await txn.query('orders', columns: ['id']);
+        for (final local in localOrders) {
+          final localId = local['id'] as String;
+          if (!remoteIds.contains(localId) && !pendingOrderIds.contains(localId)) {
+            batch.delete('order_items', where: 'order_id = ?', whereArgs: [localId]);
+            batch.delete('order_status_log', where: 'order_id = ?', whereArgs: [localId]);
+            batch.delete('orders', where: 'id = ?', whereArgs: [localId]);
+          }
+        }
+      }
+
+      await batch.commit(noResult: true);
+    });
 
     return synced;
   }
 
-  /// Merge remote status logs into local SQLite.
+  /// Merge remote status logs into local SQLite. Single transaction +
+  /// batch insert — same rationale as [syncOrders].
   Future<int> syncStatusLogs(List<Map<String, dynamic>> remoteLogs) async {
     if (remoteLogs.isEmpty) return 0;
     final db = await database;
-    int synced = 0;
-    for (final log in remoteLogs) {
-      await db.insert('order_status_log', {
-        'id': log['id'],
-        'order_id': log['order_id'],
-        'status': log['status'] ?? '',
-        'changed_by': log['changed_by'],
-        'changed_by_name': log['changed_by_name'],
-        'reason': log['reason'],
-        'created_at': log['created_at'] ?? DateTime.now().toIso8601String(),
-      }, conflictAlgorithm: ConflictAlgorithm.replace);
-      synced++;
-    }
-    return synced;
+    final nowIso = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final log in remoteLogs) {
+        batch.insert('order_status_log', {
+          'id': log['id'],
+          'order_id': log['order_id'],
+          'status': log['status'] ?? '',
+          'changed_by': log['changed_by'],
+          'changed_by_name': log['changed_by_name'],
+          'reason': log['reason'],
+          'created_at': log['created_at'] ?? nowIso,
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      await batch.commit(noResult: true);
+    });
+
+    return remoteLogs.length;
   }
 
   // ── Dashboard Stats ──
@@ -832,6 +913,26 @@ class DatabaseService {
   }
 
   /// Remove sync queue entries that have already been synced and are older than [days] days.
+  // ── App Metadata (key/value bookkeeping) ──
+
+  /// Read a metadata value. Returns null if the key doesn't exist.
+  Future<String?> getMeta(String key) async {
+    final db = await database;
+    final rows = await db.query('app_meta', where: 'key = ?', whereArgs: [key], limit: 1);
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  /// Write a metadata value (upsert by key).
+  Future<void> setMeta(String key, String value) async {
+    final db = await database;
+    await db.insert(
+      'app_meta',
+      {'key': key, 'value': value},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
   Future<int> cleanSyncQueue({int days = 7}) async {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();

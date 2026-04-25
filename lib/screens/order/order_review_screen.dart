@@ -8,17 +8,39 @@ import '../../widgets/screen_scaffold.dart';
 import '../../providers/order_provider.dart';
 import '../../models/order.dart';
 
-class OrderReviewScreen extends ConsumerWidget {
+class OrderReviewScreen extends ConsumerStatefulWidget {
   const OrderReviewScreen({super.key});
 
-  Future<void> _submit(BuildContext context, WidgetRef ref) async {
+  @override
+  ConsumerState<OrderReviewScreen> createState() => _OrderReviewScreenState();
+}
+
+class _OrderReviewScreenState extends ConsumerState<OrderReviewScreen> {
+  bool _isSubmitting = false;
+
+  Future<void> _submit() async {
+    // Guard: ignore re-taps while a submit is in flight. Without this, a
+    // frustrated user tapping the button repeatedly during a slow sync
+    // creates duplicate orders with the same docket number.
+    if (_isSubmitting) return;
+    setState(() => _isSubmitting = true);
+
     final docket = ref.read(orderProvider).docketNumber;
-    await ref.read(orderProvider.notifier).submitOrder();
-    if (context.mounted) context.go('/order/success', extra: docket);
+    try {
+      await ref.read(orderProvider.notifier).submitOrder();
+      if (mounted) context.go('/order/success', extra: docket);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not submit order: $e')),
+        );
+      }
+    }
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final order = ref.watch(orderProvider);
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
     final isGuest = order.isGuestOrder;
@@ -60,7 +82,7 @@ class OrderReviewScreen extends ConsumerWidget {
             ),
           ),
           // Submit bar
-          _buildSubmitBar(context, ref, order),
+          _buildSubmitBar(order),
         ],
       ),
     );
@@ -297,7 +319,7 @@ class OrderReviewScreen extends ConsumerWidget {
     );
   }
 
-  Widget _buildSubmitBar(BuildContext context, WidgetRef ref, OrderDraft order) {
+  Widget _buildSubmitBar(OrderDraft order) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl, vertical: AppSpacing.base),
       decoration: BoxDecoration(
@@ -315,7 +337,7 @@ class OrderReviewScreen extends ConsumerWidget {
         child: Row(
           children: [
             OutlinedButton.icon(
-              onPressed: () => context.pop(),
+              onPressed: _isSubmitting ? null : () => context.pop(),
               icon: const Icon(Icons.arrow_back_rounded, size: AppSizes.iconSizeMd),
               label: const Text('Go Back'),
               style: OutlinedButton.styleFrom(
@@ -327,9 +349,18 @@ class OrderReviewScreen extends ConsumerWidget {
             SizedBox(
               height: AppSizes.buttonHeightLg,
               child: ElevatedButton.icon(
-                onPressed: () => _submit(context, ref),
-                icon: const Icon(Icons.check_circle_outline, size: AppSizes.iconSizeLg),
-                label: const Text('Submit Order'),
+                onPressed: _isSubmitting ? null : _submit,
+                icon: _isSubmitting
+                    ? const SizedBox(
+                        width: AppSizes.iconSizeLg,
+                        height: AppSizes.iconSizeLg,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          valueColor: AlwaysStoppedAnimation<Color>(AppColors.navy),
+                        ),
+                      )
+                    : const Icon(Icons.check_circle_outline, size: AppSizes.iconSizeLg),
+                label: Text(_isSubmitting ? 'Submitting…' : 'Submit Order'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: AppColors.gold,
                   foregroundColor: AppColors.navy,
@@ -338,6 +369,8 @@ class OrderReviewScreen extends ConsumerWidget {
                   elevation: 3,
                   shadowColor: AppColors.gold.withValues(alpha: 0.3),
                   shape: RoundedRectangleBorder(borderRadius: AppRadius.mediumBR),
+                  disabledBackgroundColor: AppColors.gold.withValues(alpha: 0.6),
+                  disabledForegroundColor: AppColors.navy.withValues(alpha: 0.7),
                 ),
               ),
             ),

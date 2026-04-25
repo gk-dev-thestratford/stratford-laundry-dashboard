@@ -33,6 +33,8 @@ class SyncService {
   Timer? _syncTimer;
   DateTime? _lastRefPull;
   DateTime? _lastCleanup;
+  DateTime? _lastFullPull; // last time we did a full (no-`since`) order pull
+  DateTime? _lastFullSyncStart; // throttle for fullSync()
   bool _isPushing = false;
 
   /// Track consecutive failures per sync-queue item ID.
@@ -45,6 +47,18 @@ class SyncService {
 
   /// How often the periodic timer ticks (checks if work is needed)
   static const _timerInterval = Duration(seconds: 30);
+
+  /// app_meta keys for incremental-pull bookkeeping
+  static const _kLastOrdersPullAt = 'last_orders_pull_at';
+  static const _kLastStatusLogsPullAt = 'last_status_logs_pull_at';
+
+  /// How long incremental pulls are valid before forcing a full pull again.
+  /// On a full pull we also run orphan-deletion to catch orders deleted remotely.
+  static const _fullPullInterval = Duration(hours: 24);
+
+  /// Minimum gap between fullSync() calls — prevents thrash if multiple
+  /// triggers fire (e.g. login + connectivity restore + screen navigation).
+  static const _fullSyncMinGap = Duration(seconds: 30);
 
   void initialize() {
     _debugInfo = 'init: supa=${SupabaseService.instance.isInitialized}, conn=${ConnectivityService.instance.currentStatus}';
@@ -93,8 +107,16 @@ class SyncService {
   }
 
   /// Force a full sync — pull reference data + push pending items.
-  /// Can be called from UI (e.g. refresh button).
-  Future<void> fullSync() async {
+  /// Can be called from UI (e.g. refresh button). Throttled: at most once
+  /// per [_fullSyncMinGap] unless [force] is true.
+  Future<void> fullSync({bool force = false}) async {
+    final now = DateTime.now();
+    if (!force && _lastFullSyncStart != null &&
+        now.difference(_lastFullSyncStart!) < _fullSyncMinGap) {
+      debugPrint('[Sync] fullSync throttled — last run ${now.difference(_lastFullSyncStart!).inSeconds}s ago');
+      return;
+    }
+    _lastFullSyncStart = now;
     // Reset the pushing guard in case it got stuck
     _isPushing = false;
     return _fullSync();
@@ -224,28 +246,64 @@ class SyncService {
       debugPrint('[Sync] Failed to sync admin users: $e');
     }
 
-    // Pull orders (with nested order_items) from Supabase into local SQLite
+    // Pull orders (with nested order_items). Incremental by default — only
+    // download orders modified since the last successful pull. Once per day
+    // we do a FULL pull and orphan-cleanup so orders deleted on the web get
+    // removed locally too.
+    final db = DatabaseService.instance;
+    final shouldFullPull = _lastFullPull == null ||
+        DateTime.now().difference(_lastFullPull!) > _fullPullInterval;
+
     try {
-      final remoteOrders = await SupabaseService.instance.fetchOrders();
-      debugPrint('[Sync] Pulled ${remoteOrders.length} orders from Supabase');
-      if (remoteOrders.isNotEmpty) {
-        final synced = await DatabaseService.instance.syncOrders(remoteOrders);
-        debugPrint('[Sync] Synced $synced orders into local DB');
+      DateTime? since;
+      if (!shouldFullPull) {
+        final lastPull = await db.getMeta(_kLastOrdersPullAt);
+        if (lastPull != null) {
+          final parsed = DateTime.tryParse(lastPull);
+          // Subtract a small overlap to absorb clock skew between client/server
+          if (parsed != null) since = parsed.subtract(const Duration(minutes: 1));
+        }
+      }
+      final pullStart = DateTime.now();
+      final remoteOrders = await SupabaseService.instance.fetchOrders(since: since);
+      debugPrint('[Sync] Pulled ${remoteOrders.length} orders '
+          '(${since == null ? "FULL" : "since ${since.toIso8601String()}"})');
+      if (remoteOrders.isNotEmpty || shouldFullPull) {
+        final synced = await db.syncOrders(
+          remoteOrders,
+          deleteOrphans: shouldFullPull,
+        );
+        debugPrint('[Sync] Synced $synced orders'
+            '${shouldFullPull ? " (with orphan cleanup)" : ""}');
         didSync = true;
       }
+      // Update bookkeeping only after a successful pull
+      await db.setMeta(_kLastOrdersPullAt, pullStart.toIso8601String());
+      if (shouldFullPull) _lastFullPull = pullStart;
     } catch (e) {
       debugPrint('[Sync] Failed to sync orders: $e');
     }
 
-    // Pull order status logs
+    // Pull order status logs (also incremental by default)
     try {
-      final remoteLogs = await SupabaseService.instance.fetchOrderStatusLogs();
-      debugPrint('[Sync] Pulled ${remoteLogs.length} status logs');
+      DateTime? since;
+      if (!shouldFullPull) {
+        final lastPull = await db.getMeta(_kLastStatusLogsPullAt);
+        if (lastPull != null) {
+          final parsed = DateTime.tryParse(lastPull);
+          if (parsed != null) since = parsed.subtract(const Duration(minutes: 1));
+        }
+      }
+      final pullStart = DateTime.now();
+      final remoteLogs = await SupabaseService.instance.fetchOrderStatusLogs(since: since);
+      debugPrint('[Sync] Pulled ${remoteLogs.length} status logs '
+          '(${since == null ? "FULL" : "since ${since.toIso8601String()}"})');
       if (remoteLogs.isNotEmpty) {
-        final synced = await DatabaseService.instance.syncStatusLogs(remoteLogs);
-        debugPrint('[Sync] Synced $synced status logs into local DB');
+        final synced = await db.syncStatusLogs(remoteLogs);
+        debugPrint('[Sync] Synced $synced status logs');
         didSync = true;
       }
+      await db.setMeta(_kLastStatusLogsPullAt, pullStart.toIso8601String());
     } catch (e) {
       debugPrint('[Sync] Failed to sync status logs: $e');
     }

@@ -94,12 +94,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   }
 
   Future<void> _loadData({bool silent = false}) async {
-    await DatabaseService.instance.autoCollectCompletedOrders(
-      days: AppConstants.autoCollectDays,
-    );
-    await DatabaseService.instance.autoExpireCompletedOrders(
-      days: AppConstants.completedExpiryDays,
-    );
+    // autoCollectCompletedOrders and autoExpireCompletedOrders used to run
+    // here on every tab change — wasteful, since they only need to run
+    // periodically. They're now invoked once per hour by SyncService's
+    // periodic cleanup, so loadData just reads.
     await Future.wait([_loadOrders(silent: silent), _loadCounts()]);
   }
 
