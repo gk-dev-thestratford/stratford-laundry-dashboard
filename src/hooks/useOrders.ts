@@ -28,6 +28,7 @@ export function useOrders() {
   const [orders, setOrders] = useState<Order[]>([])
   const [departments, setDepartments] = useState<Department[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filters, setFilters] = useState<Filters>({
     status: 'all',
     department: 'all',
@@ -53,40 +54,54 @@ export function useOrders() {
 
   const fetchOrders = useCallback(async () => {
     setLoading(true)
-    let query = supabase
-      .from('orders')
-      .select(`
-        *,
-        department:departments(*),
-        order_items(*),
-        status_log:order_status_log(*)
-      `)
-      .order('created_at', { ascending: false })
+    setError(null)
 
-    if (filters.status !== 'all') {
-      query = query.eq('status', filters.status)
-    }
-    if (filters.department !== 'all') {
-      query = query.eq('department_id', filters.department)
-    }
-    if (filters.orderType !== 'all') {
-      query = query.eq('order_type', filters.orderType)
+    // Build the base server-side filter as a function so we can page through it.
+    // PostgREST caps a single response at ~1000 rows; an unfiltered year can exceed
+    // that (2500+ orders) and silently truncate, corrupting counts/totals. Page in
+    // 1000-row chunks until a short page signals the end.
+    const buildQuery = () => {
+      let q = supabase
+        .from('orders')
+        .select(`
+          *,
+          department:departments(*),
+          order_items(*),
+          status_log:order_status_log(*)
+        `)
+        .order('created_at', { ascending: false })
+      if (filters.status !== 'all') q = q.eq('status', filters.status)
+      if (filters.department !== 'all') q = q.eq('department_id', filters.department)
+      if (filters.orderType !== 'all') q = q.eq('order_type', filters.orderType)
+      if (filters.month > 0) {
+        const startDate = new Date(filters.year, filters.month - 1, 1).toISOString()
+        const endDate = new Date(filters.year, filters.month, 1).toISOString()
+        q = q.gte('created_at', startDate).lt('created_at', endDate)
+      } else {
+        const startDate = new Date(filters.year, 0, 1).toISOString()
+        const endDate = new Date(filters.year + 1, 0, 1).toISOString()
+        q = q.gte('created_at', startDate).lt('created_at', endDate)
+      }
+      return q
     }
 
-    // Year + month filtering
-    if (filters.month > 0) {
-      const startDate = new Date(filters.year, filters.month - 1, 1).toISOString()
-      const endDate = new Date(filters.year, filters.month, 1).toISOString()
-      query = query.gte('created_at', startDate).lt('created_at', endDate)
-    } else {
-      // Year only
-      const startDate = new Date(filters.year, 0, 1).toISOString()
-      const endDate = new Date(filters.year + 1, 0, 1).toISOString()
-      query = query.gte('created_at', startDate).lt('created_at', endDate)
+    const PAGE = 1000
+    let from = 0
+    const all: Order[] = []
+    for (;;) {
+      const { data, error: fetchErr } = await buildQuery().range(from, from + PAGE - 1)
+      if (fetchErr) {
+        setError(`Failed to load orders: ${fetchErr.message}`)
+        setOrders([])
+        setLoading(false)
+        return
+      }
+      const page = data ?? []
+      all.push(...page)
+      if (page.length < PAGE) break
+      from += PAGE
     }
-
-    const { data } = await query
-    let results = data ?? []
+    let results: Order[] = all
 
     if (filters.search) {
       const s = filters.search.toLowerCase()
@@ -323,5 +338,5 @@ export function useOrders() {
     await fetchOrders()
   }, [fetchOrders])
 
-  return { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus }
+  return { orders, departments, loading, error, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus }
 }

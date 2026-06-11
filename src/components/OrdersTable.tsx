@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import { format, formatDistanceToNow, isToday, isYesterday } from 'date-fns'
 import StatusBadge from './StatusBadge'
 import { ORDER_TYPE_LABELS } from '../types'
@@ -129,10 +130,9 @@ export default function OrdersTable({
                 const showItemRows = bulkEdit && order.order_items && order.order_items.length > 0
 
                 return (
-                  <>
+                  <Fragment key={order.id}>
                     {/* Main order row */}
                     <tr
-                      key={order.id}
                       onClick={() => !bulkEdit && onRowClick(order)}
                       className={`border-b border-gray-200 transition-colors ${
                         bulkEdit
@@ -252,7 +252,7 @@ export default function OrdersTable({
                         </tr>
                       )
                     })}
-                  </>
+                  </Fragment>
                 )
               })
             )}

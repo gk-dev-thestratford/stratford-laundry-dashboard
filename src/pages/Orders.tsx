@@ -13,19 +13,13 @@ import type { Order, OrderStatus, BulkEdits } from '../types'
 import { ORDER_STATUS_LABELS, ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
+import { computeOrderCost as computeCost } from '../lib/orderCost'
 
 const EMPTY_EDITS: BulkEdits = { orders: {}, items: {} }
 
-function computeCost(o: Order): number {
-  if (o.order_items && o.order_items.length > 0) {
-    const t = o.order_items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
-    if (t > 0) return t
-  }
-  return o.total_price ?? 0
-}
 
 export default function Orders() {
-  const { orders, departments, loading, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus } = useOrders()
+  const { orders, departments, loading, error, filters, setFilters, fetchOrders, updateOrderStatus, updateOrder, updateOrderItem, deleteOrders, bulkSaveEdits, bulkUpdateStatus } = useOrders()
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [detailOrder, setDetailOrder] = useState<Order | null>(null)
   const [showCreate, setShowCreate] = useState(false)
@@ -287,6 +281,15 @@ export default function Orders() {
 
   return (
     <div className="space-y-6">
+      {/* Load-failure banner — a failed fetch must never look like "0 orders" */}
+      {error && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+          <p className="text-sm text-red-700">{error}</p>
+          <button onClick={() => fetchOrders()} className="text-sm font-medium text-red-700 underline hover:no-underline whitespace-nowrap">
+            Retry
+          </button>
+        </div>
+      )}
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>

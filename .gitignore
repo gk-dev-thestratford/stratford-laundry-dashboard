@@ -41,5 +41,11 @@ supabase/
 # Claude Code agent worktrees (local only)
 .claude/worktrees/
 
+# Playwright MCP test artifacts (local only)
+.playwright-mcp/
+
+# Editor workspace files
+*.code-workspace
+
 # CLAUDE.md — internal dev rules, local only (public repo)
 CLAUDE.md

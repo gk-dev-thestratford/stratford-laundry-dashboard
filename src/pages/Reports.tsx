@@ -11,6 +11,7 @@ import { MONTHS, ORDER_TYPE_LABELS, ORDER_STATUS_LABELS, ORDER_STATUS_COLORS } f
 import type { Order, OrderType, OrderStatus } from '../types'
 import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
+import { computeOrderCost } from '../lib/orderCost'
 
 const DEPT_COLORS = ['#1B2A4A', '#C9A84C', '#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6']
 
@@ -30,11 +31,28 @@ export default function Reports() {
 
   const fetchData = useCallback(async () => {
     setLoading(true)
-    const [ordersRes, topUpRes, recRes] = await Promise.all([
-      supabase.from('orders').select('*, department:departments(*), order_items(*)')
-        .gte('created_at', `${year}-01-01T00:00:00.000Z`)
-        .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
-        .order('created_at', { ascending: true }),
+    // PostgREST caps a single response at ~1000 rows. A full year can exceed that
+    // (e.g. 2500+ orders), which previously truncated later months to blank. Page
+    // through in 1000-row chunks until a short page signals the end.
+    async function fetchAllOrders(): Promise<any[]> {
+      const PAGE = 1000
+      let from = 0
+      const all: any[] = []
+      for (;;) {
+        const { data, error } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+          .gte('created_at', `${year}-01-01T00:00:00.000Z`)
+          .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`)
+          .order('created_at', { ascending: true })
+          .range(from, from + PAGE - 1)
+        if (error || !data) break
+        all.push(...data)
+        if (data.length < PAGE) break
+        from += PAGE
+      }
+      return all
+    }
+    const [allOrders, topUpRes, recRes] = await Promise.all([
+      fetchAllOrders(),
       supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at, reconciliation_id')
         .gte('created_at', `${year}-01-01T00:00:00.000Z`)
         .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
@@ -42,7 +60,7 @@ export default function Reports() {
         .gte('created_at', `${year}-01-01T00:00:00.000Z`)
         .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
     ])
-    setOrders(ordersRes.data ?? [])
+    setOrders(allOrders)
     setTopUpData(topUpRes.data ?? [])
     // Build reconciliation_id → invoice month map from invoice_period (DD/MM/YY - DD/MM/YY or DD.MM.YY - DD.MM.YY)
     const monthMap: Record<string, number> = {}
@@ -68,16 +86,8 @@ export default function Reports() {
   }, [orders, month])
 
   // ── helpers ──
-  /** Compute order cost from item-level prices (works for uniforms AND linens) */
-  function orderCost(o: Order): number {
-    if (o.order_items && o.order_items.length > 0) {
-      const itemTotal = o.order_items.reduce(
-        (sum, i) => sum + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0,
-      )
-      if (itemTotal > 0) return itemTotal
-    }
-    return o.total_price ?? 0
-  }
+  /** Canonical order cost — shared with Reconciliation/Orders (src/lib/orderCost.ts) */
+  const orderCost = computeOrderCost
 
   // ── KPIs ──
   const kpis = useMemo(() => {

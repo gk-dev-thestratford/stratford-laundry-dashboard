@@ -40,6 +40,19 @@ export interface ParsedInvoice {
   totals: { net: number; vat: number; gross: number }
 }
 
+/**
+ * Canonical key for matching an invoice ticket against a stored docket_number.
+ * Goldstar prints reset-booklet tickets as bare numbers (6, 16, 3) while the system
+ * stores them zero-padded to 4 digits ("0006"). Normalise both sides: trim, drop a
+ * leading run of zeros (but keep at least one digit), and uppercase any letters.
+ *   "0006" → "6",  "6" → "6",  " 7208 " → "7208",  "ntn" → "NTN"
+ */
+export function canonicalDocket(value: string | null | undefined): string {
+  const s = String(value ?? '').trim()
+  if (!s) return ''
+  return s.replace(/^0+(?=\d)/, '').toUpperCase()
+}
+
 export function sectionTypeToOrderType(type: InvoiceSectionType): string {
   switch (type) {
     case 'staff': return 'uniform'
@@ -197,10 +210,13 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
     before = before.substring(sectionPrefixM[0].length).trim()
   }
 
-  // Extract date (range or single) — allow 1 or 2 digit days
+  // Extract date (range or single). Goldstar invoices drift between two formats within
+  // the same document: US M/D/YYYY (e.g. "5/1/2026") early in the month and UK DD/MM/YY
+  // (e.g. "14/05/26") later. Allow 1-OR-2 digit day AND month so both parse and the date
+  // gets stripped — otherwise the ticket on the first line of each day is lost.
   let date = lastDate
-  const drm = before.match(/^(\d{1,2}\/\d{2}(?:\/\d{2,4})?\s*-\s*\d{1,2}\/\d{2}(?:\/\d{2,4})?)\s+(.*)/)
-  const dm = before.match(/^(\d{1,2}\/\d{2}\/\d{2,4})\s+(.*)/)
+  const drm = before.match(/^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s*-\s*\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+(.*)/)
+  const dm = before.match(/^(\d{1,2}\/\d{1,2}\/\d{2,4})\s+(.*)/)
   if (drm) { date = drm[1].trim(); before = drm[2].trim() }
   else if (dm) { date = dm[1].trim(); before = dm[2].trim() }
 
@@ -218,6 +234,10 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
   const napkinM = before.match(/^(NAPKINS)\s+(.*)/)
   const ntnM = before.match(/^(NTN)\s+(.*)/)
   const stdM = before.match(/^(\d{4})\s+(.*)/)
+  // Short numeric ticket (1-3 digits) from a reset booklet, e.g. "6 8x bathrobes",
+  // "3 1x shirts". Require a quantity token ("Nx ...") after it so we never mistake a
+  // leading item quantity for a ticket.
+  const shortNumM = before.match(/^(\d{1,3})\s+(\d+x\b.*)/)
   // Alphanumeric ticket (e.g. "Sam 77x napkins") — short word followed by qty description
   const alphaM = before.match(/^([A-Za-z][A-Za-z0-9]{1,10})\s+(\d+x\s+.*)/)
 
@@ -226,6 +246,7 @@ function parseLine(raw: string, lastDate: string): (InvoiceLine & { parsedDate: 
   else if (napkinM) { ticket = 'NAPKINS'; description = napkinM[2].trim() }
   else if (ntnM) { ticket = 'NTN'; description = ntnM[2].trim() }
   else if (stdM) { ticket = stdM[1]; description = stdM[2].trim() }
+  else if (shortNumM) { ticket = shortNumM[1]; description = shortNumM[2].trim() }
   else if (alphaM) { ticket = alphaM[1]; description = alphaM[2].trim() }
 
   return {
@@ -334,9 +355,6 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
-  // Track section totals from "Total MM/YY" lines for informational line detection
-  const sectionTotals = new Map<InvoiceSection, number>()
-
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]
 
@@ -349,12 +367,6 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
 
     const grossM = line.match(/\bTotal\s+£\s*([\d,]+\.\d{2})$/i)
     if (grossM) totalGross = parseFloat(grossM[1].replace(',', ''))
-
-    // Capture section total (e.g. "Total 03/26 11072x Napkins £ 2,226.97 £445.39 £2,672.36")
-    const sectionTotalM = line.match(/^Total\s+\d{1,2}\/\d{2}.*£\s*([\d,]+\.\d{2})\s+£\s*[\d,]+\.\d{2}\s+£\s*[\d,]+\.\d{2}/i)
-    if (sectionTotalM && currentSection) {
-      sectionTotals.set(currentSection, parseFloat(sectionTotalM[1].replace(',', '')))
-    }
 
     // Section header
     const sectionType = detectSection(line)
@@ -383,35 +395,14 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
-  // Post-process: scale non-topup line NETs to match section stated totals.
-  // Napkin invoices list individual item lines AND weekly minimum topup charges.
-  // Some items are "informational" (covered by the minimum) so the section total
-  // is less than the sum of parsed lines. Rather than guessing which lines to remove,
-  // we scale all non-topup lines proportionally so they sum to the billed amount.
-  for (const section of sections) {
-    const sectionTotal = sectionTotals.get(section)
-    if (sectionTotal == null) continue
-    const topUpSum = Math.round(section.lines.filter(l => l.isTopUp).reduce((s, l) => s + l.net, 0) * 100) / 100
-    const itemSum = Math.round(section.lines.filter(l => !l.isTopUp).reduce((s, l) => s + l.net, 0) * 100) / 100
-    const targetItemSum = Math.round((sectionTotal - topUpSum) * 100) / 100
-    if (itemSum > 0 && Math.abs(itemSum - targetItemSum) > 0.5) {
-      const scale = targetItemSum / itemSum
-      console.log(`[Parser] Scaling "${section.name}" items: £${itemSum.toFixed(2)} → £${targetItemSum.toFixed(2)} (×${scale.toFixed(4)})`)
-      let runningTotal = 0
-      const nonTopUpLines = section.lines.filter(l => !l.isTopUp)
-      for (let i = 0; i < nonTopUpLines.length; i++) {
-        if (i < nonTopUpLines.length - 1) {
-          nonTopUpLines[i].net = Math.round(nonTopUpLines[i].net * scale * 100) / 100
-          runningTotal += nonTopUpLines[i].net
-        } else {
-          // Last line gets the remainder to avoid rounding drift
-          nonTopUpLines[i].net = Math.round((targetItemSum - runningTotal) * 100) / 100
-        }
-        nonTopUpLines[i].vat = Math.round(nonTopUpLines[i].net * 0.2 * 100) / 100
-        nonTopUpLines[i].gross = Math.round(nonTopUpLines[i].net * 1.2 * 100) / 100
-      }
-    }
-  }
+  // NOTE: We deliberately do NOT rescale per-line NETs to hit a section subtotal.
+  // The previous implementation scaled every docket line proportionally so they summed
+  // to "Total MM/YY", but that subtotal can legitimately differ from the sum of lines —
+  // e.g. a separate "STOCK REPLACEMENT" charge is billed in the grand total but sits
+  // outside the napkin usage subtotal. Scaling corrupted every real per-line price and
+  // produced dozens of false price-mismatches against the system orders. Keeping the
+  // true invoice line prices is essential for accurate ticket-level reconciliation;
+  // any section-vs-lines delta is surfaced at the summary level instead.
 
   return {
     invoiceNumber, invoiceDate, invoicePeriod,

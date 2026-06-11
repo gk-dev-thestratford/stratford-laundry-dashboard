@@ -11,6 +11,7 @@ import ReconciliationHistory from './pages/ReconciliationHistory'
 import LinenPool from './pages/LinenPool'
 import Announcements from './pages/Announcements'
 import StatusToast from './components/StatusToast'
+import ErrorBoundary from './components/ErrorBoundary'
 
 export default function App() {
   const { user, dashboardUser, loading, signIn, signOut } = useAuth()
@@ -28,21 +29,23 @@ export default function App() {
   }
 
   return (
-    <HashRouter>
-      <Routes>
-        <Route element={<Layout user={dashboardUser} onSignOut={signOut} />}>
-          <Route path="/" element={<Reports />} />
-          <Route path="/orders" element={<Orders />} />
-          <Route path="/user-management" element={<UserManagement currentUser={dashboardUser} />} />
-          <Route path="/catalogue" element={<Catalogue />} />
-          <Route path="/linen-pool" element={<LinenPool />} />
-          <Route path="/reconciliation" element={<Reconciliation />} />
-          <Route path="/reconciliation/history" element={<ReconciliationHistory />} />
-          <Route path="/announcements" element={<Announcements />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-      <StatusToast />
-    </HashRouter>
+    <ErrorBoundary>
+      <HashRouter>
+        <Routes>
+          <Route element={<Layout user={dashboardUser} onSignOut={signOut} />}>
+            <Route path="/" element={<Reports />} />
+            <Route path="/orders" element={<Orders />} />
+            <Route path="/user-management" element={<UserManagement currentUser={dashboardUser} />} />
+            <Route path="/catalogue" element={<Catalogue />} />
+            <Route path="/linen-pool" element={<LinenPool />} />
+            <Route path="/reconciliation" element={<Reconciliation />} />
+            <Route path="/reconciliation/history" element={<ReconciliationHistory />} />
+            <Route path="/announcements" element={<Announcements />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+        <StatusToast />
+      </HashRouter>
+    </ErrorBoundary>
   )
 }

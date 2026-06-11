@@ -86,7 +86,8 @@ export function generateReconciliationPdf(
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
-  financials?: FinancialTotals
+  financials?: FinancialTotals,
+  notes?: string
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
@@ -407,6 +408,27 @@ export function generateReconciliationPdf(
     })
   }
 
+  // ── Notes / Invoice Issues ──
+  if (notes && notes.trim()) {
+    y = (doc as any).lastAutoTable?.finalY ?? y
+    if (y > doc.internal.pageSize.getHeight() - 50) { doc.addPage(); y = 20 }
+    y += 8
+    doc.setTextColor(NAVY)
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.text('Notes / Invoice Issues', 14, y)
+    y += 6
+    doc.setTextColor('#374151')
+    doc.setFontSize(9)
+    doc.setFont('helvetica', 'normal')
+    const wrapped = doc.splitTextToSize(notes.trim(), pageWidth - 28)
+    for (const ln of wrapped) {
+      if (y > doc.internal.pageSize.getHeight() - 20) { doc.addPage(); y = 20 }
+      doc.text(ln, 14, y)
+      y += 5
+    }
+  }
+
   // ── Footer on every page ──
   const pageCount = doc.getNumberOfPages()
   for (let i = 1; i <= pageCount; i++) {
@@ -432,9 +454,10 @@ export function downloadReconciliationPdf(
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
-  financials?: FinancialTotals
+  financials?: FinancialTotals,
+  notes?: string
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -446,8 +469,9 @@ export function generateReconciliationPdfBlob(
   napkinDeptAllocation?: NapkinDeptAllocation[],
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
-  financials?: FinancialTotals
+  financials?: FinancialTotals,
+  notes?: string
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes)
   return doc.output('blob')
 }

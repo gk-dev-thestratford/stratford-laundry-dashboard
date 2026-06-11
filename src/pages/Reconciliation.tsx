@@ -3,11 +3,12 @@ import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpC
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
-  sectionTypeToOrderType,
+  sectionTypeToOrderType, canonicalDocket,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
   extractAndParseD140, type D140Report, type D140Transaction,
 } from '../lib/invoiceParser'
 import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals } from '../lib/pdfReport'
+import { computeOrderCost } from '../lib/orderCost'
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -23,6 +24,15 @@ interface ReconciliationRow {
   systemTotal: number
   difference: number
   rowIndex: number
+  // True when the order matched but the price differs only by a small, proportionate
+  // amount (e.g. the £0.215 vs £0.22 napkin rate gap). Still a 'price_mismatch', but
+  // surfaced as a calm "minor variance" rather than an alarming discrepancy.
+  minorVariance: boolean
+}
+
+/** Price-difference tolerance: minor if within max(£0.15, 3% of the system total). */
+function isMinorVariance(diff: number, systemTotal: number): boolean {
+  return Math.abs(diff) <= Math.max(0.15, systemTotal * 0.03)
 }
 
 interface DepartmentBreakdown {
@@ -43,7 +53,7 @@ interface ReconciliationResult {
   topUpCharges: InvoiceLine[]
   missingFromInvoice: Order[]
   matchedOrderIds: string[]
-  stats: { matched: number; priceMismatch: number; notFound: number; missing: number }
+  stats: { matched: number; priceMismatch: number; minorVariance: number; notFound: number; missing: number }
   invoiceTotal: number
   systemTotal: number
   departmentBreakdown: DepartmentBreakdown[]
@@ -81,21 +91,7 @@ function notFoundKey(row: ReconciliationRow): string {
 
 // ── Helpers ──
 
-function computeOrderCost(o: Order): number {
-  if (o.order_items && o.order_items.length > 0) {
-    const t = o.order_items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
-    if (t > 0) {
-      const itemTotal = Math.round(t * 100) / 100
-      // If total_price was explicitly set (e.g. from invoice update) and differs from
-      // item recalculation, trust total_price — item prices may not have saved (RLS)
-      if (o.total_price != null && o.total_price > 0 && Math.abs(itemTotal - o.total_price) > 0.01) {
-        return o.total_price
-      }
-      return itemTotal
-    }
-  }
-  return o.total_price ?? 0
-}
+// computeOrderCost is the shared canonical calculation — see src/lib/orderCost.ts
 
 function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: InvoiceLine[]): DepartmentBreakdown[] {
   const deptMap = new Map<string, DepartmentBreakdown>()
@@ -328,11 +324,12 @@ function buildDepartmentDisplayRows(
 }
 
 function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null, strictPeriod?: { start: Date; end: Date } | null): ReconciliationResult {
-  // Issue 2: Use array map to handle duplicate docket numbers
+  // Issue 2: Use array map to handle duplicate docket numbers.
+  // Key by canonicalDocket so a reset-booklet ticket "6" matches a stored "0006", etc.
   const byDocket = new Map<string, Order[]>()
   const byRoom = new Map<string, Order[]>()
   for (const o of orders) {
-    const dk = o.docket_number.trim()
+    const dk = canonicalDocket(o.docket_number)
     if (!byDocket.has(dk)) byDocket.set(dk, [])
     byDocket.get(dk)!.push(o)
     if (o.room_number) {
@@ -350,8 +347,8 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     const orderType = sectionTypeToOrderType(section.type)
     for (const line of section.lines) {
       if (line.isTopUp) { topUpCharges.push(line); continue }
-      // Issue 2: Pick first unclaimed order with this docket
-      const docketCandidates = byDocket.get(line.ticket.trim()) ?? []
+      // Issue 2: Pick first unclaimed order with this docket (canonicalised both sides)
+      const docketCandidates = byDocket.get(canonicalDocket(line.ticket)) ?? []
       let order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
       if (!order && section.type === 'guest' && line.ticket) {
         const candidates = (byRoom.get(line.ticket) ?? []).filter(o => !matchedOrderIds.has(o.id))
@@ -374,7 +371,8 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
       const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
       const status: ReconciliationRow['status'] = !order
         ? 'not_found' : Math.abs(diff) < 0.02 ? 'matched' : 'price_mismatch'
-      rows.push({ invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex: rowCounter++ })
+      const minorVariance = status === 'price_mismatch' && isMinorVariance(diff, systemTotal)
+      rows.push({ invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex: rowCounter++, minorVariance })
     }
   }
 
@@ -398,6 +396,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     stats: {
       matched: rows.filter(r => r.status === 'matched').length,
       priceMismatch: rows.filter(r => r.status === 'price_mismatch').length,
+      minorVariance: rows.filter(r => r.minorVariance).length,
       notFound: rows.filter(r => r.status === 'not_found').length,
       missing: missingFromInvoice.length,
     },
@@ -459,12 +458,28 @@ export default function Reconciliation() {
 
   const [showSaveConfirm, setShowSaveConfirm] = useState(false)
 
+  // Free-text notes about this reconciliation / invoice (e.g. "ticket 7208 should be 6208",
+  // "napkin rate billed at £0.22 not £0.215 — query with Goldstar"). Saved to
+  // reconciliations.notes and printed in the PDF + Excel breakdown.
+  const [reconciliationNote, setReconciliationNote] = useState('')
+
   // Add to System modal
   const [addModal, setAddModal] = useState<{ row: ReconciliationRow; index: number } | null>(null)
   const [addModalDept, setAddModalDept] = useState('')
   const [addModalDocket, setAddModalDocket] = useState('')
   const [addModalDate, setAddModalDate] = useState('')
   const [addModalSaving, setAddModalSaving] = useState(false)
+  // 'create' = make a new order; 'link' = attach this invoice line to an EXISTING order
+  // (avoids duplicates, and handles wrong/changed ticket numbers). Linking stamps the
+  // matcher's ref-key into the chosen order's notes so re-reconciliation picks it up.
+  const [addModalMode, setAddModalMode] = useState<'create' | 'link'>('create')
+  const [addModalLinkSearch, setAddModalLinkSearch] = useState('')
+  const [addModalLinkOrderId, setAddModalLinkOrderId] = useState('')
+  const [addModalNote, setAddModalNote] = useState('')
+  // When linking: the docket/ticket to record on the order (lets the user correct a wrong
+  // invoice ticket or keep ours), and whether to also sync the order's price to the invoice.
+  const [addModalLinkDocket, setAddModalLinkDocket] = useState('')
+  const [addModalLinkUpdatePrice, setAddModalLinkUpdatePrice] = useState(false)
   const [departments, setDepartments] = useState<Department[]>([])
   const [catalogueItems, setCatalogueItems] = useState<{ name: string; price: number | null; category: string }[]>([])
 
@@ -530,6 +545,7 @@ export default function Reconciliation() {
     setFile(f); setError(''); setParsing(true)
     setInvoice(null); setResult(null); setSaved(false); setShowHistory(false)
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
+    setReconciliationNote('')
     try {
       const lines = await extractPdfLines(f)
       console.log('[Reconciliation] Extracted PDF lines:', lines.slice(0, 30))
@@ -569,6 +585,9 @@ export default function Reconciliation() {
     setError(''); setFilter('all'); setSaved(false); setBroaderSearch(false)
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
+    setAddModalMode('create'); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch('')
+    setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false)
+    setReconciliationNote('')
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
     setD140Report(null); setShowD140Prompt(false); setLastSavedRecId(null); setD140Saved(false)
   }
@@ -718,6 +737,42 @@ export default function Reconciliation() {
   const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
     if (!result) return []
     return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
+  }, [result])
+
+  // ── Price-discrepancy pattern detector ──
+  // Reconciliation should ideally have NO discrepancies. When it does, look for a
+  // SYSTEMATIC cause: the same item priced consistently differently in our system vs the
+  // invoice (e.g. napkins at £0.22 in our catalogue but £0.215 on every invoice line).
+  // Grouping by item + per-unit gap surfaces a stale rate to correct, vs one-off errors.
+  const pricePatterns = useMemo(() => {
+    if (!result) return []
+    interface Pat { item: string; count: number; sysUnitSum: number; invUnitSum: number; totalImpact: number }
+    const map = new Map<string, Pat>()
+    for (const r of result.rows) {
+      if (r.status !== 'price_mismatch' || !r.order) continue
+      const items = r.invoiceLine.items
+      // Only single-item lines give a clean per-unit rate
+      if (items.length !== 1) continue
+      const qty = items[0].quantity
+      if (qty <= 0) continue
+      const invUnit = r.invoiceLine.net / qty
+      const sysUnit = r.systemTotal / qty
+      if (Math.abs(invUnit - sysUnit) < 0.001) continue
+      const name = items[0].name.toLowerCase().replace(/s$/, '')
+      const key = `${name}|${sysUnit.toFixed(3)}|${invUnit.toFixed(3)}`
+      if (!map.has(key)) map.set(key, { item: items[0].name, count: 0, sysUnitSum: 0, invUnitSum: 0, totalImpact: 0 })
+      const p = map.get(key)!
+      p.count++; p.sysUnitSum += sysUnit; p.invUnitSum += invUnit; p.totalImpact += r.difference
+    }
+    return Array.from(map.values())
+      .filter(p => p.count >= 3) // a "pattern" = at least 3 lines with the same gap
+      .map(p => ({
+        item: p.item, count: p.count,
+        sysUnit: p.sysUnitSum / p.count,
+        invUnit: p.invUnitSum / p.count,
+        totalImpact: +p.totalImpact.toFixed(2),
+      }))
+      .sort((a, b) => Math.abs(b.totalImpact) - Math.abs(a.totalImpact))
   }, [result])
 
   // ── Napkin Usage Summary ──
@@ -1124,7 +1179,7 @@ export default function Reconciliation() {
         invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : saveGrandNet * 1.2).toFixed(2),
         systemNet: +result.systemTotal.toFixed(2),
       }
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, saveFinancials)
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, saveFinancials, reconciliationNote.trim() || undefined)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -1142,6 +1197,7 @@ export default function Reconciliation() {
       invoice_file_path: invoicePath,
       report_file_path: reportPath,
       invoice_category: invoiceCategory,
+      notes: reconciliationNote.trim() || null,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
@@ -1211,7 +1267,7 @@ export default function Reconciliation() {
     setSaving(false); setSaved(true); loadHistory()
     // Prompt for D140 upload after saving a guest invoice
     if (invoice.sections.some(s => s.type === 'guest')) setShowD140Prompt(true)
-  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary])
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1313,8 +1369,10 @@ export default function Reconciliation() {
       ['RECONCILIATION SUMMARY'],
       ['Matched Orders', result.stats.matched],
       ['Price Discrepancies', result.stats.priceMismatch],
+      ['  of which minor (≤3%)', result.stats.minorVariance],
       ['On Invoice Only', result.stats.notFound],
       ['In System Only', result.stats.missing],
+      ...(reconciliationNote.trim() ? [[], ['NOTES / INVOICE ISSUES'], ...reconciliationNote.trim().split('\n').map(l => [l])] : []),
     ])
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
@@ -1393,11 +1451,13 @@ export default function Reconciliation() {
     if (discRows.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(discRows), 'Discrepancies & Actions')
 
     writeFile(wb, `accounting-report-${invoice.invoiceNumber || 'reconciliation'}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`)
-  }, [result, invoice, notFoundResolutions, missingResolutions])
+  }, [result, invoice, notFoundResolutions, missingResolutions, reconciliationNote])
 
-  const statusIcon = (s: ReconciliationRow['status']) => {
+  const statusIcon = (s: ReconciliationRow['status'], minor = false) => {
     if (s === 'matched') return <CheckCircle className="w-4 h-4 text-green-500" />
-    if (s === 'price_mismatch') return <AlertTriangle className="w-4 h-4 text-amber-500" />
+    if (s === 'price_mismatch') return minor
+      ? <AlertTriangle className="w-4 h-4 text-gray-400" />
+      : <AlertTriangle className="w-4 h-4 text-amber-500" />
     return <XCircle className="w-4 h-4 text-red-500" />
   }
 
@@ -1599,11 +1659,72 @@ export default function Reconciliation() {
     }
   }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile])
 
-  // ── Action: Accept charge (acknowledge invoice-only item as valid) ──
-  const handleAcceptCharge = useCallback((row: ReconciliationRow) => {
-    const key = notFoundKey(row)
-    setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'accepted' } }))
-  }, [])
+  // ── Action: Link this invoice line to an EXISTING order ──
+  // Used when the order is already in the system but wasn't matched (wrong/changed ticket
+  // number, or a near-miss). Instead of creating a duplicate, we stamp the matcher's
+  // ref-key — and an optional human note — into the chosen order's notes, so the next
+  // reconciliation pass links them directly.
+  const handleLinkExisting = useCallback(async () => {
+    if (!addModal || !invoice || !addModalLinkOrderId) return
+    const { row } = addModal
+    setAddModalSaving(true)
+    try {
+      const target = orders.find(o => o.id === addModalLinkOrderId)
+      if (!target) throw new Error('Selected order not found')
+      const refKey = `[ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`
+      // The docket to record on the order — user may correct a wrong invoice ticket here.
+      const newDocket = addModalLinkDocket.trim() || target.docket_number
+      const docketChanged = newDocket !== target.docket_number
+      const correction = docketChanged
+        ? ` (docket ${target.docket_number} → ${newDocket})`
+        : (canonicalDocket(target.docket_number) !== canonicalDocket(row.invoiceLine.ticket)
+            ? ` (invoice ticket ${row.invoiceLine.ticket} → our docket ${target.docket_number})` : '')
+      const noteParts = [
+        target.notes?.trim() || '',
+        `Linked to invoice ${invoice.invoiceNumber}${correction} ${refKey}`,
+      ]
+      if (addModalNote.trim()) noteParts.push(`Note: ${addModalNote.trim()}`)
+      const newNotes = noteParts.filter(Boolean).join(' ')
+
+      const orderUpdate: Record<string, unknown> = { notes: newNotes, reconciliation_id: null }
+      if (docketChanged) orderUpdate.docket_number = newDocket
+      if (addModalLinkUpdatePrice) orderUpdate.total_price = +row.invoiceLine.net.toFixed(2)
+      const { error: updErr } = await supabase.from('orders').update(orderUpdate).eq('id', target.id)
+      if (updErr) throw updErr
+
+      // Optionally sync per-item prices to the invoice (distribute net by quantity)
+      if (addModalLinkUpdatePrice) {
+        const { data: items } = await supabase.from('order_items').select('id, quantity_sent').eq('order_id', target.id)
+        const valid = (items || []).filter((i: any) => (i.quantity_sent ?? 0) > 0 && i.id)
+        const totalQty = valid.reduce((s: number, i: any) => s + (i.quantity_sent ?? 0), 0)
+        if (totalQty > 0) {
+          const unit = row.invoiceLine.net / totalQty
+          for (const it of valid) await supabase.from('order_items').update({ price_at_time: unit }).eq('id', it.id)
+        }
+      }
+
+      let userName = 'Dashboard'
+      const { data: { user: authUser } } = await supabase.auth.getUser()
+      if (authUser) {
+        const { data: du } = await supabase.from('dashboard_users').select('name, email').eq('id', authUser.id).single()
+        userName = `Dashboard / ${du?.name || du?.email || 'Unknown'}`
+      }
+      await supabase.from('order_status_log').insert({
+        order_id: target.id, status: target.status, changed_by_name: userName,
+        reason: `Linked to invoice ${invoice.invoiceNumber} line "${row.invoiceLine.ticket}"${correction}${addModalNote.trim() ? ` — ${addModalNote.trim()}` : ''}`,
+      })
+
+      const key = notFoundKey(row)
+      setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system', note: addModalNote.trim() || undefined } }))
+      await refetchAndReconcile()
+      setAddModal(null); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch(''); setAddModalMode('create')
+      setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false)
+    } catch (e) {
+      console.error('Failed to link existing order:', e)
+    } finally {
+      setAddModalSaving(false)
+    }
+  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, orders, refetchAndReconcile])
 
   // ── Action: Challenge an item (toggle) ──
   const handleChallenge = useCallback((itemKey: string, category: 'nf' | 'miss' | 'mm') => {
@@ -1740,8 +1861,8 @@ export default function Reconciliation() {
       invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : pdfGrandNet * 1.2).toFixed(2),
       systemNet: +result.systemTotal.toFixed(2),
     }
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, pdfFinancials)
-  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary])
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, pdfFinancials, reconciliationNote.trim() || undefined)
+  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary, reconciliationNote])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
@@ -1957,7 +2078,9 @@ export default function Reconciliation() {
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <StatCard icon={<CheckCircle className="w-5 h-5 text-green-500" />} label="Matched" value={result.stats.matched} color="green" />
-        <StatCard icon={<AlertTriangle className="w-5 h-5 text-amber-500" />} label="Price Discrepancy" value={result.stats.priceMismatch} color="amber" />
+        <StatCard icon={<AlertTriangle className="w-5 h-5 text-amber-500" />} label="Price Discrepancy" value={result.stats.priceMismatch} color="amber"
+          subtitle={result.stats.minorVariance > 0 ? `${result.stats.minorVariance} minor (≤3%)` : undefined} />
+        {/* "minor" = matched order, price within tolerance (e.g. £0.215 vs £0.22 napkin rate). Real overcharges stay flagged. */}
         <StatCard icon={<XCircle className="w-5 h-5 text-red-500" />} label="On Invoice Only" value={result.stats.notFound} color="red"
           subtitle={Object.keys(notFoundResolutions).length > 0 ? `${Object.keys(notFoundResolutions).length} resolved` : undefined} />
         <StatCard icon={<HelpCircle className="w-5 h-5 text-blue-500" />} label="In System Only" value={result.stats.missing} color="blue"
@@ -1973,6 +2096,49 @@ export default function Reconciliation() {
             </p>
           )}
         </div>
+      </div>
+
+      {/* Detected systematic price patterns — a stale rate to correct, not one-off errors. */}
+      {pricePatterns.length > 0 && (
+        <div className="bg-amber-50 rounded-xl border border-amber-200 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Scale className="w-4 h-4 text-amber-600" />
+            <h3 className="text-sm font-semibold text-gray-900">Systematic price patterns detected</h3>
+            <span className="text-xs text-gray-500">— consistent gaps that look like a stale rate, not one-off errors</span>
+          </div>
+          <div className="space-y-1.5">
+            {pricePatterns.map((p, i) => (
+              <div key={i} className="flex items-center justify-between text-sm bg-white rounded-lg px-3 py-2 border border-amber-100">
+                <span className="text-gray-700">
+                  <strong>{p.item}</strong> {'·'} {p.count} lines {'·'} our rate {'£'}{p.sysUnit.toFixed(3)}/unit {'→'} invoice {'£'}{p.invUnit.toFixed(3)}/unit
+                </span>
+                <span className={`font-medium ${Math.abs(p.totalImpact) >= 0.01 ? 'text-amber-700' : 'text-gray-500'}`}>
+                  {p.totalImpact >= 0 ? '+' : ''}{'£'}{p.totalImpact.toFixed(2)} total
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="text-[11px] text-gray-500 mt-2">
+            A consistent per-unit gap usually means our catalogue/order rate is out of date. Correct the rate in the Catalogue (fixes future orders) and use “Update price” on the affected lines, or note it here to query with the cleaning company.
+          </p>
+        </div>
+      )}
+
+      {/* Reconciliation notes — invoice errors / corrections to request / anything to record.
+          Saved with the reconciliation and printed on the PDF + Excel breakdown. */}
+      <div className="bg-white rounded-xl border border-gray-200 p-4">
+        <div className="flex items-center gap-2 mb-2">
+          <FileText className="w-4 h-4 text-navy" />
+          <h3 className="text-sm font-semibold text-gray-900">Notes / Invoice Issues</h3>
+          <span className="text-xs text-gray-400">— recorded on the saved report (PDF & Excel)</span>
+        </div>
+        <textarea
+          value={reconciliationNote}
+          onChange={e => setReconciliationNote(e.target.value)}
+          rows={3}
+          placeholder={'e.g. Ticket 7208 doesn’t exist — should be 6208 (linked). Napkins billed at £0.22 but agreed rate is £0.215 — query with Goldstar. Charged £4.37 for jacket+apron (should be £2.40).'}
+          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30 resize-y"
+        />
       </div>
 
       {/* Department Breakdown */}
@@ -2316,7 +2482,7 @@ export default function Reconciliation() {
                   row.status === 'price_mismatch' ? 'bg-amber-50/50' :
                   row.status === 'not_found' ? 'bg-red-50/50' : ''
                 }`}>
-                  <td className="px-3 py-2.5 text-center">{statusIcon(row.status)}</td>
+                  <td className="px-3 py-2.5 text-center">{statusIcon(row.status, row.minorVariance)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
                     {row.invoiceLine.ticket}{row.invoiceLine.guestInfo && <span className="text-gray-400 ml-1">{row.invoiceLine.guestInfo}</span>}
@@ -2354,44 +2520,44 @@ export default function Reconciliation() {
                       </div>
                     )}
 
-                    {/* Not Found — Add to System / Accept / Challenge */}
-                    {row.status === 'not_found' && !nfRes && (
+                    {/* Not Found — Link to existing (primary) / Add new / Challenge supplier */}
+                    {row.status === 'not_found' && !nfRes && (() => {
+                      const openModal = (mode: 'create' | 'link') => {
+                        setAddModal({ row, index: i }); setAddModalDept('')
+                        setAddModalMode(mode); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch('')
+                        setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false)
+                        setAddModalDocket(row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`)
+                        const ld = row.invoiceLine.date
+                        if (ld) setAddModalDate(ld)
+                        else if (parsedPeriod) setAddModalDate(format(parsedPeriod.start, 'yyyy-MM-dd'))
+                        else setAddModalDate('')
+                      }
+                      return (
                       <div className="flex items-center gap-1 justify-center">
                         <button
-                          onClick={() => {
-                            setAddModal({ row, index: i }); setAddModalDept('')
-                            setAddModalDocket(row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`)
-                            // Auto-populate date from invoice line, or fall back to invoice period start
-                            const ld = row.invoiceLine.date
-                            if (ld) {
-                              setAddModalDate(ld)
-                            } else if (parsedPeriod) {
-                              setAddModalDate(format(parsedPeriod.start, 'yyyy-MM-dd'))
-                            } else {
-                              setAddModalDate('')
-                            }
-                          }}
-                          className="px-2 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 whitespace-nowrap"
-                          title="Add this item to our system"
+                          onClick={() => openModal('link')}
+                          className="px-2 py-1 text-xs font-medium text-white bg-navy rounded hover:bg-navy/90 whitespace-nowrap"
+                          title="Link this invoice line to an order already in the system (wrong/changed ticket or room number)"
+                        >
+                          <ArrowRightLeft className="w-3 h-3 inline mr-0.5" />Link
+                        </button>
+                        <button
+                          onClick={() => openModal('create')}
+                          className="px-2 py-1 text-xs font-medium text-blue-700 bg-blue-100 rounded hover:bg-blue-200 whitespace-nowrap"
+                          title="Create a new order for this item (only if it genuinely isn't in the system)"
                         >
                           <Plus className="w-3 h-3 inline mr-0.5" />Add
                         </button>
                         <button
-                          onClick={() => handleAcceptCharge(row)}
-                          className="px-2 py-1 text-xs font-medium text-green-700 bg-green-100 rounded hover:bg-green-200 whitespace-nowrap"
-                          title="Accept this charge as valid"
-                        >
-                          Accept
-                        </button>
-                        <button
                           onClick={() => handleChallenge(nfKey, 'nf')}
                           className={`p-1 rounded hover:bg-orange-100 ${isChallenged ? 'text-orange-600 bg-orange-100' : 'text-gray-400'}`}
-                          title="Challenge this item with supplier"
+                          title="Flag to the cleaning company — billed but not in our records"
                         >
                           <Mail className="w-3.5 h-3.5" />
                         </button>
                       </div>
-                    )}
+                      )
+                    })()}
                     {/* Not Found — already resolved */}
                     {row.status === 'not_found' && nfRes && (
                       <div className="flex items-center gap-1 justify-center">
@@ -2844,16 +3010,106 @@ export default function Reconciliation() {
             </div>
             <div className="px-6 py-4 space-y-4">
               <p className="text-sm text-gray-600">
-                This invoice item was not found in our system. Create an order to match it.
+                This invoice item was not found in our system. Either <strong>create</strong> a new order, or <strong>link it to an existing order</strong> (if it's already in the system under a different/wrong ticket number) {'\u2014'} linking avoids creating a duplicate.
               </p>
 
               {/* Invoice item details */}
               <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-2">
+                <div className="flex justify-between"><span className="text-gray-500">Ticket:</span><span className="font-mono">{addModal.row.invoiceLine.ticket || '\u2014'}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Description:</span><span className="text-right max-w-[250px] truncate">{addModal.row.invoiceLine.description}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Amount (NET):</span><span className="font-bold">{'\u00a3'}{addModal.row.invoiceLine.net.toFixed(2)}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Service Type:</span><span>{ORDER_TYPE_LABELS[addModal.row.sectionType as OrderType] ?? addModal.row.sectionType}</span></div>
               </div>
 
+              {/* Mode toggle: create new vs link existing */}
+              <div className="flex rounded-lg border border-gray-200 p-1 bg-gray-50">
+                <button onClick={() => setAddModalMode('create')}
+                  className={`flex-1 px-3 py-1.5 text-sm font-medium rounded-md ${addModalMode === 'create' ? 'bg-white shadow text-navy' : 'text-gray-500'}`}>
+                  Create new order
+                </button>
+                <button onClick={() => setAddModalMode('link')}
+                  className={`flex-1 px-3 py-1.5 text-sm font-medium rounded-md ${addModalMode === 'link' ? 'bg-white shadow text-navy' : 'text-gray-500'}`}>
+                  Link existing order
+                </button>
+              </div>
+
+              {/* \u2500\u2500 LINK MODE: pick an existing in-system order \u2500\u2500 */}
+              {addModalMode === 'link' && (
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Find the existing order to link</label>
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-2.5 w-4 h-4 text-gray-400" />
+                    <input
+                      type="text" value={addModalLinkSearch} onChange={e => setAddModalLinkSearch(e.target.value)}
+                      placeholder="Search by docket, department, items..."
+                      className="w-full pl-8 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30"
+                    />
+                  </div>
+                  <div className="border border-gray-200 rounded-lg max-h-52 overflow-y-auto divide-y divide-gray-100">
+                    {(() => {
+                      const s = addModalLinkSearch.toLowerCase()
+                      const candidates = (result?.missingFromInvoice ?? []).filter(o => {
+                        if (o.order_type !== addModal.row.sectionType) return false
+                        if (!s) return true
+                        return o.docket_number?.toLowerCase().includes(s)
+                          || o.department?.name?.toLowerCase().includes(s)
+                          || o.staff_name?.toLowerCase().includes(s)
+                          || (o.order_items || []).some(it => it.item_name?.toLowerCase().includes(s))
+                      })
+                      if (candidates.length === 0) return <p className="px-3 py-4 text-xs text-gray-400 text-center">No unmatched "{ORDER_TYPE_LABELS[addModal.row.sectionType as OrderType] ?? addModal.row.sectionType}" orders in this period. Try the broader-search toggle, or create a new order.</p>
+                      return candidates.slice(0, 60).map(o => {
+                        const cost = computeOrderCost(o)
+                        const items = (o.order_items || []).map(it => `${it.quantity_sent}x ${it.item_name}`).join(', ')
+                        const sel = addModalLinkOrderId === o.id
+                        const priceGap = Math.abs(cost - addModal.row.invoiceLine.net) >= 0.02
+                        return (
+                          <button key={o.id} onClick={() => { setAddModalLinkOrderId(o.id); setAddModalLinkDocket(o.docket_number); setAddModalLinkUpdatePrice(priceGap) }}
+                            className={`w-full text-left px-3 py-2 text-xs hover:bg-blue-50 ${sel ? 'bg-blue-100' : ''}`}>
+                            <div className="flex justify-between font-medium">
+                              <span className="font-mono">#{o.docket_number}</span>
+                              <span>{'\u00a3'}{cost.toFixed(2)} {!priceGap ? '\u2713' : `(inv ${'\u00a3'}${addModal.row.invoiceLine.net.toFixed(2)})`}</span>
+                            </div>
+                            <div className="text-gray-500">{format(new Date(o.created_at), 'dd/MM/yy')}{' \u00b7 '}{o.department?.name || 'Unallocated'}{' \u00b7 '}{items || '\u2014'}</div>
+                          </button>
+                        )
+                      })
+                    })()}
+                  </div>
+
+                  {/* Once an order is picked: correct the ticket + optionally sync price */}
+                  {addModalLinkOrderId && (
+                    <div className="space-y-3 bg-blue-50/50 border border-blue-100 rounded-lg p-3">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Ticket / docket to record on this order</label>
+                        <input type="text" value={addModalLinkDocket} onChange={e => setAddModalLinkDocket(e.target.value)}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                        <p className="text-[10px] text-gray-500 mt-0.5">Correct it if the invoice ticket is wrong, or keep our docket {'\u2014'} the two are linked either way.</p>
+                      </div>
+                      {(() => {
+                        const t = orders.find(o => o.id === addModalLinkOrderId)
+                        const sysCost = t ? computeOrderCost(t) : 0
+                        const gap = Math.abs(sysCost - addModal.row.invoiceLine.net) >= 0.02
+                        if (!gap) return null
+                        return (
+                          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                            <input type="checkbox" checked={addModalLinkUpdatePrice} onChange={e => setAddModalLinkUpdatePrice(e.target.checked)} className="rounded" />
+                            Update this order&apos;s price {'\u00a3'}{sysCost.toFixed(2)} {'\u2192'} {'\u00a3'}{addModal.row.invoiceLine.net.toFixed(2)} (match the invoice)
+                          </label>
+                        )
+                      })()}
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Note (optional \u2014 why the ticket/room was wrong, for the audit trail)</label>
+                        <input type="text" value={addModalNote} onChange={e => setAddModalNote(e.target.value)}
+                          placeholder="e.g. Invoice shows ticket 7208 but our docket is 6208"
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* \u2500\u2500 CREATE MODE \u2500\u2500 */}
+              {addModalMode === 'create' && (<>
               {/* Editable docket number and date */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -2952,19 +3208,31 @@ export default function Reconciliation() {
                   ))}
                 </select>
               </div>
+              </>)}
 
               <div className="flex gap-3 pt-2">
                 <button onClick={() => setAddModal(null)} className="flex-1 px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
                   Cancel
                 </button>
-                <button
-                  onClick={handleAddToSystem}
-                  disabled={!addModalDept || addModalSaving}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                  {addModalSaving ? 'Adding...' : 'Add Order'}
-                </button>
+                {addModalMode === 'create' ? (
+                  <button
+                    onClick={handleAddToSystem}
+                    disabled={!addModalDept || addModalSaving}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                    {addModalSaving ? 'Adding...' : 'Add Order'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleLinkExisting}
+                    disabled={!addModalLinkOrderId || addModalSaving}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ArrowRightLeft className="w-4 h-4" />}
+                    {addModalSaving ? 'Linking...' : 'Link Order'}
+                  </button>
+                )}
               </div>
             </div>
           </div>
