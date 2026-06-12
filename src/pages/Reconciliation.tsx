@@ -237,42 +237,36 @@ function departmentItemsLabel(rows: ReconciliationRow[], deptName: string): stri
   }
 }
 
-function isHskLinenRow(row: ReconciliationRow, hskLinenNames: Set<string>): boolean {
-  // Check invoice line description and parsed items against catalogue HSK Linen names
-  const desc = (row.invoiceLine.description || '').toLowerCase()
-  for (const name of hskLinenNames) {
-    if (desc.includes(name)) return true
-  }
-  if (row.invoiceLine.items?.length) {
-    return row.invoiceLine.items.some(i => {
-      const itemLower = i.name.toLowerCase()
-      for (const name of hskLinenNames) {
-        if (itemLower.includes(name)) return true
-      }
-      return false
-    })
-  }
-  return false
+// A row counts as HSK linen ONLY when the matched system order is an hsk_linen order.
+// Never classify by item-name substrings: the hsk_linen catalogue contains generic names
+// like "Hoodie" that also appear in staff uniforms, which falsely split Main Kitchen /
+// Kitchen E20 Front into a phantom "Other (HSK Linen)" line.
+function isHskLinenRow(row: ReconciliationRow): boolean {
+  return row.order?.order_type === 'hsk_linen'
 }
 
 function buildDepartmentDisplayRows(
   breakdown: DepartmentBreakdown[],
-  allRows: ReconciliationRow[],
-  hskLinenNames: Set<string> = new Set()
+  allRows: ReconciliationRow[]
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
     // Check if this department has a mix of staff uniform and HSK linen items
     let uniformCount = 0, uniformInvNet = 0, uniformSysNet = 0
     let linenCount = 0, linenInvNet = 0, linenSysNet = 0
+    const linenItemQty = new Map<string, number>()
 
     for (const row of allRows) {
       const deptName = row.order?.department?.name || 'Unallocated'
       if (deptName !== dept.departmentName || row.status === 'not_found') continue
-      if (isHskLinenRow(row, hskLinenNames)) {
+      if (isHskLinenRow(row)) {
         linenCount++
         linenInvNet += row.invoiceLine.net
         linenSysNet += row.systemTotal
+        for (const it of row.order?.order_items ?? []) {
+          if (!it.item_name) continue
+          linenItemQty.set(it.item_name, (linenItemQty.get(it.item_name) || 0) + (it.quantity_sent ?? 0))
+        }
       } else {
         uniformCount++
         uniformInvNet += row.invoiceLine.net
@@ -298,6 +292,10 @@ function buildDepartmentDisplayRows(
       displayRows.push({
         departmentName: dept.departmentName,
         lineLabel: 'Other (HSK Linen)',
+        subDetail: Array.from(linenItemQty.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([name, qty]) => `${qty}x ${name}`)
+          .join(', ') || undefined,
         isTopUp: false,
         orderCount: linenCount,
         invoiceNet: +linenInvNet.toFixed(2),
@@ -321,6 +319,9 @@ function buildDepartmentDisplayRows(
       displayRows.push({
         departmentName: dept.departmentName,
         lineLabel: 'Minimum TopUp',
+        // Uniform TopUp lands 100% on Main Kitchen — it's the unutilised part of the
+        // weekly uniform minimum, i.e. still Staff Uniform spend, not a separate service.
+        subDetail: dept.departmentName === 'Main Kitchen' ? 'Unutilised weekly uniform minimum (counts as Staff Uniform)' : undefined,
         isTopUp: true,
         orderCount: 0,
         invoiceNet: dept.allocatedTopUp,
@@ -375,9 +376,13 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
       // 1) Explicit manual link (ref-key) wins over everything
       const refKey = `[ref:${line.ticket}|${line.date}|${line.net}]`
       let order = (byRef.get(refKey) ?? []).find(o => !matchedOrderIds.has(o.id)) ?? null
-      // 2) Issue 2: Pick first unclaimed order with this docket (canonicalised both sides)
+      // 2) Issue 2: Pick first unclaimed order with this docket (canonicalised both sides).
+      // Guest dockets are ROOM numbers; staff/napkin tickets are booklet numbers — the
+      // same digits mean different things, so a docket match must stay within the right
+      // family (otherwise staff ticket "0402" claims the room-402 guest order).
       if (!order) {
-        const docketCandidates = byDocket.get(canonicalDocket(line.ticket)) ?? []
+        const docketCandidates = (byDocket.get(canonicalDocket(line.ticket)) ?? []).filter(o =>
+          section.type === 'guest' ? o.order_type === 'guest_laundry' : o.order_type !== 'guest_laundry')
         order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
       }
       // 3) Guest lines: fall back to room-number match
@@ -498,7 +503,6 @@ export default function Reconciliation() {
   const [history, setHistory] = useState<SavedReconciliation[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [updatingPrices, setUpdatingPrices] = useState<Set<string>>(new Set())
-  const [hskLinenNames, setHskLinenNames] = useState<Set<string>>(new Set())
   const [broaderSearch, setBroaderSearch] = useState(false)
   const [deptBreakdownOpen, setDeptBreakdownOpen] = useState(true)
   const [uniformMinOpen, setUniformMinOpen] = useState(true)
@@ -508,17 +512,6 @@ export default function Reconciliation() {
   const [lastSavedRecId, setLastSavedRecId] = useState<string | null>(null)
   const [d140Saving, setD140Saving] = useState(false)
   const [d140Saved, setD140Saved] = useState(false)
-
-  // Fetch HSK Linen item names from catalogue (excluding bathrobes — they have their own invoice)
-  useEffect(() => {
-    supabase.from('item_catalogue').select('name').eq('category', 'hsk_linen').eq('is_active', true)
-      .then(({ data }) => {
-        if (data) {
-          const names = new Set(data.map((i: { name: string }) => i.name.toLowerCase()).filter(n => !n.includes('bathrobe')))
-          setHskLinenNames(names)
-        }
-      })
-  }, [])
 
   // Resolution tracking
   const [notFoundResolutions, setNotFoundResolutions] = useState<Record<string, Resolution>>({})
@@ -830,7 +823,7 @@ export default function Reconciliation() {
 
   const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
     if (!result) return []
-    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
+    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
   }, [result])
 
   // ── Price-discrepancy pattern detector ──
@@ -1242,7 +1235,7 @@ export default function Reconciliation() {
 
     let reportPath: string | null = null
     try {
-      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
+      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
       const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
         dateRange: w.dateRange,
         items: uniformMinSummary.ITEM_KEYS.map(k => ({
@@ -1484,7 +1477,7 @@ export default function Reconciliation() {
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
-    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, hskLinenNames)
+    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
       'Line': row.lineLabel,
@@ -2313,6 +2306,7 @@ export default function Reconciliation() {
               <tr key={i} className={`border-b border-gray-100 ${row.isTopUp ? 'bg-amber-50/20' : ''}`}>
                 <td className={`px-4 py-2.5 ${row.isTopUp ? 'pl-8 italic text-gray-500 text-xs' : 'font-medium'}`}>
                   {row.departmentName} {'\u2014'} {row.lineLabel}
+                  {row.subDetail && <div className="text-[10px] text-gray-400 font-normal mt-0.5">{row.subDetail}</div>}
                 </td>
                 <td className="px-4 py-2.5 text-right">{row.isTopUp && row.lineLabel === 'Minimum TopUp' ? '\u2014' : row.orderCount}</td>
                 <td className="px-4 py-2.5 text-right">{'\u00a3'}{row.invoiceNet.toFixed(2)}</td>

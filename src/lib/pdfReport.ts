@@ -7,6 +7,8 @@ import type { ParsedInvoice } from './invoiceParser'
 export interface DepartmentDisplayRow {
   departmentName: string
   lineLabel: string
+  /** Optional small-print under the line label (e.g. HSK item quantities, TopUp explanation) */
+  subDetail?: string
   isTopUp: boolean
   orderCount: number
   invoiceNet: number
@@ -194,9 +196,10 @@ export function generateReconciliationPdf(
   const deptBody: (string | { content: string; styles?: Record<string, any> })[][] = []
   for (const row of displayRows) {
     const isRealTopUp = row.isTopUp && row.lineLabel === 'Minimum TopUp'
-    const label = row.isTopUp
+    const baseLabel = row.isTopUp
       ? `    ${row.departmentName} \u2014 ${row.lineLabel}`
       : `${row.departmentName} \u2014 ${row.lineLabel}`
+    const label = row.subDetail ? `${baseLabel}\n${row.subDetail}` : baseLabel
 
     const rowCostNet = row.invoiceNet
     deptBody.push([
