@@ -1,15 +1,25 @@
 import { useState, useEffect, useMemo } from 'react'
-import { X, Send, AlertCircle, CheckCircle, FileText, Truck, Package, UtensilsCrossed, Loader2 } from 'lucide-react'
+import { X, Send, AlertCircle, CheckCircle, FileText, Truck, Package, UtensilsCrossed, Loader2, Mail } from 'lucide-react'
 import { format } from 'date-fns'
 import { supabase } from '../lib/supabase'
 import { logActivity } from '../hooks/useSessionActivity'
 import { showStatusToast } from './StatusToast'
 
-const REPORT_RECIPIENTS = [
-  'kunov.georgi@gmail.com',
-  'georgi@thestratford.com',
-  'set1000@hotmail.com',
-]
+/** Editable recipient list lives in the report_recipients table (shared with the
+ *  tablet — the edge function reads the same table for payload-less sends). */
+interface Recipient {
+  id: string
+  email: string
+}
+
+async function fetchRecipients(): Promise<Recipient[]> {
+  const { data } = await supabase
+    .from('report_recipients')
+    .select('id, email')
+    .eq('is_active', true)
+    .order('created_at')
+  return (data ?? []) as Recipient[]
+}
 
 interface ReportOrder {
   id: string
@@ -137,18 +147,23 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Live recipient list — managed on the Configuration page
+  const [recipients, setRecipients] = useState<Recipient[]>([])
+
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
-        const [received, sent, napkins, openSent] = await Promise.all([
+        const [received, sent, napkins, openSent, recips] = await Promise.all([
           fetchOrdersByStatus('received'),
           fetchOrdersByStatus('sent'),
           fetchTodaysNapkinReturns(),
           fetchOpenSentOrders(),
+          fetchRecipients(),
         ])
         if (!cancelled) {
           setData({ received, sent, napkins, openSent })
+          setRecipients(recips)
           setLoading(false)
         }
       } catch (err) {
@@ -161,6 +176,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
     })()
     return () => { cancelled = true }
   }, [])
+
 
   const outstanding = useMemo(() => data?.openSent ?? [], [data])
 
@@ -198,6 +214,9 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
         senderName = du?.name || du?.email || senderName
       }
 
+      const emails = recipients.map((r) => r.email)
+      if (emails.length === 0) throw new Error('No report recipients configured — add at least one on the Configuration page')
+
       // Send via Edge Function with the exact payload we previewed
       const { data: result, error: invokeError } = await supabase.functions.invoke('daily-report', {
         body: {
@@ -205,7 +224,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
           sentOrders: data.sent,
           outstandingOrders: data.openSent,
           napkinReturns: data.napkins,
-          recipients: REPORT_RECIPIENTS,
+          recipients: emails,
           senderName,
         },
       })
@@ -233,7 +252,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
         collected_order_ids: data.sent.map((o) => o.id),
         received_order_ids: data.received.map((o) => o.id),
         napkin_ledger_ids: data.napkins.map((n) => n.id),
-        email_recipients: REPORT_RECIPIENTS,
+        email_recipients: emails,
         send_result: result,
       })
       if (logError) {
@@ -253,7 +272,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
       })
       showStatusToast({
         customLabel: 'Daily report sent',
-        subtitle: `Emailed to ${REPORT_RECIPIENTS.length} recipient${REPORT_RECIPIENTS.length !== 1 ? 's' : ''}`,
+        subtitle: `Emailed to ${emails.length} recipient${emails.length !== 1 ? 's' : ''}`,
       })
 
       onClose()
@@ -423,9 +442,15 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
                 </PreviewSection>
               )}
 
-              {/* Recipients note */}
-              <div className="mt-4 px-3 py-2 bg-gray-50 dark:bg-gray-700/30 rounded-lg text-xs text-gray-500 dark:text-gray-400">
-                Will be emailed to: {REPORT_RECIPIENTS.join(', ')}
+              {/* Recipients note — list is managed on the Configuration page */}
+              <div className="mt-4 px-3 py-2 bg-gray-50 dark:bg-gray-700/30 rounded-lg text-xs text-gray-500 dark:text-gray-400 flex items-start gap-2">
+                <Mail className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <span>
+                  {recipients.length > 0
+                    ? <>Will be emailed to: {recipients.map((r) => r.email).join(', ')}</>
+                    : <span className="text-red-600 font-medium">No recipients configured — add some on the Configuration page before sending.</span>}
+                  {' '}<a href="#/configuration" className="underline hover:text-navy">Manage recipients</a>
+                </span>
               </div>
             </>
           )}
@@ -442,7 +467,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
           </button>
           <button
             onClick={handleSend}
-            disabled={loading || sending || !data}
+            disabled={loading || sending || !data || recipients.length === 0}
             className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-navy hover:bg-navy-light rounded-lg disabled:bg-gray-300 disabled:cursor-not-allowed"
           >
             {sending ? (

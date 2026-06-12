@@ -8,6 +8,7 @@ import UserManagement from './pages/Settings'
 import Catalogue from './pages/Catalogue'
 import Reconciliation from './pages/Reconciliation'
 import ReconciliationHistory from './pages/ReconciliationHistory'
+import Configuration from './pages/Configuration'
 import LinenPool from './pages/LinenPool'
 import Announcements from './pages/Announcements'
 import StatusToast from './components/StatusToast'
@@ -40,6 +41,7 @@ export default function App() {
             <Route path="/linen-pool" element={<LinenPool />} />
             <Route path="/reconciliation" element={<Reconciliation />} />
             <Route path="/reconciliation/history" element={<ReconciliationHistory />} />
+            <Route path="/configuration" element={<Configuration />} />
             <Route path="/announcements" element={<Announcements />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

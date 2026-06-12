@@ -24,7 +24,23 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
+// Last-resort fallback only — the live list is the report_recipients table,
+// managed from the web dashboard.
 const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
+
+async function fetchRecipients(): Promise<string[]> {
+  try {
+    const { data } = await supabase
+      .from("report_recipients")
+      .select("email")
+      .eq("is_active", true);
+    const emails = (data ?? []).map((r: any) => r.email).filter(Boolean);
+    if (emails.length > 0) return emails;
+  } catch (e) {
+    console.error("fetchRecipients failed, using fallback:", e);
+  }
+  return REPORT_EMAILS;
+}
 
 // Aging escalation for not-received tickets (normal turnaround is 1-2 days)
 const AGING_AMBER_DAYS = 3;
@@ -441,7 +457,7 @@ serve(async (req: Request) => {
 
     const recipients = (payload?.recipients && payload.recipients.length > 0)
       ? payload.recipients
-      : REPORT_EMAILS;
+      : await fetchRecipients();
 
     const reportHtml = buildDailyReport(receivedOrders, sentOrders, outstandingOrders, napkinReturns);
 
