@@ -274,47 +274,28 @@ function buildDepartmentDisplayRows(
       }
     }
 
-    const hasSubBreakdown = linenCount > 0 && uniformCount > 0
     const label = departmentItemsLabel(allRows, dept.departmentName)
 
-    if (hasSubBreakdown) {
-      // Split into two sub-rows instead of one main row to avoid double-counting
-      displayRows.push({
-        departmentName: dept.departmentName,
-        lineLabel: 'Staff Uniform',
-        isTopUp: false,
-        orderCount: uniformCount,
-        invoiceNet: +uniformInvNet.toFixed(2),
-        systemTotal: +uniformSysNet.toFixed(2),
-        difference: +(uniformInvNet - uniformSysNet).toFixed(2),
-        totalGross: +(uniformInvNet * 1.2).toFixed(2),
-      })
-      displayRows.push({
-        departmentName: dept.departmentName,
-        lineLabel: 'Other (HSK Linen)',
-        subDetail: Array.from(linenItemQty.entries())
-          .sort((a, b) => b[1] - a[1])
-          .map(([name, qty]) => `${qty}x ${name}`)
-          .join(', ') || undefined,
-        isTopUp: false,
-        orderCount: linenCount,
-        invoiceNet: +linenInvNet.toFixed(2),
-        systemTotal: +linenSysNet.toFixed(2),
-        difference: +(linenInvNet - linenSysNet).toFixed(2),
-        totalGross: +(linenInvNet * 1.2).toFixed(2),
-      })
-    } else {
-      displayRows.push({
-        departmentName: dept.departmentName,
-        lineLabel: label,
-        isTopUp: false,
-        orderCount: dept.orderCount,
-        invoiceNet: dept.invoiceNet,
-        systemTotal: dept.systemTotal,
-        difference: dept.difference,
-        totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
-      })
-    }
+    // One row per department. When the department mixes uniforms with HSK linen
+    // (e.g. Housekeeping), the linen content is shown as small print under the main
+    // line instead of a separate "Other (HSK Linen)" row — totals stay combined.
+    const linenDetail = linenCount > 0
+      ? `Incl. HSK Linen £${linenInvNet.toFixed(2)} (${linenCount} order${linenCount !== 1 ? 's' : ''})${
+          linenItemQty.size > 0
+            ? ': ' + Array.from(linenItemQty.entries()).sort((a, b) => b[1] - a[1]).map(([name, qty]) => `${qty}x ${name}`).join(', ')
+            : ''}`
+      : undefined
+    displayRows.push({
+      departmentName: dept.departmentName,
+      lineLabel: linenCount > 0 && uniformCount > 0 ? 'Staff Uniform' : label,
+      subDetail: linenDetail,
+      isTopUp: false,
+      orderCount: dept.orderCount,
+      invoiceNet: dept.invoiceNet,
+      systemTotal: dept.systemTotal,
+      difference: dept.difference,
+      totalGross: +(dept.invoiceNet * 1.2).toFixed(2),
+    })
     if (dept.allocatedTopUp > 0) {
       displayRows.push({
         departmentName: dept.departmentName,
@@ -1480,7 +1461,7 @@ export default function Reconciliation() {
     const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
-      'Line': row.lineLabel,
+      'Line': row.subDetail ? `${row.lineLabel} — ${row.subDetail}` : row.lineLabel,
       'Orders': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : row.orderCount,
       'Invoice NET (\u00a3)': +row.invoiceNet.toFixed(2),
       'System NET (\u00a3)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.systemTotal.toFixed(2),
