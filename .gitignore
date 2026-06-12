@@ -54,3 +54,4 @@ dist/
 # Supabase local config
 supabase/.gitignore
 supabase/config.toml
+supabase/.temp/
