@@ -1,14 +1,14 @@
 import { Fragment } from 'react'
 import { format, formatDistanceToNow, isToday, isYesterday } from 'date-fns'
 import StatusBadge from './StatusBadge'
-import { ORDER_TYPE_LABELS } from '../types'
-import type { Order, BulkEdits } from '../types'
+import { ORDER_TYPE_LABELS, ORDER_STATUS_LABELS } from '../types'
+import type { Order, OrderStatus, BulkEdits } from '../types'
 
 function lastModified(order: Order): { date: Date; label: string } | null {
   const logs = order.status_log
   if (logs && logs.length > 0) {
     const latest = logs.reduce((best, l) => new Date(l.created_at) > new Date(best.created_at) ? l : best)
-    return { date: new Date(latest.created_at), label: latest.status }
+    return { date: new Date(latest.created_at), label: ORDER_STATUS_LABELS[latest.status as OrderStatus] || latest.status }
   }
   if (order.updated_at) return { date: new Date(order.updated_at), label: 'updated' }
   return null
@@ -19,6 +19,23 @@ function formatLastMod(info: { date: Date; label: string } | null): string {
   if (isToday(info.date)) return formatDistanceToNow(info.date, { addSuffix: true })
   if (isYesterday(info.date)) return 'Yesterday ' + format(info.date, 'HH:mm')
   return format(info.date, 'dd MMM HH:mm')
+}
+
+/** Whole days an order has been at the laundry without coming back (status = sent). */
+export function daysAtLaundry(order: Order): number | null {
+  if (order.status !== 'sent') return null
+  const sentLogs = (order.status_log || []).filter((l) => l.status === 'sent')
+  const since = sentLogs.length > 0
+    ? sentLogs.reduce((b, l) => (new Date(l.created_at) > new Date(b.created_at) ? l : b)).created_at
+    : order.created_at
+  return Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000))
+}
+
+/** Aging escalation: amber at 3+ days, red at 7+ (normal turnaround is 1-2 days). */
+export function agingTone(days: number): 'red' | 'amber' | null {
+  if (days >= 7) return 'red'
+  if (days >= 3) return 'amber'
+  return null
 }
 
 /** Compute order cost from item-level prices (works for uniforms AND linens) */
@@ -183,7 +200,31 @@ export default function OrdersTable({
                         {cost != null ? `\u00a3${(cost * 1.2).toFixed(2)}` : '\u2014'}
                       </td>
                       <td className={`${TD} text-center`}>
-                        <StatusBadge status={order.status} />
+                        <div className="flex flex-col items-center gap-1">
+                          <StatusBadge status={order.status} />
+                          {(() => {
+                            const days = daysAtLaundry(order)
+                            const tone = days != null ? agingTone(days) : null
+                            if (days == null || !tone) return null
+                            return (
+                              <span className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold ${
+                                tone === 'red' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'
+                              }`}>
+                                {days}d at laundry
+                              </span>
+                            )
+                          })()}
+                          {order.status === 'received' && outstanding > 0 && (
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-red-100 text-red-700">
+                              Discrepancy
+                            </span>
+                          )}
+                          {order.parent_order_id && (
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-700">
+                              Outstanding ticket
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className={`${TD} text-gray-500 whitespace-nowrap`}>
                         {format(new Date(order.created_at), 'dd MMM yyyy HH:mm')}

@@ -1710,7 +1710,7 @@ export default function Reconciliation() {
         staff_name: row.invoiceLine.guestInfo?.replace(/[()]/g, '') || null,
         guest_name: orderType === 'guest_laundry' ? (row.invoiceLine.guestInfo?.replace(/[()]/g, '') || null) : null,
         room_number: orderType === 'guest_laundry' ? row.invoiceLine.ticket : null,
-        status: 'completed',
+        status: 'received',
         total_price: +row.invoiceLine.net.toFixed(2),
         notes: `Added from invoice reconciliation — ${invoice.invoiceNumber} [ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`,
         created_at: createdAt,
@@ -1751,7 +1751,7 @@ export default function Reconciliation() {
         }
         await supabase.from('order_status_log').insert({
           order_id: newOrder.id,
-          status: 'completed',
+          status: 'received',
           changed_by_name: userName,
           reason: `Added from invoice reconciliation — ${invoice.invoiceNumber}`,
         })

@@ -1,7 +1,9 @@
-import { useState } from 'react'
-import { X, Clock, Pencil, Save, XCircle, CheckCircle } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { X, Clock, Pencil, Save, XCircle, CheckCircle, AlertTriangle, ArrowUpRight } from 'lucide-react'
 import { format } from 'date-fns'
 import StatusBadge from './StatusBadge'
+import { supabase } from '../lib/supabase'
 import { ORDER_TYPE_LABELS, ORDER_STATUS_LABELS, ORDER_STATUS_COLORS } from '../types'
 import type { Order, OrderStatus, OrderItem, Department } from '../types'
 
@@ -16,30 +18,65 @@ interface OrderDetailProps {
 
 const STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   submitted: ['approved', 'rejected'],
-  approved: ['collected'],
+  approved: ['sent'],
   rejected: [],
-  collected: ['in_processing'],
-  in_processing: ['received'],
-  received: ['completed'],
-  completed: ['picked_up'],
-  picked_up: [],
+  sent: ['received'],
+  received: ['collected'],
+  collected: [],
+  expired: [],
 }
 
 const STATUS_ACTION_LABELS: Record<OrderStatus, string> = {
   submitted: 'Submit',
   approved: 'Approve',
   rejected: 'Reject',
-  collected: 'Mark Collected',
-  in_processing: 'Mark In Processing',
+  sent: 'Mark Sent to Laundry',
   received: 'Mark Received',
-  completed: 'Mark Returned',
-  picked_up: 'Mark Picked Up',
+  collected: 'Mark Collected by Owner',
+  expired: 'Mark Expired',
 }
 
 export default function OrderDetail({ order, departments, onClose, onStatusChange, onSave, onSaveItem }: OrderDetailProps) {
   const nextStatuses = STATUS_TRANSITIONS[order.status] || []
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const navigate = useNavigate()
+
+  // Related tickets from a partial receipt: the parent this was split from,
+  // and/or the outstanding child split off this one.
+  const [parentOrder, setParentOrder] = useState<Order | null>(null)
+  const [childOrder, setChildOrder] = useState<Order | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    setParentOrder(null)
+    setChildOrder(null)
+    ;(async () => {
+      if (order.parent_order_id) {
+        const { data } = await supabase
+          .from('orders')
+          .select('id, docket_number, status, parent_order_id')
+          .eq('id', order.parent_order_id)
+          .maybeSingle()
+        if (!cancelled && data) setParentOrder(data as Order)
+      }
+      const { data: child } = await supabase
+        .from('orders')
+        .select('id, docket_number, status, parent_order_id, order_items(*)')
+        .eq('parent_order_id', order.id)
+        .maybeSingle()
+      if (!cancelled && child) setChildOrder(child as Order)
+    })()
+    return () => { cancelled = true }
+  }, [order.id, order.parent_order_id])
+
+  const outstandingItems = (order.order_items || [])
+    .map((i) => ({ name: i.item_name, missing: (i.quantity_sent || 0) - (i.quantity_received ?? i.quantity_sent ?? 0) }))
+    .filter((i) => i.missing > 0)
+
+  function openRelated(id: string) {
+    onClose()
+    navigate(`/orders?open=${id}`)
+  }
 
   // Editable fields
   const [staffName, setStaffName] = useState(order.staff_name || '')
@@ -179,6 +216,45 @@ export default function OrderDetail({ order, departments, onClose, onStatusChang
                   </button>
                 ))}
               </div>
+            )}
+
+            {/* Partial-receipt discrepancy + linked tickets */}
+            {outstandingItems.length > 0 && (
+              <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+                <p className="text-sm font-semibold text-red-800 flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4" />
+                  Discrepancy — still awaiting:
+                </p>
+                <p className="text-sm text-red-700 mt-1">
+                  {outstandingItems.map((i) => `${i.missing}× ${i.name}`).join(', ')}
+                </p>
+              </div>
+            )}
+            {childOrder && (
+              <button
+                onClick={() => openRelated(childOrder.id)}
+                className="mt-2 w-full flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg p-3 text-left hover:bg-amber-100 transition-colors"
+              >
+                <span className="text-sm text-amber-800">
+                  Outstanding items split to follow-up ticket{' '}
+                  <span className="font-mono font-semibold">#{childOrder.docket_number}</span>
+                  {' '}({ORDER_STATUS_LABELS[childOrder.status] || childOrder.status})
+                </span>
+                <ArrowUpRight className="w-4 h-4 text-amber-600 shrink-0" />
+              </button>
+            )}
+            {order.parent_order_id && (
+              <button
+                onClick={() => parentOrder && openRelated(parentOrder.id)}
+                className="mt-2 w-full flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg p-3 text-left hover:bg-amber-100 transition-colors"
+              >
+                <span className="text-sm text-amber-800">
+                  Outstanding ticket — split from{' '}
+                  <span className="font-mono font-semibold">#{parentOrder?.docket_number || '…'}</span>
+                  {parentOrder ? ` (${ORDER_STATUS_LABELS[parentOrder.status] || parentOrder.status})` : ''}
+                </span>
+                <ArrowUpRight className="w-4 h-4 text-amber-600 shrink-0" />
+              </button>
             )}
           </div>
 

@@ -194,9 +194,9 @@ export function useOrders() {
         changed_by_name: userName,
       })
 
-      // When marking received/completed, auto-fill quantity_received for items
+      // When marking received, auto-fill quantity_received for items
       // that haven't been manually reconciled yet (null or 0)
-      if (status === 'received' || status === 'completed') {
+      if (status === 'received') {
         const { data: items } = await supabase
           .from('order_items')
           .select('id, quantity_sent, quantity_received')
@@ -312,8 +312,8 @@ export function useOrders() {
         changed_by_name: userName,
       })
 
-      // Auto-fill quantity_received when marking received/completed
-      if (status === 'received' || status === 'completed') {
+      // Auto-fill quantity_received when marking received
+      if (status === 'received') {
         const { data: items } = await supabase
           .from('order_items')
           .select('id, quantity_sent, quantity_received')

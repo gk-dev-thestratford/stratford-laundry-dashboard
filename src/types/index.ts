@@ -18,15 +18,19 @@ export interface CatalogueItem {
   sort_order: number
 }
 
+// Five-stage flow (renamed 2026-06-12 — staff found old names confusing):
+//   submitted -> approved -> sent (laundry company collected) -> received (back
+//   from laundry) -> collected (owner picked up). rejected/expired auxiliary.
+// Old names: sent = collected + in_processing; received = received + completed;
+//   collected = picked_up.
 export type OrderStatus =
   | 'submitted'
   | 'approved'
   | 'rejected'
-  | 'collected'
-  | 'in_processing'
+  | 'sent'
   | 'received'
-  | 'completed'
-  | 'picked_up'
+  | 'collected'
+  | 'expired'
 
 export type OrderType = 'uniform' | 'hsk_linen' | 'fnb_linen' | 'guest_laundry'
 
@@ -47,6 +51,8 @@ export interface Order {
   updated_at: string
   synced_at: string | null
   reconciliation_id: string | null
+  /** Set on outstanding child tickets created by a partial receipt — points at the original order */
+  parent_order_id: string | null
   // Joined
   department?: Department
   order_items?: OrderItem[]
@@ -84,28 +90,26 @@ export interface DashboardUser {
 
 // NOTE: key order matters — drives the visual order of status filter dropdowns,
 // the bulk-status dropdown, and the Activity panel category groups. Ordered to
-// match daily procedure: In Processing comes before Approved because staff
-// handle in-processing items (mark Received) before approved items (mark Collected).
+// match daily procedure: Sent comes before Approved because staff first mark
+// what came back (Sent -> Received), then send out approved items (Approved -> Sent).
 export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   submitted: 'Submitted',
-  in_processing: 'In Processing',
+  sent: 'Sent',
   rejected: 'Rejected',
-  collected: 'Collected',
   approved: 'Approved',
   received: 'Received',
-  completed: 'Returned',
-  picked_up: 'Picked Up',
+  collected: 'Collected',
+  expired: 'Expired',
 }
 
 export const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
   submitted: 'bg-blue-100 text-blue-800',
-  in_processing: 'bg-orange-100 text-orange-800',
+  sent: 'bg-orange-100 text-orange-800',
   rejected: 'bg-red-100 text-red-800',
-  collected: 'bg-yellow-100 text-yellow-800',
   approved: 'bg-green-100 text-green-800',
-  received: 'bg-purple-100 text-purple-800',
-  completed: 'bg-teal-100 text-teal-800',
-  picked_up: 'bg-gray-100 text-gray-800',
+  received: 'bg-teal-100 text-teal-800',
+  collected: 'bg-gray-100 text-gray-800',
+  expired: 'bg-slate-100 text-slate-500',
 }
 
 export const ORDER_TYPE_LABELS: Record<OrderType, string> = {

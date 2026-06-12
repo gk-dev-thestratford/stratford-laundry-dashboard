@@ -9,13 +9,11 @@ import type { OrderStatus } from '../types'
 // Workflow-priority order of category groups in the panel.
 const STATUS_GROUP_ORDER: OrderStatus[] = [
   'received',
-  'collected',
-  'in_processing',
+  'sent',
   'approved',
-  'picked_up',
+  'collected',
   'submitted',
   'rejected',
-  'completed',
 ]
 
 interface ActivityPanelProps {
@@ -140,7 +138,7 @@ export default function ActivityPanel({ enabled, onSendReport }: ActivityPanelPr
             <div className="flex flex-col items-center justify-center h-full text-center px-6 text-gray-400 dark:text-gray-500">
               <Sparkles className="w-8 h-8 mb-3 text-gray-300 dark:text-gray-600" />
               <p className="text-sm font-medium text-gray-600 dark:text-gray-400">No activity yet</p>
-              <p className="text-[11px] mt-1">Approve, collect, receive or save napkin returns and they'll appear here.</p>
+              <p className="text-[11px] mt-1">Approve, send, receive or save napkin returns and they'll appear here.</p>
             </div>
           ) : (
             <>

@@ -158,7 +158,7 @@ export default function Orders() {
 
     // Nudge: if 3+ orders just changed to a daily-report-relevant status and
     // no report has been sent today, ask if they want to send it now.
-    const reportRelevant: OrderStatus[] = ['collected', 'received']
+    const reportRelevant: OrderStatus[] = ['sent', 'received']
     if (
       targetIds.length >= 3 &&
       reportRelevant.includes(targetStatus) &&

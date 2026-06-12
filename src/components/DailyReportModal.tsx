@@ -32,18 +32,21 @@ interface NapkinReturn {
 }
 
 interface ReportData {
-  collected: ReportOrder[]
   received: ReportOrder[]
+  sent: ReportOrder[]
   napkins: NapkinReturn[]
+  openSent: OutstandingOrder[]
 }
 
-interface OutstandingItem {
+/** An order still at the laundry (status = sent) — the not-yet-received backlog */
+interface OutstandingOrder {
+  id: string
   docket: string
   department: string
-  item: string
-  sent: number
-  received: number
-  outstanding: number
+  name: string
+  days: number
+  isChild: boolean
+  items: { item: string; awaited: number }[]
 }
 
 interface DailyReportModalProps {
@@ -98,26 +101,34 @@ async function fetchTodaysNapkinReturns(): Promise<NapkinReturn[]> {
   return (data ?? []) as unknown as NapkinReturn[]
 }
 
-function extractOutstanding(received: ReportOrder[]): OutstandingItem[] {
-  const items: OutstandingItem[] = []
-  for (const o of received) {
-    for (const i of o.order_items || []) {
-      const sent = i.quantity_sent || 0
-      const recvd = i.quantity_received ?? 0
-      const out = sent - recvd
-      if (out > 0) {
-        items.push({
-          docket: o.docket_number,
-          department: o.departments?.name || '—',
-          item: i.item_name,
-          sent,
-          received: recvd,
-          outstanding: out,
-        })
+/** All orders currently at the laundry (status = sent), regardless of day, with aging. */
+async function fetchOpenSentOrders(): Promise<OutstandingOrder[]> {
+  const { data } = await supabase
+    .from('orders')
+    .select('id, docket_number, staff_name, guest_name, parent_order_id, created_at, departments(name), order_items(item_name, quantity_sent, quantity_received), status_log:order_status_log(status, created_at)')
+    .eq('status', 'sent')
+    .order('created_at', { ascending: true })
+  return (data ?? [])
+    .map((o: any) => {
+      const sentLogs = (o.status_log || []).filter((l: any) => l.status === 'sent')
+      const since = sentLogs.length > 0
+        ? sentLogs.reduce((b: any, l: any) => (new Date(l.created_at) > new Date(b.created_at) ? l : b)).created_at
+        : o.created_at
+      const days = Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000))
+      const items = (o.order_items || [])
+        .map((i: any) => ({ item: i.item_name, awaited: (i.quantity_sent || 0) - (i.quantity_received ?? 0) }))
+        .filter((i: { awaited: number }) => i.awaited > 0)
+      return {
+        id: o.id,
+        docket: o.docket_number,
+        department: o.departments?.name || '—',
+        name: o.staff_name || o.guest_name || '—',
+        days,
+        isChild: !!o.parent_order_id,
+        items,
       }
-    }
-  }
-  return items
+    })
+    .filter((o: OutstandingOrder) => o.items.length > 0)
 }
 
 export default function DailyReportModal({ onClose }: DailyReportModalProps) {
@@ -130,13 +141,14 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
     let cancelled = false
     ;(async () => {
       try {
-        const [collected, received, napkins] = await Promise.all([
-          fetchOrdersByStatus('collected'),
+        const [received, sent, napkins, openSent] = await Promise.all([
           fetchOrdersByStatus('received'),
+          fetchOrdersByStatus('sent'),
           fetchTodaysNapkinReturns(),
+          fetchOpenSentOrders(),
         ])
         if (!cancelled) {
-          setData({ collected, received, napkins })
+          setData({ received, sent, napkins, openSent })
           setLoading(false)
         }
       } catch (err) {
@@ -150,21 +162,18 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
     return () => { cancelled = true }
   }, [])
 
-  const outstanding = useMemo(
-    () => (data ? extractOutstanding(data.received) : []),
-    [data],
-  )
+  const outstanding = useMemo(() => data?.openSent ?? [], [data])
 
   const counts = useMemo(() => {
-    if (!data) return { collected: 0, collectedItems: 0, received: 0, receivedItems: 0, napkins: 0, napkinsQty: 0 }
-    const collectedItems = data.collected.reduce(
+    if (!data) return { sent: 0, sentItems: 0, received: 0, receivedItems: 0, napkins: 0, napkinsQty: 0 }
+    const sentItems = data.sent.reduce(
       (s, o) => s + (o.order_items || []).reduce((ss, i) => ss + (i.quantity_sent || 0), 0), 0)
     const receivedItems = data.received.reduce(
       (s, o) => s + (o.order_items || []).reduce((ss, i) => ss + (i.quantity_received ?? 0), 0), 0)
     const napkinsQty = data.napkins.reduce((s, n) => s + (n.quantity || 0), 0)
     return {
-      collected: data.collected.length,
-      collectedItems,
+      sent: data.sent.length,
+      sentItems,
       received: data.received.length,
       receivedItems,
       napkins: data.napkins.length,
@@ -172,8 +181,8 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
     }
   }, [data])
 
-  const outstandingTotal = outstanding.reduce((s, i) => s + i.outstanding, 0)
-  const isEmpty = !loading && data && counts.collected === 0 && counts.received === 0 && counts.napkins === 0
+  const outstandingTotal = outstanding.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0)
+  const isEmpty = !loading && data && counts.sent === 0 && counts.received === 0 && counts.napkins === 0
 
   async function handleSend() {
     if (!data || sending) return
@@ -192,8 +201,9 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
       // Send via Edge Function with the exact payload we previewed
       const { data: result, error: invokeError } = await supabase.functions.invoke('daily-report', {
         body: {
-          collectedOrders: data.collected,
           receivedOrders: data.received,
+          sentOrders: data.sent,
+          outstandingOrders: data.openSent,
           napkinReturns: data.napkins,
           recipients: REPORT_RECIPIENTS,
           senderName,
@@ -210,15 +220,17 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
       }
 
       // Audit row in daily_report_log
+      // NOTE: collected_* audit columns now hold the "sent to laundry" figures
+      // (status renamed collected -> sent on 2026-06-12; columns kept for history).
       const { error: logError } = await supabase.from('daily_report_log').insert({
         sent_by_user_id: user?.id ?? null,
         sent_by_name: senderName,
-        collected_count: counts.collected,
+        collected_count: counts.sent,
         received_count: counts.received,
         outstanding_qty: outstandingTotal,
         napkin_returns_count: counts.napkins,
         napkin_returns_qty: counts.napkinsQty,
-        collected_order_ids: data.collected.map((o) => o.id),
+        collected_order_ids: data.sent.map((o) => o.id),
         received_order_ids: data.received.map((o) => o.id),
         napkin_ledger_ids: data.napkins.map((n) => n.id),
         email_recipients: REPORT_RECIPIENTS,
@@ -233,7 +245,7 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
       logActivity({
         type: 'daily_report_sent',
         reportSummary: {
-          collected: counts.collected,
+          collected: counts.sent,
           received: counts.received,
           outstanding: outstandingTotal,
           napkins: counts.napkinsQty,
@@ -309,16 +321,16 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
                 />
                 <SummaryCard
                   icon={<Truck className="w-4 h-4" />}
-                  label="Collected"
-                  value={counts.collected}
-                  detail={`${counts.collectedItems} items`}
-                  color={counts.collected > 0 ? 'orange' : 'gray'}
+                  label="Sent"
+                  value={counts.sent}
+                  detail={`${counts.sentItems} items`}
+                  color={counts.sent > 0 ? 'orange' : 'gray'}
                 />
                 <SummaryCard
                   icon={<AlertCircle className="w-4 h-4" />}
                   label="Outstanding"
                   value={outstandingTotal}
-                  detail={`${outstanding.length} item${outstanding.length !== 1 ? 's' : ''}`}
+                  detail={`${outstanding.length} ticket${outstanding.length !== 1 ? 's' : ''} at laundry`}
                   color={outstandingTotal > 0 ? 'red' : 'green'}
                 />
                 <SummaryCard
@@ -336,47 +348,54 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
                 </div>
               )}
 
-              {/* Outstanding section */}
-              {outstanding.length > 0 && (
-                <PreviewSection title="Outstanding Items" tone="red" countLabel={`${outstandingTotal} item${outstandingTotal !== 1 ? 's' : ''} not returned`}>
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-left text-gray-500 border-b border-gray-200 dark:border-gray-700">
-                        <th className="py-1.5 pr-2">Docket</th>
-                        <th className="py-1.5 pr-2">Dept</th>
-                        <th className="py-1.5 pr-2">Item</th>
-                        <th className="py-1.5 pr-2 text-right">Sent</th>
-                        <th className="py-1.5 pr-2 text-right">Recv</th>
-                        <th className="py-1.5 text-right text-red-600">Out</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {outstanding.map((o, i) => (
-                        <tr key={i} className="border-b border-gray-100 dark:border-gray-700/50 last:border-0">
-                          <td className="py-1.5 pr-2 font-mono">#{o.docket}</td>
-                          <td className="py-1.5 pr-2">{o.department}</td>
-                          <td className="py-1.5 pr-2">{o.item}</td>
-                          <td className="py-1.5 pr-2 text-right">{o.sent}</td>
-                          <td className="py-1.5 pr-2 text-right">{o.received}</td>
-                          <td className="py-1.5 text-right font-bold text-red-600">{o.outstanding}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </PreviewSection>
-              )}
-
-              {/* Received section */}
+              {/* 1. Received today — what actually came back */}
               {data.received.length > 0 && (
                 <PreviewSection title="Received Today" tone="teal" countLabel={`${counts.received} order${counts.received !== 1 ? 's' : ''}, ${counts.receivedItems} items`}>
                   <OrderListTable orders={data.received} mode="received" />
                 </PreviewSection>
               )}
 
-              {/* Collected section */}
-              {data.collected.length > 0 && (
-                <PreviewSection title="Collected Today" tone="orange" countLabel={`${counts.collected} order${counts.collected !== 1 ? 's' : ''}, ${counts.collectedItems} items`}>
-                  <OrderListTable orders={data.collected} mode="collected" />
+              {/* 2. Sent today — what the laundry company collected */}
+              {data.sent.length > 0 && (
+                <PreviewSection title="Sent to Laundry Today" tone="orange" countLabel={`${counts.sent} order${counts.sent !== 1 ? 's' : ''}, ${counts.sentItems} items`}>
+                  <OrderListTable orders={data.sent} mode="sent" />
+                </PreviewSection>
+              )}
+
+              {/* 3. Outstanding — everything still at the laundry, with aging */}
+              {outstanding.length > 0 && (
+                <PreviewSection title="Still at Laundry (Not Received)" tone="red" countLabel={`${outstandingTotal} item${outstandingTotal !== 1 ? 's' : ''} across ${outstanding.length} ticket${outstanding.length !== 1 ? 's' : ''}`}>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-gray-500 border-b border-gray-200 dark:border-gray-700">
+                        <th className="py-1.5 pr-2">Docket</th>
+                        <th className="py-1.5 pr-2">Dept</th>
+                        <th className="py-1.5 pr-2">Name</th>
+                        <th className="py-1.5 pr-2">Awaiting</th>
+                        <th className="py-1.5 text-right">Days</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {outstanding.map((o) => (
+                        <tr key={o.id} className="border-b border-gray-100 dark:border-gray-700/50 last:border-0">
+                          <td className="py-1.5 pr-2 font-mono">
+                            #{o.docket}
+                            {o.isChild && <span className="ml-1 text-[10px] text-amber-600 font-sans">(partial)</span>}
+                          </td>
+                          <td className="py-1.5 pr-2">{o.department}</td>
+                          <td className="py-1.5 pr-2">{o.name}</td>
+                          <td className="py-1.5 pr-2 text-gray-600">
+                            {o.items.map((i) => `${i.awaited}× ${i.item}`).join(', ')}
+                          </td>
+                          <td className={`py-1.5 text-right font-bold ${
+                            o.days >= 7 ? 'text-red-600' : o.days >= 3 ? 'text-amber-600' : 'text-gray-500'
+                          }`}>
+                            {o.days}d{o.days >= 7 ? ' ⚠' : ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </PreviewSection>
               )}
 
@@ -503,7 +522,7 @@ function PreviewSection({ title, tone, countLabel, children }: {
   )
 }
 
-function OrderListTable({ orders, mode }: { orders: ReportOrder[]; mode: 'received' | 'collected' }) {
+function OrderListTable({ orders, mode }: { orders: ReportOrder[]; mode: 'received' | 'sent' }) {
   const showReceived = mode === 'received'
   return (
     <table className="w-full text-xs">

@@ -247,7 +247,7 @@ export default function Reports() {
   }, [filtered])
 
   const visibleDiscrepancies = discrepancyFilter === 'discrepancies'
-    ? discrepancies.filter(o => ['received', 'completed'].includes(o.status))
+    ? discrepancies.filter(o => o.status === 'received')
     : discrepancies
 
   function toggleExpand(id: string) {

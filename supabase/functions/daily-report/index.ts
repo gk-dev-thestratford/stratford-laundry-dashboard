@@ -1,12 +1,19 @@
 // Supabase Edge Function: Combined daily laundry report
-// Sends ONE email with: Outstanding Items, Collected, Received, Napkin Returns
+// Sends ONE email, in operational order:
+//   1. Received Today (what came back from the laundry)
+//   2. Sent to Laundry Today (what the laundry company collected)
+//   3. Still at Laundry (ALL not-yet-received tickets, with days-outstanding aging)
+//   4. Napkin Returns
+//
+// Status model (renamed 2026-06-12): submitted -> approved -> sent -> received -> collected.
 //
 // Two modes:
 //  1. Cron / no body  — fetches today's data from the DB and emails it.
 //  2. Manual / POST with JSON body — uses the provided payload as-is so the email
-//     matches exactly what the dashboard previewed. Body shape:
-//       { collectedOrders, receivedOrders, napkinReturns,
+//     matches exactly what the dashboard/tablet previewed. Body shape:
+//       { receivedOrders, sentOrders, outstandingOrders, napkinReturns,
 //         recipients?: string[], senderName?: string }
+//     (legacy field `collectedOrders` is accepted as an alias for sentOrders)
 //
 // Deploy: supabase functions deploy daily-report
 
@@ -18,6 +25,10 @@ const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
 const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
+
+// Aging escalation for not-received tickets (normal turnaround is 1-2 days)
+const AGING_AMBER_DAYS = 3;
+const AGING_RED_DAYS = 7;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -116,141 +127,60 @@ async function fetchTodaysNapkinReturns() {
   return data || [];
 }
 
-// ── Extract item-level outstanding from received orders ──
-interface OutstandingItem {
+// ── The not-received backlog: every order still at the laundry, with aging ──
+interface OutstandingOrder {
+  id: string;
   docket: string;
   department: string;
-  item: string;
-  sent: number;
-  received: number;
-  outstanding: number;
+  name: string;
+  days: number;
+  isChild: boolean; // partial-receipt follow-up ticket
+  items: { item: string; awaited: number }[];
 }
 
-function extractOutstandingItems(receivedOrders: any[]): OutstandingItem[] {
-  const items: OutstandingItem[] = [];
-  for (const order of receivedOrders) {
-    for (const i of order.order_items || []) {
-      const sent = i.quantity_sent || 0;
-      const received = i.quantity_received ?? 0;
-      const outstanding = sent - received;
-      if (outstanding > 0) {
-        items.push({
-          docket: order.docket_number,
-          department: order.departments?.name || "—",
-          item: i.item_name,
-          sent,
-          received,
-          outstanding,
-        });
-      }
-    }
-  }
-  return items;
+async function fetchOpenSentOrders(): Promise<OutstandingOrder[]> {
+  const { data } = await supabase
+    .from("orders")
+    .select("id, docket_number, staff_name, guest_name, parent_order_id, created_at, departments(name), order_items(item_name, quantity_sent, quantity_received), status_log:order_status_log(status, created_at)")
+    .eq("status", "sent")
+    .order("created_at", { ascending: true });
+
+  return (data ?? [])
+    .map((o: any) => {
+      const sentLogs = (o.status_log || []).filter((l: any) => l.status === "sent");
+      const since = sentLogs.length > 0
+        ? sentLogs.reduce((b: any, l: any) => (new Date(l.created_at) > new Date(b.created_at) ? l : b)).created_at
+        : o.created_at;
+      const days = Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000));
+      const items = (o.order_items || [])
+        .map((i: any) => ({ item: i.item_name, awaited: (i.quantity_sent || 0) - (i.quantity_received ?? 0) }))
+        .filter((i: { awaited: number }) => i.awaited > 0);
+      return {
+        id: o.id,
+        docket: o.docket_number,
+        department: o.departments?.name || "—",
+        name: o.staff_name || o.guest_name || "—",
+        days,
+        isChild: !!o.parent_order_id,
+        items,
+      };
+    })
+    .filter((o: OutstandingOrder) => o.items.length > 0);
 }
 
 // ── Build combined daily report HTML ──
 function buildDailyReport(
-  collectedOrders: any[],
   receivedOrders: any[],
-  outstandingItems: OutstandingItem[],
+  sentOrders: any[],
+  outstandingOrders: OutstandingOrder[],
   napkinReturns: any[],
 ) {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
-  const hasOutstanding = outstandingItems.length > 0;
-  const totalOutstanding = outstandingItems.reduce((s, i) => s + i.outstanding, 0);
+  const totalOutstanding = outstandingOrders.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0);
+  const hasOutstanding = totalOutstanding > 0;
+  const hasOverdue = outstandingOrders.some((o) => o.days >= AGING_AMBER_DAYS);
 
-  // ── Section: Outstanding Items (RED, only if any) ──
-  let outstandingSection = "";
-  if (hasOutstanding) {
-    const outstandingRows = outstandingItems.map((item, idx) => `
-      <tr style="border-bottom:1px solid #eee;background:${idx % 2 === 0 ? "#fff" : "#FFF8F8"}">
-        <td style="padding:8px;font-family:monospace;font-size:12px">#${item.docket}</td>
-        <td style="padding:8px">${item.department}</td>
-        <td style="padding:8px">${item.item}</td>
-        <td style="padding:8px;text-align:center">${item.sent}</td>
-        <td style="padding:8px;text-align:center">${item.received}</td>
-        <td style="padding:8px;text-align:center;color:#C62828;font-weight:bold">${item.outstanding}</td>
-      </tr>`).join("");
-
-    outstandingSection = `
-      <div style="background:#C62828;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          Outstanding Items — ${totalOutstanding} item${totalOutstanding !== 1 ? "s" : ""} not returned
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:#FFF8F8">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#C62828;color:white">
-            <th style="padding:8px;text-align:left">Docket</th>
-            <th style="padding:8px;text-align:left">Department</th>
-            <th style="padding:8px;text-align:left">Item</th>
-            <th style="padding:8px;text-align:center">Sent</th>
-            <th style="padding:8px;text-align:center">Received</th>
-            <th style="padding:8px;text-align:center">Outstanding</th>
-          </tr>
-          ${outstandingRows}
-          <tr style="background:#FFEBEE;font-weight:bold;border-top:2px solid #EF9A9A">
-            <td style="padding:8px" colspan="3">Total Outstanding</td>
-            <td style="padding:8px;text-align:center">${outstandingItems.reduce((s, i) => s + i.sent, 0)}</td>
-            <td style="padding:8px;text-align:center">${outstandingItems.reduce((s, i) => s + i.received, 0)}</td>
-            <td style="padding:8px;text-align:center;color:#C62828">${totalOutstanding}</td>
-          </tr>
-        </table>
-      </div>`;
-  }
-
-  // ── Section: Collected Today (orange) ──
-  let collectedSection = "";
-  if (collectedOrders.length > 0) {
-    const collectedGrandTotal = collectedOrders.reduce((sum: number, o: any) =>
-      sum + (o.order_items || []).reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0), 0);
-
-    const collectedRows = collectedOrders.map((order: any) => {
-      const items = order.order_items || [];
-      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
-      const totalQty = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
-      return `<tr style="border-bottom:1px solid #eee">
-        <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
-        <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
-        <td style="padding:10px 8px">${order.departments?.name || "—"}</td>
-        <td style="padding:10px 8px">${itemsDesc || "—"}</td>
-        <td style="padding:10px 8px;text-align:center;font-weight:bold">${totalQty}</td>
-      </tr>`;
-    }).join("");
-
-    collectedSection = `
-      <div style="background:#E65100;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          Collected Today — ${collectedOrders.length} order${collectedOrders.length !== 1 ? "s" : ""}, ${collectedGrandTotal} items
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#1B2A4A;color:white">
-            <th style="padding:10px 8px;text-align:left">Docket</th>
-            <th style="padding:10px 8px;text-align:left">Name</th>
-            <th style="padding:10px 8px;text-align:left">Department</th>
-            <th style="padding:10px 8px;text-align:left">Items</th>
-            <th style="padding:10px 8px;text-align:center">Qty</th>
-          </tr>
-          ${collectedRows}
-          <tr style="background:#f5f5f5;font-weight:bold">
-            <td colspan="4" style="padding:10px 8px;text-align:right">Total Items</td>
-            <td style="padding:10px 8px;text-align:center">${collectedGrandTotal}</td>
-          </tr>
-        </table>
-      </div>`;
-  } else {
-    collectedSection = `
-      <div style="background:#E65100;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">Collected Today</p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <p style="margin:0;color:#999;font-style:italic">No collections today.</p>
-      </div>`;
-  }
-
-  // ── Section: Received Today (teal) ──
+  // ── Section 1: Received Today (teal) ──
   let receivedSection = "";
   if (receivedOrders.length > 0) {
     let grandSent = 0;
@@ -281,7 +211,7 @@ function buildDailyReport(
     receivedSection = `
       <div style="background:#00838F;padding:12px 24px">
         <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          Received Today — ${receivedOrders.length} order${receivedOrders.length !== 1 ? "s" : ""} (${grandSent} sent, ${grandReceived} received${grandOutstanding > 0 ? `, ${grandOutstanding} outstanding` : ""})
+          1. Received Today — ${receivedOrders.length} order${receivedOrders.length !== 1 ? "s" : ""} (${grandSent} sent, ${grandReceived} received${grandOutstanding > 0 ? `, ${grandOutstanding} short` : ""})
         </p>
       </div>
       <div style="padding:16px 24px;background:white">
@@ -293,7 +223,7 @@ function buildDailyReport(
             <th style="padding:10px 8px;text-align:left">Items</th>
             <th style="padding:10px 8px;text-align:center">Sent</th>
             <th style="padding:10px 8px;text-align:center">Received</th>
-            <th style="padding:10px 8px;text-align:center">Outstanding</th>
+            <th style="padding:10px 8px;text-align:center">Short</th>
           </tr>
           ${receivedRows}
           <tr style="background:#f5f5f5;font-weight:bold">
@@ -307,14 +237,108 @@ function buildDailyReport(
   } else {
     receivedSection = `
       <div style="background:#00838F;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">Received Today</p>
+        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">1. Received Today</p>
       </div>
       <div style="padding:16px 24px;background:white">
         <p style="margin:0;color:#999;font-style:italic">No items received today.</p>
       </div>`;
   }
 
-  // ── Section: Napkin Returns (purple, conditional) ──
+  // ── Section 2: Sent to Laundry Today (orange) ──
+  let sentSection = "";
+  if (sentOrders.length > 0) {
+    const sentGrandTotal = sentOrders.reduce((sum: number, o: any) =>
+      sum + (o.order_items || []).reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0), 0);
+
+    const sentRows = sentOrders.map((order: any) => {
+      const items = order.order_items || [];
+      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
+      const totalQty = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
+      return `<tr style="border-bottom:1px solid #eee">
+        <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
+        <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
+        <td style="padding:10px 8px">${order.departments?.name || "—"}</td>
+        <td style="padding:10px 8px">${itemsDesc || "—"}</td>
+        <td style="padding:10px 8px;text-align:center;font-weight:bold">${totalQty}</td>
+      </tr>`;
+    }).join("");
+
+    sentSection = `
+      <div style="background:#E65100;padding:12px 24px">
+        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
+          2. Sent to Laundry Today — ${sentOrders.length} order${sentOrders.length !== 1 ? "s" : ""}, ${sentGrandTotal} items
+        </p>
+      </div>
+      <div style="padding:16px 24px;background:white">
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <tr style="background:#1B2A4A;color:white">
+            <th style="padding:10px 8px;text-align:left">Docket</th>
+            <th style="padding:10px 8px;text-align:left">Name</th>
+            <th style="padding:10px 8px;text-align:left">Department</th>
+            <th style="padding:10px 8px;text-align:left">Items</th>
+            <th style="padding:10px 8px;text-align:center">Qty</th>
+          </tr>
+          ${sentRows}
+          <tr style="background:#f5f5f5;font-weight:bold">
+            <td colspan="4" style="padding:10px 8px;text-align:right">Total Items</td>
+            <td style="padding:10px 8px;text-align:center">${sentGrandTotal}</td>
+          </tr>
+        </table>
+      </div>`;
+  } else {
+    sentSection = `
+      <div style="background:#E65100;padding:12px 24px">
+        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">2. Sent to Laundry Today</p>
+      </div>
+      <div style="padding:16px 24px;background:white">
+        <p style="margin:0;color:#999;font-style:italic">Nothing sent to the laundry today.</p>
+      </div>`;
+  }
+
+  // ── Section 3: Still at Laundry — the full not-received backlog with aging ──
+  let outstandingSection = "";
+  if (outstandingOrders.length > 0) {
+    const outstandingRows = outstandingOrders.map((o, idx) => {
+      const ageColour = o.days >= AGING_RED_DAYS ? "#C62828" : o.days >= AGING_AMBER_DAYS ? "#E65100" : "#666";
+      const ageFlag = o.days >= AGING_RED_DAYS ? " ⚠ OVERDUE" : o.days >= AGING_AMBER_DAYS ? " ⚠" : "";
+      const awaitedDesc = o.items.map((i) => `${i.awaited}x ${i.item}`).join(", ");
+      return `
+      <tr style="border-bottom:1px solid #eee;background:${idx % 2 === 0 ? "#fff" : "#FFF8F8"}">
+        <td style="padding:8px;font-family:monospace;font-size:12px">#${o.docket}${o.isChild ? ' <span style="color:#E65100;font-size:10px">(partial)</span>' : ""}</td>
+        <td style="padding:8px">${o.department}</td>
+        <td style="padding:8px">${o.name}</td>
+        <td style="padding:8px">${awaitedDesc}</td>
+        <td style="padding:8px;text-align:center;color:${ageColour};font-weight:bold">${o.days}d${ageFlag}</td>
+      </tr>`;
+    }).join("");
+
+    outstandingSection = `
+      <div style="background:#C62828;padding:12px 24px">
+        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
+          3. Still at Laundry — ${totalOutstanding} item${totalOutstanding !== 1 ? "s" : ""} across ${outstandingOrders.length} ticket${outstandingOrders.length !== 1 ? "s" : ""} not yet received
+        </p>
+      </div>
+      <div style="padding:16px 24px;background:#FFF8F8">
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <tr style="background:#C62828;color:white">
+            <th style="padding:8px;text-align:left">Docket</th>
+            <th style="padding:8px;text-align:left">Department</th>
+            <th style="padding:8px;text-align:left">Name</th>
+            <th style="padding:8px;text-align:left">Awaiting</th>
+            <th style="padding:8px;text-align:center">Days Out</th>
+          </tr>
+          ${outstandingRows}
+        </table>
+        <p style="margin:12px 0 0;font-size:11px;color:#999">Days Out = days since the ticket was sent to the laundry. ⚠ from ${AGING_AMBER_DAYS} days, ⚠ OVERDUE from ${AGING_RED_DAYS} days.</p>
+      </div>`;
+  } else {
+    outstandingSection = `
+      <div style="background:#2E7D32;padding:12px 24px">
+        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">3. Still at Laundry — nothing outstanding ✓</p>
+      </div>`;
+  }
+
+  // ── Section 4: Napkin Returns (purple, conditional) ──
   let napkinSection = "";
   if (napkinReturns.length > 0) {
     const napkinTotal = napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0);
@@ -329,7 +353,7 @@ function buildDailyReport(
     napkinSection = `
       <div style="background:#6A1B9A;padding:12px 24px">
         <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          Napkin Returns Today — ${napkinTotal} napkin${napkinTotal !== 1 ? "s" : ""} returned
+          4. Napkin Returns Today — ${napkinTotal} napkin${napkinTotal !== 1 ? "s" : ""} returned
         </p>
       </div>
       <div style="padding:16px 24px;background:white">
@@ -350,6 +374,13 @@ function buildDailyReport(
   }
 
   // ── Assemble full report ──
+  const bannerColour = hasOverdue ? "#C62828" : hasOutstanding ? "#E65100" : "#2E7D32";
+  const bannerText = hasOverdue
+    ? "Action Required — Overdue Items at Laundry"
+    : hasOutstanding
+      ? "Items Still at Laundry"
+      : "All Clear — Nothing Outstanding";
+
   return `
     <div style="font-family:sans-serif;max-width:750px;margin:0 auto;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
       <div style="background:#1B2A4A;padding:24px;text-align:center">
@@ -357,13 +388,13 @@ function buildDailyReport(
         <p style="color:#C9A84C;margin:6px 0 0;font-size:12px;letter-spacing:1px">Daily Laundry Report</p>
       </div>
 
-      <div style="background:${hasOutstanding ? "#C62828" : "#2E7D32"};padding:14px 24px;text-align:center">
-        <h2 style="color:white;margin:0;font-size:18px">${hasOutstanding ? "Action Required — Outstanding Items" : "All Clear — No Outstanding Items"} — ${today}</h2>
+      <div style="background:${bannerColour};padding:14px 24px;text-align:center">
+        <h2 style="color:white;margin:0;font-size:18px">${bannerText} — ${today}</h2>
       </div>
 
-      ${outstandingSection}
-      ${collectedSection}
       ${receivedSection}
+      ${sentSection}
+      ${outstandingSection}
       ${napkinSection}
 
       <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
@@ -375,8 +406,11 @@ function buildDailyReport(
 }
 
 interface ManualPayload {
-  collectedOrders?: any[];
   receivedOrders?: any[];
+  sentOrders?: any[];
+  /** Legacy alias for sentOrders (pre-2026-06-12 dashboards) */
+  collectedOrders?: any[];
+  outstandingOrders?: OutstandingOrder[];
   napkinReturns?: any[];
   recipients?: string[];
   senderName?: string;
@@ -400,22 +434,23 @@ serve(async (req: Request) => {
     const payload = await readPayload(req);
 
     // Mode selection: payload data wins; otherwise fetch today's from DB.
-    const collectedOrders = payload?.collectedOrders ?? await fetchTodaysOrders("collected");
     const receivedOrders = payload?.receivedOrders ?? await fetchTodaysOrders("received");
+    const sentOrders = payload?.sentOrders ?? payload?.collectedOrders ?? await fetchTodaysOrders("sent");
+    const outstandingOrders = payload?.outstandingOrders ?? await fetchOpenSentOrders();
     const napkinReturns = payload?.napkinReturns ?? await fetchTodaysNapkinReturns();
-    const outstandingItems = extractOutstandingItems(receivedOrders);
 
     const recipients = (payload?.recipients && payload.recipients.length > 0)
       ? payload.recipients
       : REPORT_EMAILS;
 
-    const reportHtml = buildDailyReport(collectedOrders, receivedOrders, outstandingItems, napkinReturns);
+    const reportHtml = buildDailyReport(receivedOrders, sentOrders, outstandingOrders, napkinReturns);
 
     const today = new Date().toLocaleDateString("en-GB", { timeZone: "Europe/London" });
+    const totalOutstanding = outstandingOrders.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0);
     const parts: string[] = [];
-    if (collectedOrders.length > 0) parts.push(`${collectedOrders.length} collected`);
     if (receivedOrders.length > 0) parts.push(`${receivedOrders.length} received`);
-    if (outstandingItems.length > 0) parts.push(`${outstandingItems.reduce((s, i) => s + i.outstanding, 0)} outstanding`);
+    if (sentOrders.length > 0) parts.push(`${sentOrders.length} sent`);
+    if (totalOutstanding > 0) parts.push(`${totalOutstanding} outstanding`);
     if (napkinReturns.length > 0) parts.push(`${napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0)} napkins`);
 
     const senderTag = payload?.senderName ? ` — sent by ${payload.senderName}` : "";
