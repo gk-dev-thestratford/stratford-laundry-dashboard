@@ -42,12 +42,13 @@ class AdminNotifier extends StateNotifier<AdminState> {
     return rows.map((r) => AdminUser.fromMap(r)).toList();
   }
 
-  Future<bool> login(String adminId, String adminName, String pin, {bool canDeleteOrders = false, bool canRejectOrders = false}) async {
+  Future<bool> login(String adminId, String adminName, String pin, {bool canDeleteOrders = false, bool canRejectOrders = false, bool canSendReport = true}) async {
     final valid = await DatabaseService.instance.verifyPin(adminId, pin);
     if (valid) {
       // Try to fetch fresh permissions from Supabase (with timeout so login isn't blocked)
       bool deletePermission = canDeleteOrders;
       bool rejectPermission = canRejectOrders;
+      bool sendReportPermission = canSendReport;
       try {
         final remoteAdmins = await SupabaseService.instance
             .fetchAdminUsers()
@@ -56,6 +57,8 @@ class AdminNotifier extends StateNotifier<AdminState> {
         if (match.isNotEmpty) {
           deletePermission = match.first['can_delete_orders'] == true;
           rejectPermission = match.first['can_reject_orders'] == true;
+          // Default true when the server row predates the column
+          sendReportPermission = match.first['can_send_report'] != false;
           // Also update local DB while we have fresh data
           await DatabaseService.instance.syncAdminUsers(remoteAdmins);
         }
@@ -64,7 +67,7 @@ class AdminNotifier extends StateNotifier<AdminState> {
       }
 
       state = AdminState(
-        currentAdmin: AdminUser(id: adminId, name: adminName, canDeleteOrders: deletePermission, canRejectOrders: rejectPermission),
+        currentAdmin: AdminUser(id: adminId, name: adminName, canDeleteOrders: deletePermission, canRejectOrders: rejectPermission, canSendReport: sendReportPermission),
         isAuthenticated: true,
         lastActivity: DateTime.now(),
       );

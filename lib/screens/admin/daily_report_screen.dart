@@ -14,10 +14,22 @@ import '../../widgets/thumbs_up_confirmation.dart';
 /// email will contain, with an explicit "Send Report" button.
 ///
 /// Sections (operational order, mirrors supabase/functions/daily-report):
-///   1. Received Today        — orders with a 'received' status log today
-///   2. Sent to Laundry Today — orders with a 'sent' status log today
-///   3. Still at Laundry      — the FULL backlog of status='sent' orders, aged
-///   4. Napkin Returns Today  — linen_ledger 'in' entries today
+///   1. Received Today        — fully received tickets ('received' log today)
+///   2. Partially Received    — 'received' log today but non-napkin items short
+///   3. Sent to Laundry Today — orders with a 'sent' status log today
+///   4. Still at Laundry      — the FULL backlog of status='sent' orders, aged
+///   5. Napkin Returns Today  — linen_ledger 'in' entries today
+///
+/// Pool-tracked napkins (AppConstants.isPoolTracked) are balanced via the
+/// linen pool, NOT per-ticket: napkin LINES are excluded from item counts
+/// and napkin-ONLY tickets are excluded from sections 1–4 — they only appear
+/// in the napkin section. The server-side email builder applies the same rule.
+///
+/// On wide/landscape screens the sections render as a 2-column grid
+/// (Received | Partial, Sent | Still at Laundry, Napkins full-width); on
+/// narrow/portrait they fall back to the vertical list.
+///
+/// Requires the can_send_report permission — admins without it are denied.
 ///
 /// All data comes from the LOCAL database (offline-first). Sending pushes
 /// pending local work to Supabase first, then invokes the edge function with
@@ -55,7 +67,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
 
   bool _isLoading = true;
   bool _isSending = false;
+  /// Fully received today (non-napkin lines complete).
   List<Map<String, dynamic>> _receivedToday = [];
+  /// 'received' log today but at least one non-napkin item came back short
+  /// (these spawned a child outstanding ticket).
+  List<Map<String, dynamic>> _partialToday = [];
   List<Map<String, dynamic>> _sentToday = [];
   List<_BacklogRow> _backlog = [];
   List<Map<String, dynamic>> _napkinReturns = [];
@@ -69,6 +85,15 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     super.initState();
     _loadData();
   }
+
+  /// Pool-tracked napkin line — excluded from per-ticket counts everywhere.
+  static bool _isNapkinLine(Map<String, dynamic> item) =>
+      AppConstants.isPoolTracked(item['item_name'] as String? ?? '');
+
+  /// Napkin-only tickets live in the napkin section, not the order sections.
+  /// (Bag-only tickets with no items are NOT napkin-only.)
+  static bool _isNapkinOnly(List<Map<String, dynamic>> items) =>
+      items.isNotEmpty && items.every(_isNapkinLine);
 
   Future<void> _loadData() async {
     final db = DatabaseService.instance;
@@ -89,6 +114,24 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     }.toList();
     final itemsByOrder = await db.getOrderItemsByOrderIds(allIds);
 
+    // Split received into fully vs partially received (non-napkin lines
+    // only); napkin-only tickets are excluded from both.
+    final receivedFull = <Map<String, dynamic>>[];
+    final receivedPartial = <Map<String, dynamic>>[];
+    for (final order in received) {
+      final items = itemsByOrder[order['id'] as String] ?? [];
+      if (_isNapkinOnly(items)) continue;
+      final isPartial = items.where((i) => !_isNapkinLine(i)).any((i) =>
+          (i['quantity_received'] as int? ?? 0) <
+          (i['quantity_sent'] as int? ?? 0));
+      (isPartial ? receivedPartial : receivedFull).add(order);
+    }
+
+    // Sent today — napkin-only tickets excluded (pool ledger covers them).
+    final sentFiltered = sent
+        .where((o) => !_isNapkinOnly(itemsByOrder[o['id'] as String] ?? []))
+        .toList();
+
     // Aging: days since the latest 'sent' log (fallback created_at)
     final sentDates = await db.getLatestStatusLogDates(
       backlogOrders.map((o) => o['id'] as String).toList(),
@@ -99,9 +142,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     for (final order in backlogOrders) {
       final orderId = order['id'] as String;
       final items = itemsByOrder[orderId] ?? [];
+      if (_isNapkinOnly(items)) continue;
       final awaitedParts = <String>[];
       int awaitedQty = 0;
       for (final item in items) {
+        if (_isNapkinLine(item)) continue; // pool-tracked, never awaited
         final awaited = (item['quantity_sent'] as int? ?? 0) -
             (item['quantity_received'] as int? ?? 0);
         if (awaited > 0) {
@@ -141,8 +186,9 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
 
     if (mounted) {
       setState(() {
-        _receivedToday = received;
-        _sentToday = sent;
+        _receivedToday = receivedFull;
+        _partialToday = receivedPartial;
+        _sentToday = sentFiltered;
         _backlog = backlog;
         _napkinReturns = napkinReturns;
         _itemsByOrder = itemsByOrder;
@@ -173,6 +219,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
         title: const Text('Send Daily Report?'),
         content: Text(
           'Send daily report? ${_receivedToday.length} received, '
+          '${_partialToday.length} partially received, '
           '${_sentToday.length} sent, $_stillAtLaundryQty items still at '
           'laundry, $_napkinQty napkins — will be emailed to the laundry '
           'company and management.',
@@ -246,6 +293,13 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Permission gate: admins without can_send_report never see this screen
+    // (the dashboard hides the entry points; this denies direct navigation).
+    final admin = ref.watch(adminProvider);
+    if (admin.currentAdmin?.canSendReport == false) {
+      return _buildDeniedScaffold();
+    }
+
     return Scaffold(
       backgroundColor: AppColors.offWhite,
       body: Column(
@@ -256,31 +310,135 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                 ? const Center(child: CircularProgressIndicator())
                 : RefreshIndicator(
                     onRefresh: _loadData,
-                    child: SingleChildScrollView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.all(AppSpacing.lg),
-                      child: Center(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 900),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              _buildReceivedSection(),
-                              const SizedBox(height: AppSpacing.lg),
-                              _buildSentSection(),
-                              const SizedBox(height: AppSpacing.lg),
-                              _buildBacklogSection(),
-                              const SizedBox(height: AppSpacing.lg),
-                              _buildNapkinSection(),
-                              const SizedBox(height: AppSpacing.xl),
-                            ],
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        // Side-by-side grid on wide/landscape screens;
+                        // vertical list fallback on narrow/portrait.
+                        final isWide = constraints.maxWidth >= 700 &&
+                            MediaQuery.of(context).orientation ==
+                                Orientation.landscape;
+                        return SingleChildScrollView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          padding: const EdgeInsets.all(AppSpacing.lg),
+                          child: Center(
+                            child: ConstrainedBox(
+                              constraints:
+                                  const BoxConstraints(maxWidth: 1100),
+                              child: isWide
+                                  ? _buildGridLayout()
+                                  : _buildVerticalLayout(),
+                            ),
                           ),
-                        ),
-                      ),
+                        );
+                      },
                     ),
                   ),
           ),
           if (!_isLoading) _buildSendBar(),
+        ],
+      ),
+    );
+  }
+
+  /// 2-column grid: Received | Partially Received, Sent | Still at Laundry,
+  /// then Napkins full-width.
+  Widget _buildGridLayout() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(child: _buildReceivedSection()),
+              const SizedBox(width: AppSpacing.lg),
+              Expanded(child: _buildPartialSection()),
+            ],
+          ),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(child: _buildSentSection()),
+              const SizedBox(width: AppSpacing.lg),
+              Expanded(child: _buildBacklogSection()),
+            ],
+          ),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        _buildNapkinSection(),
+        const SizedBox(height: AppSpacing.xl),
+      ],
+    );
+  }
+
+  Widget _buildVerticalLayout() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildReceivedSection(),
+        const SizedBox(height: AppSpacing.lg),
+        _buildPartialSection(),
+        const SizedBox(height: AppSpacing.lg),
+        _buildSentSection(),
+        const SizedBox(height: AppSpacing.lg),
+        _buildBacklogSection(),
+        const SizedBox(height: AppSpacing.lg),
+        _buildNapkinSection(),
+        const SizedBox(height: AppSpacing.xl),
+      ],
+    );
+  }
+
+  /// Shown when an admin without can_send_report reaches this route directly.
+  Widget _buildDeniedScaffold() {
+    return Scaffold(
+      backgroundColor: AppColors.offWhite,
+      body: Column(
+        children: [
+          _buildHeader(),
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.lock_outline_rounded,
+                      size: 56, color: AppColors.grey400),
+                  const SizedBox(height: AppSpacing.md),
+                  Text(
+                    'You don\'t have permission to send the daily report',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: AppTextStyles.titleSize,
+                        fontWeight: AppTextStyles.medium,
+                        color: AppColors.grey700),
+                  ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Text(
+                    'Ask a manager to enable "Can send report" for your account.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: AppTextStyles.labelSize,
+                        color: AppColors.grey500),
+                  ),
+                  const SizedBox(height: AppSpacing.lg),
+                  ElevatedButton.icon(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.arrow_back_rounded,
+                        size: AppSizes.iconSizeSm),
+                    label: const Text('Back to dashboard'),
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.navy,
+                        foregroundColor: AppColors.white),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -445,15 +603,29 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     );
   }
 
+  /// Item description for a ticket — napkin lines excluded (pool-tracked).
   String _itemsDesc(String orderId) {
-    final items = _itemsByOrder[orderId] ?? [];
+    final items = (_itemsByOrder[orderId] ?? [])
+        .where((i) => !_isNapkinLine(i))
+        .toList();
     if (items.isEmpty) return '—';
     return items
         .map((i) => '${i['quantity_sent']}× ${i['item_name']}')
         .join(', ');
   }
 
-  // ── 1. Received Today ──
+  /// Non-napkin (sent, received) totals for a ticket.
+  (int, int) _nonNapkinTotals(String orderId) {
+    final items = (_itemsByOrder[orderId] ?? [])
+        .where((i) => !_isNapkinLine(i));
+    final sent =
+        items.fold<int>(0, (s, i) => s + (i['quantity_sent'] as int? ?? 0));
+    final received = items.fold<int>(
+        0, (s, i) => s + (i['quantity_received'] as int? ?? 0));
+    return (sent, received);
+  }
+
+  // ── 1. Received Today (fully) ──
 
   Widget _buildReceivedSection() {
     return _sectionCard(
@@ -464,12 +636,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       emptyMessage: 'Nothing received today.',
       children: _receivedToday.map((order) {
         final orderId = order['id'] as String;
-        final items = _itemsByOrder[orderId] ?? [];
-        final totalSent = items.fold<int>(
-            0, (s, i) => s + (i['quantity_sent'] as int? ?? 0));
-        final totalReceived = items.fold<int>(
-            0, (s, i) => s + (i['quantity_received'] as int? ?? 0));
-        final short = totalSent - totalReceived;
+        final (totalSent, totalReceived) = _nonNapkinTotals(orderId);
         return _reportRow(
           leading: _docketBadge('${order['docket_number']}'),
           name: order['staff_name'] as String? ??
@@ -488,24 +655,8 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                       fontWeight: AppTextStyles.medium,
                       color: AppColors.grey700)),
               const SizedBox(height: 2),
-              if (short > 0)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.sm, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: AppColors.error.withValues(alpha: 0.12),
-                    borderRadius: AppRadius.smallBR,
-                  ),
-                  child: Text('$short short',
-                      style: TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: AppTextStyles.captionSize,
-                          fontWeight: AppTextStyles.bold,
-                          color: AppColors.error)),
-                )
-              else
-                Icon(Icons.check_circle_rounded,
-                    size: AppSizes.iconSizeSm, color: AppColors.success),
+              Icon(Icons.check_circle_rounded,
+                  size: AppSizes.iconSizeSm, color: AppColors.success),
             ],
           ),
         );
@@ -513,20 +664,67 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     );
   }
 
-  // ── 2. Sent to Laundry Today ──
+  // ── 2. Partially Received (spawned a follow-up outstanding ticket) ──
+
+  Widget _buildPartialSection() {
+    final partialColor = Colors.amber.shade800;
+    return _sectionCard(
+      title: '2 · Partially Received',
+      countLabel: '${_partialToday.length} order${_partialToday.length == 1 ? '' : 's'}',
+      color: partialColor,
+      icon: Icons.rule_rounded,
+      emptyMessage: 'No partial receipts today.',
+      children: _partialToday.map((order) {
+        final orderId = order['id'] as String;
+        final (totalSent, totalReceived) = _nonNapkinTotals(orderId);
+        final awaiting = (_itemsByOrder[orderId] ?? [])
+            .where((i) => !_isNapkinLine(i))
+            .map((i) {
+              final short = (i['quantity_sent'] as int? ?? 0) -
+                  (i['quantity_received'] as int? ?? 0);
+              return short > 0 ? '$short× ${i['item_name']}' : null;
+            })
+            .whereType<String>()
+            .join(', ');
+        return _reportRow(
+          leading: _docketBadge('${order['docket_number']}'),
+          name: order['staff_name'] as String? ??
+              order['guest_name'] as String? ??
+              '—',
+          department: order['department_name'] as String? ?? '—',
+          detail: awaiting.isEmpty ? null : 'awaiting $awaiting',
+          detailColor: AppColors.error,
+          trailing: Container(
+            padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm, vertical: 2),
+            decoration: BoxDecoration(
+              color: partialColor.withValues(alpha: 0.12),
+              borderRadius: AppRadius.smallBR,
+            ),
+            child: Text('$totalReceived of $totalSent',
+                style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: AppTextStyles.captionSize,
+                    fontWeight: AppTextStyles.bold,
+                    color: partialColor)),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  // ── 3. Sent to Laundry Today ──
 
   Widget _buildSentSection() {
     return _sectionCard(
-      title: '2 · Sent to Laundry Today',
+      title: '3 · Sent to Laundry Today',
       countLabel: '${_sentToday.length} order${_sentToday.length == 1 ? '' : 's'}',
       color: AppColors.statusSent,
       icon: Icons.local_shipping_rounded,
       emptyMessage: 'Nothing sent to the laundry today.',
       children: _sentToday.map((order) {
         final orderId = order['id'] as String;
-        final items = _itemsByOrder[orderId] ?? [];
-        final totalQty = items.fold<int>(
-            0, (s, i) => s + (i['quantity_sent'] as int? ?? 0));
+        final (totalQty, _) = _nonNapkinTotals(orderId);
         return _reportRow(
           leading: _docketBadge('${order['docket_number']}'),
           name: order['staff_name'] as String? ??
@@ -545,11 +743,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     );
   }
 
-  // ── 3. Still at Laundry (full backlog with aging) ──
+  // ── 4. Still at Laundry (full backlog with aging) ──
 
   Widget _buildBacklogSection() {
     return _sectionCard(
-      title: '3 · Still at Laundry',
+      title: '4 · Still at Laundry',
       countLabel: _backlog.isEmpty
           ? 'all clear'
           : '$_stillAtLaundryQty item${_stillAtLaundryQty == 1 ? '' : 's'} / ${_backlog.length} ticket${_backlog.length == 1 ? '' : 's'}',
@@ -594,7 +792,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
 
   Widget _buildNapkinSection() {
     return _sectionCard(
-      title: '4 · Napkin Returns Today',
+      title: '5 · Napkin Returns Today',
       countLabel: '$_napkinQty napkin${_napkinQty == 1 ? '' : 's'}',
       color: AppColors.gold,
       icon: Icons.dining,

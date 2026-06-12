@@ -105,7 +105,7 @@ class SupabaseService {
 
   Future<List<Map<String, dynamic>>> fetchAdminUsers() async {
     if (!isInitialized) return [];
-    return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders, can_reject_orders');
+    return await _client!.from('admin_users').select('id, name, pin_hash, is_active, can_delete_orders, can_reject_orders, can_send_report');
   }
 
   // ── Announcements ──

@@ -312,13 +312,16 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     });
   }
 
-  Future<void> _bulkSend() async {
+  /// Approved tab bulk "Add (N)": marks the selected tickets 'sent'
+  /// immediately (they join today's report collection). The daily report
+  /// EMAIL is only sent later via the panel's "Preview & Send Report".
+  Future<void> _bulkAddToSent() async {
     if (_selectedOrderIds.isEmpty) return;
     final db = DatabaseService.instance;
 
     // Workflow gate: the daily procedure is receive-first. If nothing has been
     // received today AND there are open 'sent' tickets that could have been
-    // received, confirm before sending — a soft nudge, never a hard block.
+    // received, confirm before adding — a soft nudge, never a hard block.
     final receivedToday =
         await db.hasStatusLogToday(AppConstants.statusReceived);
     if (!receivedToday && await db.hasOpenSentOrders()) {
@@ -329,7 +332,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
           title: const Text('Receive First?'),
           content: const Text(
             'Nothing has been received today yet — the daily procedure is to '
-            'record received items first. Send anyway?',
+            'record received items first. Add anyway?',
           ),
           actions: [
             TextButton(
@@ -340,7 +343,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
               onPressed: () => Navigator.pop(ctx, true),
               style: ElevatedButton.styleFrom(
                   backgroundColor: AppColors.statusSent),
-              child: const Text('Send anyway'),
+              child: const Text('Add anyway'),
             ),
           ],
         ),
@@ -367,7 +370,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
-      _showStatusSnackBar(count == 1 ? '1 order sent to laundry' : '$count orders sent to laundry');
+      _showStatusSnackBar(count == 1
+          ? '1 ticket added — sent to laundry'
+          : '$count tickets added — sent to laundry');
     }
 
     for (final orderId in sentIds) {
@@ -387,6 +392,69 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       final finalStatus = order?['status'] ?? AppConstants.statusSent;
       await db.addToSyncQueue('orders', orderId, 'update',
           jsonEncode({'id': orderId, 'status': finalStatus}));
+    }
+
+    // Push immediately and WAIT for sync to complete
+    await SyncService.instance.pushPendingAndWait();
+    _panelKey.currentState?.refresh();
+  }
+
+  /// Sent tab bulk "Add (N)": marks each selected ticket as FULLY received —
+  /// every item gets quantity_received = quantity_sent (napkins included,
+  /// same auto-full treatment as the receive dialog), status → 'received'.
+  /// Partial receipts stay on the per-ticket "Receive" button.
+  Future<void> _bulkReceiveAll() async {
+    if (_selectedOrderIds.isEmpty) return;
+    final db = DatabaseService.instance;
+    final count = _selectedOrderIds.length;
+    final admin = ref.read(adminProvider).currentAdmin;
+    final uuid = const Uuid();
+    final now = DateTime.now().toIso8601String();
+
+    // Optimistic UI
+    final receivedIds = _selectedOrderIds.toSet();
+    setState(() {
+      _orders = _orders.where((o) => !receivedIds.contains(o['id'])).toList();
+      _selectedOrderIds.clear();
+      final currentStatus = _statusForCurrentTab();
+      if (currentStatus != null && _counts.containsKey(currentStatus)) {
+        _counts[currentStatus] = (_counts[currentStatus]! - count).clamp(0, 999999);
+      }
+      _counts[AppConstants.statusReceived] =
+          (_counts[AppConstants.statusReceived] ?? 0) + count;
+    });
+
+    if (mounted) {
+      ref.read(adminProvider.notifier).refreshActivity();
+      _showStatusSnackBar(count == 1
+          ? '1 ticket added — all items received'
+          : '$count tickets added — all items received');
+    }
+
+    for (final orderId in receivedIds) {
+      // Full receipt: every item received in the quantity it was sent.
+      final items = await db.getOrderItems(orderId);
+      if (items.isNotEmpty) {
+        final fullReceipt = <String, int>{
+          for (final item in items)
+            item['id'] as String: item['quantity_sent'] as int? ?? 0,
+        };
+        await db.updateReceivedQuantities(orderId, fullReceipt);
+      }
+
+      await db.updateOrderStatus(orderId, AppConstants.statusReceived);
+      await db.insertStatusLog({
+        'id': uuid.v4(),
+        'order_id': orderId,
+        'status': AppConstants.statusReceived,
+        'changed_by': admin?.id,
+        'changed_by_name': admin?.name,
+        'reason': 'All items received',
+        'created_at': now,
+      });
+
+      await db.addToSyncQueue('orders', orderId, 'update',
+          jsonEncode({'id': orderId, 'status': AppConstants.statusReceived}));
     }
 
     // Push immediately and WAIT for sync to complete
@@ -726,6 +794,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                           final label = entry.value;
                           final isNapkinTab = idx == _kNapkinReturns;
                           final isReportTab = idx == _kReport;
+                          // The Report pill is hidden for admins without the
+                          // can_send_report permission.
+                          if (isReportTab &&
+                              !(admin.currentAdmin?.canSendReport ?? true)) {
+                            return const SizedBox.shrink();
+                          }
                           // Gold "special" pills navigate to their own screen
                           // instead of switching tabs.
                           final isNapkinTabOrReport = isNapkinTab || isReportTab;
@@ -834,29 +908,41 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                 Expanded(
                   child: Column(children: _buildBodyContent(isLandscape)),
                 ),
-                TodayReportPanel(
-                  key: _panelKey,
-                  // Approved-tab selection shows as "ready to send" ghost
-                  // chips under SENT today before Send is pressed.
-                  selectedDockets: _isApprovedTab
-                      ? _orders
-                          .where((o) => _selectedOrderIds.contains(o['id']))
-                          .map((o) => '${o['docket_number']}')
-                          .toList()
-                      : const [],
-                  onOpenReport: () {
-                    ref.read(adminProvider.notifier).refreshActivity();
-                    context.push('/admin/daily-report').then((_) {
-                      _loadData(silent: true);
-                    });
-                  },
-                  onLogNapkins: () {
-                    ref.read(adminProvider.notifier).refreshActivity();
-                    context.push('/admin/napkin-returns').then((_) {
-                      _loadData(silent: true);
-                    });
-                  },
-                ),
+                // Admins without can_send_report never see the panel —
+                // not even the collapsed tab.
+                if (admin.currentAdmin?.canSendReport ?? true)
+                  TodayReportPanel(
+                    key: _panelKey,
+                    // Approved-tab selection shows as "ready to add" ghost
+                    // chips in the Sent Today card before Add is pressed.
+                    selectedDockets: _isApprovedTab
+                        ? _orders
+                            .where((o) => _selectedOrderIds.contains(o['id']))
+                            .map((o) => '${o['docket_number']}')
+                            .toList()
+                        : const [],
+                    // Sent-tab selection shows as ghost chips in the
+                    // Received Today card (bulk Add = fully received).
+                    selectedReceiveDockets: _isSentTab
+                        ? _orders
+                            .where((o) => _selectedOrderIds.contains(o['id']))
+                            .map((o) => '${o['docket_number']}')
+                            .toList()
+                        : const [],
+                    adminName: admin.currentAdmin?.name,
+                    onOpenReport: () {
+                      ref.read(adminProvider.notifier).refreshActivity();
+                      context.push('/admin/daily-report').then((_) {
+                        _loadData(silent: true);
+                      });
+                    },
+                    onLogNapkins: () {
+                      ref.read(adminProvider.notifier).refreshActivity();
+                      context.push('/admin/napkin-returns').then((_) {
+                        _loadData(silent: true);
+                      });
+                    },
+                  ),
               ],
             ),
           ),
@@ -955,8 +1041,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                 ),
               ),
             ),
-          // Bulk select bar for Approved tab
-          if (_isApprovedTab && _orders.isNotEmpty && !_isLoading)
+          // Bulk select bar — Approved tab: Add (→ sent to laundry);
+          // Sent tab: Add (→ fully received). Same pattern, different verb
+          // under the hood.
+          if ((_isApprovedTab || _isSentTab) && _orders.isNotEmpty && !_isLoading)
             Padding(
               padding: EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.xs),
               child: Row(
@@ -972,18 +1060,22 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                   SizedBox(width: AppSpacing.sm),
                   Text(
                     _selectedOrderIds.isEmpty
-                        ? 'Select All for Sending'
+                        ? (_isApprovedTab
+                            ? 'Select all to add to today\'s report'
+                            : 'Select all fully-returned tickets')
                         : '${_selectedOrderIds.length} selected',
                     style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: AppColors.grey700),
                   ),
                   const Spacer(),
                   if (_selectedOrderIds.isNotEmpty)
                     ElevatedButton.icon(
-                      onPressed: _bulkSend,
-                      icon: Icon(Icons.local_shipping_rounded, size: AppSizes.iconSizeSm),
-                      label: Text('Send (${_selectedOrderIds.length})'),
+                      onPressed: _isApprovedTab ? _bulkAddToSent : _bulkReceiveAll,
+                      icon: Icon(Icons.playlist_add_rounded, size: AppSizes.iconSizeSm),
+                      label: Text('Add (${_selectedOrderIds.length})'),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: AppColors.statusSent,
+                        backgroundColor: _isApprovedTab
+                            ? AppColors.statusSent
+                            : AppColors.statusReceived,
                         foregroundColor: AppColors.white,
                         padding: EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
                         textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
@@ -1071,7 +1163,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       daysUntilExpiry: daysUntilExpiry,
       daysSinceSent: daysSinceSent,
       showActions: _isPendingTab,
-      showCheckbox: _isApprovedTab,
+      showCheckbox: _isApprovedTab || _isSentTab,
       isSelected: _selectedOrderIds.contains(orderId),
       showReturnToPending: _isApprovedTab || _isRejectedTab,
       showReceiveAction: _isSentTab,

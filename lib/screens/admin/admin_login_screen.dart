@@ -33,6 +33,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
   String? _selectedAdminName;
   bool _selectedCanDelete = false;
   bool _selectedCanReject = false;
+  bool _selectedCanSendReport = true;
   Color _selectedAdminColor = _adminColors[0];
   String _pin = '';
   bool _isLoading = true;
@@ -88,6 +89,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
       _pin,
       canDeleteOrders: _selectedCanDelete,
       canRejectOrders: _selectedCanReject,
+      canSendReport: _selectedCanSendReport,
     );
     if (success) {
       if (mounted) context.go('/admin/dashboard');
@@ -175,6 +177,7 @@ class _AdminLoginScreenState extends ConsumerState<AdminLoginScreen> {
                 _selectedAdminName = admin.name;
                 _selectedCanDelete = admin.canDeleteOrders;
                 _selectedCanReject = admin.canRejectOrders;
+                _selectedCanSendReport = admin.canSendReport;
                 _selectedAdminColor = color;
                 _pin = '';
                 _error = null;

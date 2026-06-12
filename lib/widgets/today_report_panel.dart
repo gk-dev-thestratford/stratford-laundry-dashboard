@@ -1,28 +1,44 @@
+import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:uuid/uuid.dart';
 import '../config/constants.dart';
 import '../services/database_service.dart';
+import '../services/sync_service.dart';
 import '../theme/app_theme.dart';
 import 'thumbs_up_confirmation.dart';
 
 /// Right-side "Today's Report" panel for the admin dashboard.
 ///
-/// Guides the daily procedure top-to-bottom:
-///   1. OUTSTANDING   — open 'sent' tickets still awaited (receive these first)
-///   2. RECEIVED today — what came back today
-///   3. SENT today     — what went out today + "ready to send" ghost chips for
-///                       the Approved-tab selection (before Send is pressed)
-///   4. NAPKINS        — logged / explicitly "none today" / not recorded yet
-///   5. Preview & Send Report button
+/// Expanded (landscape, wide screens) it shows FIVE groups as a grid of
+/// compact cards — the same groups the daily report email contains:
 ///
-/// Expanded by default in landscape; collapses to a slim vertical "Today" tab
-/// in portrait, when toggled, or on narrow screens. All data comes from local
-/// SQLite — the dashboard calls [TodayReportPanelState.refresh] after every
-/// relevant action (no polling).
+///   Row 1: RECEIVED today (fully)   | PARTIALLY RECEIVED today
+///   Row 2: SENT today               | OUTSTANDING (still at laundry)
+///   Row 3: NAPKINS strip (pool-tracked — own card, quick inline entry)
+///
+/// followed by the step checkmarks and the "Preview & Send Report" button
+/// pinned at the bottom.
+///
+/// Pool-tracked napkins (AppConstants.isPoolTracked) are balanced via the
+/// linen pool, NOT per-ticket — napkin LINES are excluded from the counts
+/// and napkin-ONLY tickets are excluded entirely from the four order groups.
+/// The server-side email builder applies the identical rule.
+///
+/// Collapses to a slim vertical "Today" tab in portrait, when toggled, or on
+/// narrow screens. All data comes from local SQLite — the dashboard calls
+/// [TodayReportPanelState.refresh] after every relevant action (no polling).
 class TodayReportPanel extends StatefulWidget {
   /// Docket numbers currently selected on the Approved tab — rendered as
-  /// dashed "ready to send" ghost chips under SENT today.
+  /// dashed "ready to add" ghost chips inside the SENT today card.
   final List<String> selectedDockets;
+
+  /// Docket numbers currently selected on the Sent tab — rendered as dashed
+  /// ghost chips inside the RECEIVED today card (bulk Add = fully received).
+  final List<String> selectedReceiveDockets;
+
+  /// Name of the logged-in admin — recorded on inline napkin log entries.
+  final String? adminName;
 
   /// Opens the full Daily Report preview screen.
   final VoidCallback onOpenReport;
@@ -33,6 +49,8 @@ class TodayReportPanel extends StatefulWidget {
   const TodayReportPanel({
     super.key,
     required this.selectedDockets,
+    this.selectedReceiveDockets = const [],
+    this.adminName,
     required this.onOpenReport,
     required this.onLogNapkins,
   });
@@ -48,22 +66,22 @@ class _OutstandingRow {
   const _OutstandingRow({required this.docket, required this.days});
 }
 
-/// One ticket received today, with quantities for the partial badge.
+/// One ticket received today, with non-napkin quantities and (for partials)
+/// what is still awaited.
 class _ReceivedRow {
   final String docket;
   final int receivedQty;
   final int sentQty;
+  final String? awaiting;
   const _ReceivedRow({
     required this.docket,
     required this.receivedQty,
     required this.sentQty,
+    this.awaiting,
   });
-
-  bool get isPartial => sentQty > 0 && receivedQty < sentQty;
 }
 
 class TodayReportPanelState extends State<TodayReportPanel> {
-  static const double _expandedWidth = 330;
   static const double _collapsedWidth = 56;
   // Below this width an expanded panel would crush the order list.
   static const double _minWidthToExpand = 700;
@@ -71,10 +89,17 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   bool _loading = true;
   List<_OutstandingRow> _outstanding = [];
   List<_ReceivedRow> _receivedToday = [];
+  List<_ReceivedRow> _partialToday = [];
   List<String> _sentTodayDockets = [];
+  /// Raw count of tickets sent today INCLUDING napkin-only ones — drives the
+  /// "Add" step checkmark (napkin-only sends still count as work done).
+  int _sentTodayRawCount = 0;
   int _napkinQtyToday = 0;
   bool _napkinNoneToday = false;
   int _approvedCount = 0;
+  bool _napkinLogging = false;
+
+  final TextEditingController _napkinQtyController = TextEditingController();
 
   /// null = follow the orientation default (landscape expanded).
   bool? _userExpanded;
@@ -84,6 +109,12 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _napkinQtyController.dispose();
+    super.dispose();
   }
 
   @override
@@ -98,9 +129,20 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   }
 
   /// Reloads all panel data from local SQLite. Called by the dashboard after
-  /// every relevant action (receive, send, napkin log, returning from child
+  /// every relevant action (receive, add, napkin log, returning from child
   /// screens, background sync).
   Future<void> refresh() => _load();
+
+  /// Napkin-only tickets are pool-tracked end-to-end — they never belong in
+  /// the per-ticket order groups. (Bag-only tickets with no items are NOT
+  /// napkin-only — they're awaited as a whole.)
+  static bool _isNapkinOnly(List<Map<String, dynamic>> items) =>
+      items.isNotEmpty &&
+      items.every(
+          (i) => AppConstants.isPoolTracked(i['item_name'] as String? ?? ''));
+
+  static bool _isNapkinLine(Map<String, dynamic> item) =>
+      AppConstants.isPoolTracked(item['item_name'] as String? ?? '');
 
   Future<void> _load() async {
     final db = DatabaseService.instance;
@@ -114,23 +156,29 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     final itemIds = <String>{
       ...backlogOrders.map((o) => o['id'] as String),
       ...received.map((o) => o['id'] as String),
+      ...sent.map((o) => o['id'] as String),
     }.toList();
     final itemsByOrder = await db.getOrderItemsByOrderIds(itemIds);
     final sentDates = await db.getLatestStatusLogDates(
       backlogOrders.map((o) => o['id'] as String).toList(),
       AppConstants.statusSent,
     );
+    // What is still awaited per received-today ticket (napkins already
+    // excluded by the query) — shown on Partially Received chips.
+    final awaitingSummaries = await db.getAwaitingSummaries(
+        received.map((o) => o['id'] as String).toList());
 
     // OUTSTANDING — mirror the daily report's "Still at Laundry" rules:
-    // open 'sent' tickets with items still awaited (bag-only tickets with no
-    // items count too — they're awaited as a whole).
+    // open 'sent' tickets with NON-NAPKIN items still awaited (bag-only
+    // tickets with no items count too — they're awaited as a whole).
     final now = DateTime.now();
     final outstanding = <_OutstandingRow>[];
     for (final order in backlogOrders) {
       final orderId = order['id'] as String;
       final items = itemsByOrder[orderId] ?? [];
+      if (_isNapkinOnly(items)) continue;
       if (items.isNotEmpty) {
-        final awaited = items.fold<int>(
+        final awaited = items.where((i) => !_isNapkinLine(i)).fold<int>(
             0,
             (s, i) =>
                 s +
@@ -149,17 +197,39 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     }
     outstanding.sort((a, b) => b.days.compareTo(a.days));
 
-    // RECEIVED today — with quantities for the "x of y" partial badge.
-    final receivedRows = received.map((order) {
-      final items = itemsByOrder[order['id'] as String] ?? [];
-      return _ReceivedRow(
+    // RECEIVED today — split into fully vs partially received based on
+    // NON-NAPKIN lines only; napkin-only tickets skipped entirely.
+    final receivedFull = <_ReceivedRow>[];
+    final receivedPartial = <_ReceivedRow>[];
+    for (final order in received) {
+      final orderId = order['id'] as String;
+      final items = itemsByOrder[orderId] ?? [];
+      if (_isNapkinOnly(items)) continue;
+      final nonNapkin = items.where((i) => !_isNapkinLine(i)).toList();
+      final sentQty = nonNapkin.fold<int>(
+          0, (s, i) => s + (i['quantity_sent'] as int? ?? 0));
+      final receivedQty = nonNapkin.fold<int>(
+          0, (s, i) => s + (i['quantity_received'] as int? ?? 0));
+      final isPartial = nonNapkin.any((i) =>
+          (i['quantity_received'] as int? ?? 0) <
+          (i['quantity_sent'] as int? ?? 0));
+      final row = _ReceivedRow(
         docket: '${order['docket_number']}',
-        receivedQty: items.fold<int>(
-            0, (s, i) => s + (i['quantity_received'] as int? ?? 0)),
-        sentQty: items.fold<int>(
-            0, (s, i) => s + (i['quantity_sent'] as int? ?? 0)),
+        receivedQty: receivedQty,
+        sentQty: sentQty,
+        awaiting: awaitingSummaries[orderId],
       );
-    }).toList();
+      (isPartial ? receivedPartial : receivedFull).add(row);
+    }
+
+    // SENT today — napkin-only tickets excluded from the card (pool handles
+    // them) but still counted for the step checkmark.
+    final sentDockets = <String>[];
+    for (final order in sent) {
+      final items = itemsByOrder[order['id'] as String] ?? [];
+      if (_isNapkinOnly(items)) continue;
+      sentDockets.add('${order['docket_number']}');
+    }
 
     final napkinQty = await db.getNapkinReturnsTodayTotal();
     final napkinNone = await db.isNapkinNoneMarkedToday();
@@ -168,9 +238,10 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     if (!mounted) return;
     setState(() {
       _outstanding = outstanding;
-      _receivedToday = receivedRows;
-      _sentTodayDockets =
-          sent.map((o) => '${o['docket_number']}').toList();
+      _receivedToday = receivedFull;
+      _partialToday = receivedPartial;
+      _sentTodayDockets = sentDockets;
+      _sentTodayRawCount = sent.length;
       _napkinQtyToday = napkinQty;
       _napkinNoneToday = napkinNone;
       _approvedCount = counts[AppConstants.statusApproved] ?? 0;
@@ -182,10 +253,14 @@ class TodayReportPanelState extends State<TodayReportPanel> {
 
   /// Receive step done: something was received today, or there was nothing
   /// at the laundry to receive.
-  bool get _receiveDone => _receivedToday.isNotEmpty || _outstanding.isEmpty;
+  bool get _receiveDone =>
+      _receivedToday.isNotEmpty ||
+      _partialToday.isNotEmpty ||
+      _outstanding.isEmpty;
 
-  /// Send step done: something was sent today, or nothing approved is waiting.
-  bool get _sendDone => _sentTodayDockets.isNotEmpty || _approvedCount == 0;
+  /// Add step done: something was added (sent) today, or nothing approved
+  /// is waiting.
+  bool get _addDone => _sentTodayRawCount > 0 || _approvedCount == 0;
 
   /// Napkin step resolved: returns logged today OR explicitly marked none.
   bool get _napkinsResolved => _napkinQtyToday > 0 || _napkinNoneToday;
@@ -222,6 +297,61 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     }
   }
 
+  /// Quick inline napkin return — writes a linen_ledger 'in' entry directly
+  /// (same shape as the full Napkin Returns screen) and clears any
+  /// "none today" marker.
+  Future<void> _logNapkinsInline() async {
+    final qty = int.tryParse(_napkinQtyController.text.trim()) ?? 0;
+    if (qty <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid napkin quantity')),
+      );
+      return;
+    }
+    setState(() => _napkinLogging = true);
+
+    final db = DatabaseService.instance;
+    final entryId = const Uuid().v4();
+    final now = DateTime.now().toIso8601String();
+
+    await db.insertLedgerEntry({
+      'id': entryId,
+      'item_name': 'Linen Napkins',
+      'direction': 'in',
+      'quantity': qty,
+      'order_id': null,
+      'department_id': null,
+      'note': 'Logged from Today panel',
+      'recorded_by': widget.adminName,
+      'created_at': now,
+    });
+
+    // Queue for Supabase sync
+    await db.addToSyncQueue('linen_ledger', entryId, 'insert', jsonEncode({
+      'id': entryId,
+      'item_name': 'Linen Napkins',
+      'direction': 'in',
+      'quantity': qty,
+      'note': 'Logged from Today panel',
+      'recorded_by': widget.adminName,
+      'created_at': now,
+    }));
+    // Real returns override any "no returns today" marker set earlier.
+    await db.clearNapkinNoneToday();
+    SyncService.instance.pushPendingNow();
+
+    _napkinQtyController.clear();
+    if (mounted) {
+      FocusScope.of(context).unfocus();
+      setState(() => _napkinLogging = false);
+    }
+    await _load();
+    if (mounted) {
+      showThumbsUpConfirmation(context,
+          message: '$qty napkin${qty == 1 ? '' : 's'} logged');
+    }
+  }
+
   // ── Build ──
 
   @override
@@ -230,11 +360,13 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     final canExpand = mq.size.width >= _minWidthToExpand;
     final expanded =
         canExpand && (_userExpanded ?? mq.orientation == Orientation.landscape);
+    // ~52% of the screen in landscape — wide enough for the 2-column grid.
+    final expandedWidth = (mq.size.width * 0.52).clamp(520.0, 900.0);
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeInOut,
-      width: expanded ? _expandedWidth : _collapsedWidth,
+      width: expanded ? expandedWidth : _collapsedWidth,
       child: expanded ? _buildExpanded() : _buildCollapsedTab(canExpand),
     );
   }
@@ -308,9 +440,10 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     );
   }
 
-  // ── Expanded panel ──
+  // ── Expanded panel: 2×2 grid of group cards + napkins strip ──
 
   Widget _buildExpanded() {
+    final partialColor = Colors.amber.shade800;
     return Container(
       decoration: BoxDecoration(
         color: AppColors.white,
@@ -320,53 +453,96 @@ class TodayReportPanelState extends State<TodayReportPanel> {
       child: Column(
         children: [
           _buildHeader(),
-          _buildStepsRow(),
           const Divider(height: 1),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
-                : ListView(
-                    padding: const EdgeInsets.all(AppSpacing.base),
-                    children: [
-                      _section(
-                        title: 'Outstanding',
-                        color: AppColors.error,
-                        icon: Icons.local_laundry_service_rounded,
-                        countLabel: '${_outstanding.length}',
-                        emptyText: 'Nothing at the laundry',
-                        chips:
-                            _outstanding.map(_outstandingChip).toList(),
-                      ),
-                      const SizedBox(height: AppSpacing.lg),
-                      _section(
-                        title: 'Received today',
-                        color: AppColors.statusReceived,
-                        icon: Icons.done_all_rounded,
-                        countLabel: '${_receivedToday.length}',
-                        emptyText: 'Nothing received yet',
-                        chips: _receivedToday.map(_receivedChip).toList(),
-                      ),
-                      const SizedBox(height: AppSpacing.lg),
-                      _section(
-                        title: 'Sent today',
-                        color: AppColors.statusSent,
-                        icon: Icons.local_shipping_rounded,
-                        countLabel: widget.selectedDockets.isEmpty
-                            ? '${_sentTodayDockets.length}'
-                            : '${_sentTodayDockets.length} +${widget.selectedDockets.length}',
-                        emptyText: widget.selectedDockets.isEmpty
-                            ? 'Nothing sent yet'
-                            : '',
-                        chips: [
-                          ..._sentTodayDockets.map(_sentChip),
-                          ...widget.selectedDockets.map(_ghostChip),
-                        ],
-                      ),
-                      const SizedBox(height: AppSpacing.lg),
-                      _napkinSection(),
-                    ],
+                : Padding(
+                    padding: const EdgeInsets.all(AppSpacing.sm + 2),
+                    child: Column(
+                      children: [
+                        Expanded(
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Expanded(
+                                child: _groupCard(
+                                  title: 'Received Today',
+                                  color: AppColors.statusReceived,
+                                  icon: Icons.done_all_rounded,
+                                  countLabel: widget
+                                          .selectedReceiveDockets.isEmpty
+                                      ? '${_receivedToday.length}'
+                                      : '${_receivedToday.length} +${widget.selectedReceiveDockets.length}',
+                                  emptyText: 'Nothing received yet',
+                                  chips: [
+                                    ..._receivedToday.map(_receivedChip),
+                                    ...widget.selectedReceiveDockets.map(
+                                        (d) => _ghostChip(
+                                            d, AppColors.statusReceived)),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: AppSpacing.sm),
+                              Expanded(
+                                child: _groupCard(
+                                  title: 'Partially Received',
+                                  color: partialColor,
+                                  icon: Icons.rule_rounded,
+                                  countLabel: '${_partialToday.length}',
+                                  emptyText: 'No partial receipts',
+                                  chips:
+                                      _partialToday.map(_partialChip).toList(),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: AppSpacing.sm),
+                        Expanded(
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Expanded(
+                                child: _groupCard(
+                                  title: 'Sent Today',
+                                  color: AppColors.statusSent,
+                                  icon: Icons.local_shipping_rounded,
+                                  countLabel: widget.selectedDockets.isEmpty
+                                      ? '${_sentTodayDockets.length}'
+                                      : '${_sentTodayDockets.length} +${widget.selectedDockets.length}',
+                                  emptyText: 'Nothing sent yet',
+                                  chips: [
+                                    ..._sentTodayDockets.map(_sentChip),
+                                    ...widget.selectedDockets.map((d) =>
+                                        _ghostChip(d, AppColors.statusSent)),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: AppSpacing.sm),
+                              Expanded(
+                                child: _groupCard(
+                                  title: 'Outstanding',
+                                  color: AppColors.error,
+                                  icon: Icons.local_laundry_service_rounded,
+                                  countLabel: '${_outstanding.length}',
+                                  emptyText: 'Nothing at the laundry',
+                                  chips: _outstanding
+                                      .map(_outstandingChip)
+                                      .toList(),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: AppSpacing.sm),
+                        _napkinStrip(),
+                      ],
+                    ),
                   ),
           ),
+          const Divider(height: 1),
+          _buildStepsRow(),
           _buildSendButton(),
         ],
       ),
@@ -406,7 +582,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     );
   }
 
-  // ── Step checkmarks: 1 Receive / 2 Send / 3 Napkins ──
+  // ── Step checkmarks: 1 Receive / 2 Add / 3 Napkins ──
 
   Widget _buildStepsRow() {
     return Padding(
@@ -415,7 +591,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
       child: Row(
         children: [
           _stepChip('1 Receive', done: _receiveDone),
-          _stepChip('2 Send', done: _sendDone),
+          _stepChip('2 Add', done: _addDone),
           _stepChip('3 Napkins', done: _napkinsResolved, warnWhenPending: true),
         ],
       ),
@@ -459,9 +635,9 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     );
   }
 
-  // ── Section scaffolding ──
+  // ── Group card scaffolding ──
 
-  Widget _section({
+  Widget _groupCard({
     required String title,
     required Color color,
     required IconData icon,
@@ -469,61 +645,87 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     required String emptyText,
     required List<Widget> chips,
   }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(icon, size: 18, color: color),
-            const SizedBox(width: AppSpacing.xs + 2),
-            Expanded(
-              child: Text(
-                title.toUpperCase(),
-                style: TextStyle(
-                  fontFamily: 'Inter',
-                  fontSize: 13,
-                  fontWeight: AppTextStyles.bold,
-                  letterSpacing: 0.8,
-                  color: color,
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: AppColors.white,
+        borderRadius: AppRadius.mediumBR,
+        border: Border.all(color: color.withValues(alpha: 0.30)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Colored header with count badge
+          Container(
+            color: color.withValues(alpha: 0.10),
+            padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm + 2, vertical: AppSpacing.xs + 2),
+            child: Row(
+              children: [
+                Icon(icon, size: 16, color: color),
+                const SizedBox(width: AppSpacing.xs + 2),
+                Expanded(
+                  child: Text(
+                    title.toUpperCase(),
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 12,
+                      fontWeight: AppTextStyles.bold,
+                      letterSpacing: 0.6,
+                      color: color,
+                    ),
+                  ),
                 ),
-              ),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                countLabel,
-                style: TextStyle(
-                  fontFamily: 'Inter',
-                  fontSize: 12,
-                  fontWeight: AppTextStyles.bold,
-                  color: color,
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    countLabel,
+                    style: TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 12,
+                      fontWeight: AppTextStyles.bold,
+                      color: color,
+                    ),
+                  ),
                 ),
-              ),
+              ],
             ),
-          ],
-        ),
-        const SizedBox(height: AppSpacing.sm),
-        if (chips.isEmpty)
-          Text(
-            emptyText,
-            style: TextStyle(
-              fontFamily: 'Inter',
-              fontSize: 13,
-              fontStyle: FontStyle.italic,
-              color: AppColors.grey500,
-            ),
-          )
-        else
-          Wrap(
-            spacing: AppSpacing.sm - 2,
-            runSpacing: AppSpacing.sm - 2,
-            children: chips,
           ),
-      ],
+          // Scrollable chip content / friendly empty text
+          Expanded(
+            child: chips.isEmpty
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(AppSpacing.sm),
+                      child: Text(
+                        emptyText,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 13,
+                          fontStyle: FontStyle.italic,
+                          color: AppColors.grey500,
+                        ),
+                      ),
+                    ),
+                  )
+                : SingleChildScrollView(
+                    padding: const EdgeInsets.all(AppSpacing.sm),
+                    child: Wrap(
+                      spacing: AppSpacing.sm - 2,
+                      runSpacing: AppSpacing.sm - 2,
+                      children: chips,
+                    ),
+                  ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -585,30 +787,67 @@ class TodayReportPanelState extends State<TodayReportPanel> {
         border: Border.all(
             color: AppColors.statusReceived.withValues(alpha: 0.35)),
       ),
-      child: Row(
+      child: Text(
+        '#${row.docket}',
+        style: TextStyle(
+          fontFamily: 'Inter',
+          fontSize: 13,
+          fontWeight: AppTextStyles.bold,
+          color: AppColors.statusReceived,
+        ),
+      ),
+    );
+  }
+
+  /// Partially received: docket + "x of y" (non-napkin) + awaiting summary.
+  Widget _partialChip(_ReceivedRow row) {
+    final color = Colors.amber.shade800;
+    return Container(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.sm + 2, vertical: AppSpacing.xs + 1),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: AppRadius.smallBR,
+        border: Border.all(color: color.withValues(alpha: 0.45)),
+      ),
+      child: Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            '#${row.docket}',
-            style: TextStyle(
-              fontFamily: 'Inter',
-              fontSize: 13,
-              fontWeight: AppTextStyles.bold,
-              color: AppColors.statusReceived,
-            ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '#${row.docket}',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 13,
+                  fontWeight: AppTextStyles.bold,
+                  color: color,
+                ),
+              ),
+              const SizedBox(width: AppSpacing.xs),
+              Text(
+                '${row.receivedQty} of ${row.sentQty}',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 11,
+                  fontWeight: AppTextStyles.medium,
+                  color: AppColors.grey700,
+                ),
+              ),
+            ],
           ),
-          if (row.isPartial) ...[
-            const SizedBox(width: AppSpacing.xs),
+          if (row.awaiting != null && row.awaiting!.isNotEmpty)
             Text(
-              '${row.receivedQty} of ${row.sentQty}',
+              row.awaiting!,
               style: TextStyle(
                 fontFamily: 'Inter',
-                fontSize: 11,
+                fontSize: 10,
                 fontWeight: AppTextStyles.medium,
-                color: AppColors.grey700,
+                color: AppColors.error,
               ),
             ),
-          ],
         ],
       ),
     );
@@ -636,12 +875,11 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     );
   }
 
-  /// Dashed-border "ready to send" chip for the Approved-tab selection —
-  /// these tickets WILL appear under Sent once the Send button is pressed.
-  Widget _ghostChip(String docket) {
+  /// Dashed-border "ready to add" chip for the current tab selection — these
+  /// tickets WILL appear in the card once the Add button is pressed.
+  Widget _ghostChip(String docket, Color color) {
     return CustomPaint(
-      painter: _DashedBorderPainter(
-          color: AppColors.statusSent, radius: AppRadius.sm),
+      painter: _DashedBorderPainter(color: color, radius: AppRadius.sm),
       child: Container(
         padding: const EdgeInsets.symmetric(
             horizontal: AppSpacing.sm + 2, vertical: AppSpacing.xs + 1),
@@ -654,7 +892,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
                 fontFamily: 'Inter',
                 fontSize: 13,
                 fontWeight: AppTextStyles.bold,
-                color: AppColors.statusSent,
+                color: color,
               ),
             ),
             const SizedBox(width: AppSpacing.xs),
@@ -662,7 +900,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
               padding:
                   const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
               decoration: BoxDecoration(
-                color: AppColors.statusSent.withValues(alpha: 0.15),
+                color: color.withValues(alpha: 0.15),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Text(
@@ -671,7 +909,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
                   fontFamily: 'Inter',
                   fontSize: 10,
                   fontWeight: AppTextStyles.bold,
-                  color: AppColors.statusSent,
+                  color: color,
                 ),
               ),
             ),
@@ -681,90 +919,142 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     );
   }
 
-  // ── Napkins row ──
+  // ── Napkins strip (full width, pool-tracked — own card) ──
 
-  Widget _napkinSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            const Icon(Icons.dining, size: 18, color: AppColors.goldDark),
-            const SizedBox(width: AppSpacing.xs + 2),
-            Text(
-              'NAPKINS',
+  Widget _napkinStrip() {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: AppColors.gold.withValues(alpha: 0.07),
+        borderRadius: AppRadius.mediumBR,
+        border: Border.all(color: AppColors.gold.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.dining, size: 18, color: AppColors.goldDark),
+          const SizedBox(width: AppSpacing.xs + 2),
+          Text(
+            'NAPKINS',
+            style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: 12,
+              fontWeight: AppTextStyles.bold,
+              letterSpacing: 0.6,
+              color: AppColors.goldDark,
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          // State
+          Expanded(child: _napkinState()),
+          // Quick inline entry: qty + Log
+          SizedBox(
+            width: 64,
+            height: 38,
+            child: TextField(
+              controller: _napkinQtyController,
+              keyboardType: TextInputType.number,
+              textAlign: TextAlign.center,
               style: TextStyle(
-                fontFamily: 'Inter',
-                fontSize: 13,
-                fontWeight: AppTextStyles.bold,
-                letterSpacing: 0.8,
-                color: AppColors.goldDark,
+                  fontFamily: 'Inter',
+                  fontSize: AppTextStyles.labelSize,
+                  fontWeight: AppTextStyles.bold),
+              decoration: InputDecoration(
+                hintText: 'Qty',
+                hintStyle: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    color: AppColors.grey400),
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.xs, vertical: AppSpacing.sm),
+                border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
+                filled: true,
+                fillColor: AppColors.white,
+              ),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.xs + 2),
+          SizedBox(
+            height: 38,
+            child: ElevatedButton(
+              onPressed: _napkinLogging ? null : _logNapkinsInline,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.navy,
+                foregroundColor: AppColors.white,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                textStyle: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    fontWeight: AppTextStyles.medium),
+                shape:
+                    RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
+              ),
+              child: const Text('Log'),
+            ),
+          ),
+          if (_napkinQtyToday == 0 && !_napkinNoneToday) ...[
+            const SizedBox(width: AppSpacing.xs + 2),
+            SizedBox(
+              height: 38,
+              child: OutlinedButton(
+                onPressed: _markNoneToday,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.grey700,
+                  side: BorderSide(
+                      color: AppColors.grey700.withValues(alpha: 0.5)),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
+                  textStyle: TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 13,
+                      fontWeight: AppTextStyles.medium),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: AppRadius.smallBR),
+                ),
+                child: const Text('None today'),
               ),
             ),
           ],
-        ),
-        const SizedBox(height: AppSpacing.sm),
-        if (_napkinQtyToday > 0)
-          _napkinStateRow(
-              Icons.check_circle_rounded,
-              AppColors.success,
-              '$_napkinQtyToday napkin${_napkinQtyToday == 1 ? '' : 's'} logged today')
-        else if (_napkinNoneToday)
-          _napkinStateRow(Icons.check_circle_rounded, AppColors.success,
-              'No returns today')
-        else ...[
-          _napkinStateRow(Icons.warning_amber_rounded,
-              Colors.orange.shade800, 'Not recorded yet'),
-          const SizedBox(height: AppSpacing.sm),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: widget.onLogNapkins,
-                  icon: const Icon(Icons.add_rounded, size: 18),
-                  label: const Text('Log returns'),
-                  style: _napkinActionStyle(AppColors.navy),
-                ),
-              ),
-              const SizedBox(width: AppSpacing.sm),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _markNoneToday,
-                  icon: const Icon(Icons.block_rounded, size: 18),
-                  label: const Text('None today'),
-                  style: _napkinActionStyle(AppColors.grey700),
-                ),
-              ),
-            ],
+          // Link to the full napkin screen
+          IconButton(
+            onPressed: widget.onLogNapkins,
+            icon: const Icon(Icons.open_in_new_rounded,
+                size: 18, color: AppColors.goldDark),
+            tooltip: 'Open napkin returns',
+            visualDensity: VisualDensity.compact,
           ),
         ],
-      ],
-    );
-  }
-
-  ButtonStyle _napkinActionStyle(Color color) {
-    return OutlinedButton.styleFrom(
-      foregroundColor: color,
-      side: BorderSide(color: color.withValues(alpha: 0.5)),
-      minimumSize: const Size(0, 40),
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
-      textStyle: TextStyle(
-        fontFamily: 'Inter',
-        fontSize: 13,
-        fontWeight: AppTextStyles.medium,
       ),
-      shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
     );
   }
 
-  Widget _napkinStateRow(IconData icon, Color color, String text) {
+  Widget _napkinState() {
+    final IconData icon;
+    final Color color;
+    final String text;
+    if (_napkinQtyToday > 0) {
+      icon = Icons.check_circle_rounded;
+      color = AppColors.success;
+      text = '$_napkinQtyToday logged today';
+    } else if (_napkinNoneToday) {
+      icon = Icons.check_circle_rounded;
+      color = AppColors.success;
+      text = 'No returns today';
+    } else {
+      icon = Icons.warning_amber_rounded;
+      color = Colors.orange.shade800;
+      text = 'Not recorded yet';
+    }
     return Row(
       children: [
         Icon(icon, size: 18, color: color),
         const SizedBox(width: AppSpacing.xs + 2),
-        Expanded(
+        Flexible(
           child: Text(
             text,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               fontFamily: 'Inter',
               fontSize: 13,
@@ -781,10 +1071,8 @@ class TodayReportPanelState extends State<TodayReportPanel> {
 
   Widget _buildSendButton() {
     return Container(
-      padding: const EdgeInsets.all(AppSpacing.base),
-      decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: AppColors.grey200)),
-      ),
+      padding: const EdgeInsets.fromLTRB(
+          AppSpacing.base, 0, AppSpacing.base, AppSpacing.base),
       child: SizedBox(
         width: double.infinity,
         height: AppSizes.buttonHeightSm,
@@ -809,7 +1097,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
 }
 
 /// Paints a dashed rounded-rect border (Flutter has no built-in dashed
-/// BorderStyle) — used for the "ready to send" ghost chips.
+/// BorderStyle) — used for the "ready to add" ghost chips.
 class _DashedBorderPainter extends CustomPainter {
   final Color color;
   final double radius;

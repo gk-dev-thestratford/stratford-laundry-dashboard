@@ -23,7 +23,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 9,
+      version: 10,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -120,6 +120,11 @@ class DatabaseService {
         "WHERE status IN ('collected','in_processing','completed','picked_up')",
       );
     }
+    if (oldVersion < 10) {
+      // Per-admin gate for the Today's Report panel + daily report email.
+      // Defaults to 1 (allowed) — mirrors the Supabase column default.
+      await db.execute('ALTER TABLE admin_users ADD COLUMN can_send_report INTEGER NOT NULL DEFAULT 1');
+    }
   }
 
   Future<void> _createTables(Database db, int version) async {
@@ -154,7 +159,8 @@ class DatabaseService {
         pin_hash TEXT NOT NULL,
         is_active INTEGER NOT NULL DEFAULT 1,
         can_delete_orders INTEGER NOT NULL DEFAULT 0,
-        can_reject_orders INTEGER NOT NULL DEFAULT 0
+        can_reject_orders INTEGER NOT NULL DEFAULT 0,
+        can_send_report INTEGER NOT NULL DEFAULT 1
       )
     ''');
 
@@ -646,6 +652,8 @@ class DatabaseService {
           'is_active': admin['is_active'] == true ? 1 : 0,
           'can_delete_orders': admin['can_delete_orders'] == true ? 1 : 0,
           'can_reject_orders': admin['can_reject_orders'] == true ? 1 : 0,
+          // Default true when the server row predates the column
+          'can_send_report': admin['can_send_report'] == false ? 0 : 1,
         });
       }
     });
