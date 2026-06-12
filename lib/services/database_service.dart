@@ -1109,6 +1109,79 @@ class DatabaseService {
     );
   }
 
+  /// Delete a metadata key (no-op if it doesn't exist).
+  Future<void> deleteMeta(String key) async {
+    final db = await database;
+    await db.delete('app_meta', where: 'key = ?', whereArgs: [key]);
+  }
+
+  // ── Daily-procedure helpers (Today's Report panel + workflow gating) ──
+
+  /// Local-date key (yyyy-MM-dd) for date-scoped app_meta markers.
+  static String _localDateKey([DateTime? day]) {
+    final d = day ?? DateTime.now();
+    final m = d.month.toString().padLeft(2, '0');
+    final dd = d.day.toString().padLeft(2, '0');
+    return '${d.year}-$m-$dd';
+  }
+
+  /// app_meta key for the explicit "no napkin returns today" marker.
+  static String napkinNoneMetaKey([DateTime? day]) =>
+      'napkin_none_${_localDateKey(day)}';
+
+  /// Total napkins logged back IN today (linen_ledger direction='in',
+  /// since local midnight).
+  Future<int> getNapkinReturnsTodayTotal() async {
+    final db = await database;
+    final now = DateTime.now();
+    final todayIso = DateTime(now.year, now.month, now.day).toIso8601String();
+    final result = await db.rawQuery(
+      "SELECT COALESCE(SUM(quantity), 0) AS total FROM linen_ledger "
+      "WHERE direction = 'in' AND created_at >= ?",
+      [todayIso],
+    );
+    return (result.first['total'] as int?) ?? 0;
+  }
+
+  /// Whether today is explicitly marked "no napkin returns". The marker is
+  /// ignored when returns HAVE been logged today — real data wins.
+  Future<bool> isNapkinNoneMarkedToday() async {
+    if (await getNapkinReturnsTodayTotal() > 0) return false;
+    return await getMeta(napkinNoneMetaKey()) != null;
+  }
+
+  /// Store the explicit "no napkin returns today" marker (date-keyed, so it
+  /// resets automatically each day).
+  Future<void> markNapkinNoneToday() =>
+      setMeta(napkinNoneMetaKey(), DateTime.now().toIso8601String());
+
+  /// Remove today's "no napkin returns" marker (e.g. when returns are logged
+  /// after all).
+  Future<void> clearNapkinNoneToday() => deleteMeta(napkinNoneMetaKey());
+
+  /// True when any order gained a [status] status-log entry today (since
+  /// local midnight) — cheap existence check for workflow gating.
+  Future<bool> hasStatusLogToday(String status) async {
+    final db = await database;
+    final now = DateTime.now();
+    final todayIso = DateTime(now.year, now.month, now.day).toIso8601String();
+    final rows = await db.rawQuery(
+      'SELECT 1 FROM order_status_log WHERE status = ? AND created_at >= ? LIMIT 1',
+      [status, todayIso],
+    );
+    return rows.isNotEmpty;
+  }
+
+  /// True when at least one order is currently open at the laundry
+  /// (status='sent') — i.e. there is something that could be received.
+  Future<bool> hasOpenSentOrders() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      "SELECT 1 FROM orders WHERE status = 'sent' LIMIT 1",
+    );
+    return rows.isNotEmpty;
+  }
+
   Future<int> cleanSyncQueue({int days = 7}) async {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();

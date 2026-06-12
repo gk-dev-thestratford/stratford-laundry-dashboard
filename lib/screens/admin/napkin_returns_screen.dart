@@ -26,6 +26,10 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
   List<Map<String, dynamic>> _entries = [];
   bool _isLoading = true;
   String _selectedFilter = 'This Month';
+  /// Today explicitly marked "no napkin returns" (ignored once returns exist).
+  bool _noneMarkedToday = false;
+  /// Total napkins logged IN today — drives the "No returns today" action.
+  int _todayInTotal = 0;
 
   static const _filters = ['Today', 'Last 7 Days', 'This Month', 'Last 30 Days'];
 
@@ -57,15 +61,78 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
     final db = DatabaseService.instance;
     final totals = await db.getLedgerTotals();
     final entries = await db.getLedgerEntries(since: _filterSince());
+    final todayInTotal = await db.getNapkinReturnsTodayTotal();
+    final noneMarked = await db.isNapkinNoneMarkedToday();
     if (mounted) {
       setState(() {
         _totalOut = totals['total_out'] ?? 0;
         _totalIn = totals['total_in'] ?? 0;
         _balance = _totalOut - _totalIn;
         _entries = entries;
+        _todayInTotal = todayInTotal;
+        _noneMarkedToday = noneMarked;
         _isLoading = false;
       });
     }
+  }
+
+  /// Explicitly mark today as "no napkin returns" — used by the daily-report
+  /// gate when nothing came back from the laundry.
+  Future<void> _markNoneToday() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('No Napkin Returns Today?'),
+        content: const Text(
+          'Mark today as having no napkin returns from the laundry. '
+          'If napkins are logged later today, this marker is ignored.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.navy),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    await DatabaseService.instance.markNapkinNoneToday();
+    await _loadData();
+    if (mounted) {
+      showThumbsUpConfirmation(context,
+          message: 'Marked no napkin returns today');
+    }
+  }
+
+  /// Undo the "no returns today" marker.
+  Future<void> _clearNoneToday() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove Marker?'),
+        content: const Text("Remove today's \"no napkin returns\" marker?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.navy),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await DatabaseService.instance.clearNapkinNoneToday();
+    await _loadData();
   }
 
   Future<void> _logReturn() async {
@@ -147,6 +214,8 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
       'recorded_by': admin?.name,
       'created_at': now,
     }));
+    // Real returns override any "no returns today" marker set earlier.
+    await db.clearNapkinNoneToday();
     SyncService.instance.pushPendingNow();
 
     _qtyController.clear();
@@ -280,7 +349,47 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
               children: [
                 Icon(Icons.add_circle_outline, color: AppColors.success, size: 22),
                 const SizedBox(width: AppSpacing.sm),
-                Text('Log Napkin Return', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.titleSize, fontWeight: AppTextStyles.bold, color: AppColors.navy)),
+                Expanded(
+                  child: Text('Log Napkin Return', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.titleSize, fontWeight: AppTextStyles.bold, color: AppColors.navy)),
+                ),
+                // "No returns today" — only meaningful while nothing has been
+                // logged IN today. Tapping the marked chip undoes it.
+                if (_todayInTotal == 0)
+                  _noneMarkedToday
+                      ? GestureDetector(
+                          onTap: _clearNoneToday,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: AppSpacing.md, vertical: AppSpacing.xs + 2),
+                            decoration: BoxDecoration(
+                              color: AppColors.success.withValues(alpha: 0.12),
+                              borderRadius: AppRadius.largeBR,
+                              border: Border.all(color: AppColors.success.withValues(alpha: 0.4)),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.check_circle_rounded, size: AppSizes.iconSizeSm, color: AppColors.success),
+                                const SizedBox(width: AppSpacing.xs + 2),
+                                Text('No returns today',
+                                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.success)),
+                              ],
+                            ),
+                          ),
+                        )
+                      : OutlinedButton.icon(
+                          onPressed: _markNoneToday,
+                          icon: const Icon(Icons.block_rounded, size: AppSizes.iconSizeSm),
+                          label: const Text('No returns today'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppColors.grey700,
+                            side: BorderSide(color: AppColors.grey400),
+                            minimumSize: const Size(0, AppSizes.buttonHeightSm),
+                            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+                            textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium),
+                            shape: RoundedRectangleBorder(borderRadius: AppRadius.mediumBR),
+                          ),
+                        ),
               ],
             ),
             const Divider(height: AppSpacing.xl),

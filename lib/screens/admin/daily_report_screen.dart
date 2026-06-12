@@ -61,6 +61,8 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
   List<Map<String, dynamic>> _napkinReturns = [];
   Map<String, List<Map<String, dynamic>>> _itemsByOrder = {};
   DateTime? _lastSentAt;
+  /// Today explicitly marked "no napkin returns" (app_meta, date-keyed).
+  bool _napkinNoneToday = false;
 
   @override
   void initState() {
@@ -135,6 +137,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
         ledger.where((e) => e['direction'] == 'in').toList();
 
     final lastSentIso = await db.getMeta(_kLastSentMetaKey);
+    final napkinNoneToday = await db.isNapkinNoneMarkedToday();
 
     if (mounted) {
       setState(() {
@@ -145,6 +148,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
         _itemsByOrder = itemsByOrder;
         _lastSentAt =
             lastSentIso != null ? DateTime.tryParse(lastSentIso) : null;
+        _napkinNoneToday = napkinNoneToday;
         _isLoading = false;
       });
     }
@@ -155,6 +159,10 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
 
   int get _napkinQty =>
       _napkinReturns.fold(0, (sum, e) => sum + (e['quantity'] as int? ?? 0));
+
+  /// Napkin state resolved: returns logged today OR explicitly marked none.
+  /// Send Report is gated on this (the preview itself stays accessible).
+  bool get _napkinsResolved => _napkinReturns.isNotEmpty || _napkinNoneToday;
 
   Future<void> _sendReport() async {
     ref.read(adminProvider.notifier).refreshActivity();
@@ -590,7 +598,9 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       countLabel: '$_napkinQty napkin${_napkinQty == 1 ? '' : 's'}',
       color: AppColors.gold,
       icon: Icons.dining,
-      emptyMessage: 'No napkin returns today.',
+      emptyMessage: _napkinNoneToday
+          ? 'Marked: no napkin returns today.'
+          : 'No napkin returns today.',
       children: _napkinReturns.map((entry) {
         final time =
             DateTime.tryParse(entry['created_at'] as String? ?? '');
@@ -712,24 +722,44 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
           child: Row(
             children: [
               Expanded(
-                child: sentToday
-                    ? Text(
-                        'Last sent today at ${DateFormat('HH:mm').format(_lastSentAt!)}',
-                        style: TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: AppTextStyles.captionSize,
-                            fontWeight: AppTextStyles.medium,
-                            color: AppColors.grey600))
-                    : Text('Not sent today',
-                        style: TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: AppTextStyles.captionSize,
-                            color: AppColors.grey500)),
+                child: !_napkinsResolved
+                    ? Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded,
+                              size: AppSizes.iconSizeSm,
+                              color: Colors.orange.shade800),
+                          const SizedBox(width: AppSpacing.sm),
+                          Expanded(
+                            child: Text(
+                                'Napkins not recorded — log returns or mark '
+                                '"None today" before sending',
+                                style: TextStyle(
+                                    fontFamily: 'Inter',
+                                    fontSize: AppTextStyles.captionSize,
+                                    fontWeight: AppTextStyles.medium,
+                                    color: Colors.orange.shade800)),
+                          ),
+                        ],
+                      )
+                    : sentToday
+                        ? Text(
+                            'Last sent today at ${DateFormat('HH:mm').format(_lastSentAt!)}',
+                            style: TextStyle(
+                                fontFamily: 'Inter',
+                                fontSize: AppTextStyles.captionSize,
+                                fontWeight: AppTextStyles.medium,
+                                color: AppColors.grey600))
+                        : Text('Not sent today',
+                            style: TextStyle(
+                                fontFamily: 'Inter',
+                                fontSize: AppTextStyles.captionSize,
+                                color: AppColors.grey500)),
               ),
               SizedBox(
                 height: AppSizes.buttonHeightLg,
                 child: ElevatedButton.icon(
-                  onPressed: _isSending ? null : _sendReport,
+                  onPressed:
+                      (_isSending || !_napkinsResolved) ? null : _sendReport,
                   icon: _isSending
                       ? const SizedBox(
                           width: 22,

@@ -13,6 +13,7 @@ import '../../services/sync_service.dart';
 import '../../widgets/announcement_banner.dart';
 import '../../widgets/thumbs_up_confirmation.dart';
 import '../../widgets/sync_indicator.dart';
+import '../../widgets/today_report_panel.dart';
 
 class AdminDashboardScreen extends ConsumerStatefulWidget {
   const AdminDashboardScreen({super.key});
@@ -35,6 +36,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   Map<String, String> _awaitingSummaries = {};
   String? _allTabDateFilter;
   String? _allTabTypeFilter;
+  // Right-side "Today's Report" panel — refreshed after every relevant action.
+  final GlobalKey<TodayReportPanelState> _panelKey =
+      GlobalKey<TodayReportPanelState>();
 
   // Tab indices — use these constants instead of hardcoded numbers
   static const _kRejected = 0;
@@ -103,6 +107,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     // periodically. They're now invoked once per hour by SyncService's
     // periodic cleanup, so loadData just reads.
     await Future.wait([_loadOrders(silent: silent), _loadCounts()]);
+    // Keep the Today's Report panel in step (covers background sync and
+    // returning from child screens — both funnel through here).
+    _panelKey.currentState?.refresh();
   }
 
   Future<void> _loadCounts() async {
@@ -244,6 +251,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Push immediately — don't wait for the 30s timer
     SyncService.instance.pushPendingNow();
+    _panelKey.currentState?.refresh();
   }
 
   Future<void> _showRejectDialog(String orderId) async {
@@ -306,9 +314,42 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
   Future<void> _bulkSend() async {
     if (_selectedOrderIds.isEmpty) return;
+    final db = DatabaseService.instance;
+
+    // Workflow gate: the daily procedure is receive-first. If nothing has been
+    // received today AND there are open 'sent' tickets that could have been
+    // received, confirm before sending — a soft nudge, never a hard block.
+    final receivedToday =
+        await db.hasStatusLogToday(AppConstants.statusReceived);
+    if (!receivedToday && await db.hasOpenSentOrders()) {
+      if (!mounted) return;
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Receive First?'),
+          content: const Text(
+            'Nothing has been received today yet — the daily procedure is to '
+            'record received items first. Send anyway?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.statusSent),
+              child: const Text('Send anyway'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true || !mounted) return;
+    }
+
     final count = _selectedOrderIds.length;
     final admin = ref.read(adminProvider).currentAdmin;
-    final db = DatabaseService.instance;
     final uuid = const Uuid();
     final now = DateTime.now().toIso8601String();
 
@@ -350,6 +391,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Push immediately and WAIT for sync to complete
     await SyncService.instance.pushPendingAndWait();
+    _panelKey.currentState?.refresh();
   }
 
   /// For napkin items: logs OUT to the linen ledger.
@@ -601,6 +643,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Push immediately — don't wait for the 30s timer
     SyncService.instance.pushPendingNow();
+    _panelKey.currentState?.refresh();
   }
 
   @override
@@ -783,8 +826,40 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
           const AnnouncementBanner(
             padding: EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.md, AppSpacing.lg, 0),
           ),
-          // ── Body content ──
-          ..._buildBodyContent(isLandscape),
+          // ── Body content + docked Today's Report panel ──
+          Expanded(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: Column(children: _buildBodyContent(isLandscape)),
+                ),
+                TodayReportPanel(
+                  key: _panelKey,
+                  // Approved-tab selection shows as "ready to send" ghost
+                  // chips under SENT today before Send is pressed.
+                  selectedDockets: _isApprovedTab
+                      ? _orders
+                          .where((o) => _selectedOrderIds.contains(o['id']))
+                          .map((o) => '${o['docket_number']}')
+                          .toList()
+                      : const [],
+                  onOpenReport: () {
+                    ref.read(adminProvider.notifier).refreshActivity();
+                    context.push('/admin/daily-report').then((_) {
+                      _loadData(silent: true);
+                    });
+                  },
+                  onLogNapkins: () {
+                    ref.read(adminProvider.notifier).refreshActivity();
+                    context.push('/admin/napkin-returns').then((_) {
+                      _loadData(silent: true);
+                    });
+                  },
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -1264,31 +1339,6 @@ class _OrderCard extends StatelessWidget {
                       Text(awaitingSummary!,
                           style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.error),
                           overflow: TextOverflow.ellipsis, maxLines: 1),
-                    // Return to Pending button — absorb tap so it doesn't open card detail
-                    if (showReturnToPending) ...[
-                      SizedBox(height: AppSpacing.sm),
-                      GestureDetector(
-                        onTap: () {}, // absorb tap to prevent InkWell from firing
-                        child: Align(
-                          alignment: Alignment.center,
-                          child: SizedBox(
-                            height: 36,
-                            child: OutlinedButton.icon(
-                              onPressed: onReturnToPending,
-                              icon: Icon(Icons.undo_rounded, size: 16),
-                              label: const Text('Return to Pending'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: AppColors.statusSubmitted,
-                                side: BorderSide(color: AppColors.statusSubmitted.withValues(alpha: 0.5)),
-                                padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                                textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium),
-                                shape: RoundedRectangleBorder(borderRadius: AppRadius.largeBR),
-                            ),
-                          ),
-                        ),
-                        ),
-                      ),
-                    ],
                   ],
                 ),
               ),
@@ -1328,6 +1378,25 @@ class _OrderCard extends StatelessWidget {
                   ),
                 ),
                 ],
+              ] else if (showReturnToPending) ...[
+                // Approved tab: trailing action, same slot as Receive/Collected
+                // (was stacked inside the details column, which overflowed the
+                // fixed-height grid cards in landscape)
+                SizedBox(
+                  height: AppSizes.buttonHeightSm,
+                  child: OutlinedButton.icon(
+                    onPressed: onReturnToPending,
+                    icon: Icon(Icons.undo_rounded, size: AppSizes.iconSizeSm),
+                    label: const Text('Return to Pending'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.statusSubmitted,
+                      side: BorderSide(color: AppColors.statusSubmitted.withValues(alpha: 0.5)),
+                      padding: EdgeInsets.symmetric(horizontal: AppSpacing.base),
+                      textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
+                      shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
+                    ),
+                  ),
+                ),
               ] else if (showReceiveAction) ...[
                 SizedBox(
                   height: AppSizes.buttonHeightSm,
