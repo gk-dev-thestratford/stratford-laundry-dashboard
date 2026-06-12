@@ -21,6 +21,14 @@ async function fetchRecipients(): Promise<Recipient[]> {
   return (data ?? []) as Recipient[]
 }
 
+/** Pool-tracked napkins balance through the linen pool, so napkin lines and
+ *  napkin-only tickets are excluded from the order sections (the edge function
+ *  applies the same rule to the email). */
+const isPoolItem = (name: string) => (name || '').toLowerCase().includes('napkin')
+const nonPoolItems = (o: ReportOrder) => (o.order_items || []).filter((i) => !isPoolItem(i.item_name))
+const isPartialOrder = (o: ReportOrder) =>
+  nonPoolItems(o).some((i) => (i.quantity_received ?? 0) < (i.quantity_sent || 0))
+
 interface ReportOrder {
   id: string
   docket_number: string
@@ -178,27 +186,38 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
   }, [])
 
 
-  const outstanding = useMemo(() => data?.openSent ?? [], [data])
+  // Napkin-pool exclusion + full/partial split (mirrors the email builder)
+  const fullReceived = useMemo(
+    () => (data?.received ?? []).filter((o) => nonPoolItems(o).length > 0 && !isPartialOrder(o)), [data])
+  const partialReceived = useMemo(
+    () => (data?.received ?? []).filter((o) => nonPoolItems(o).length > 0 && isPartialOrder(o)), [data])
+  const sentNonPool = useMemo(
+    () => (data?.sent ?? []).filter((o) => nonPoolItems(o).length > 0), [data])
+  const outstanding = useMemo(
+    () => (data?.openSent ?? [])
+      .map((o) => ({ ...o, items: o.items.filter((i) => !isPoolItem(i.item)) }))
+      .filter((o) => o.items.length > 0),
+    [data])
 
   const counts = useMemo(() => {
-    if (!data) return { sent: 0, sentItems: 0, received: 0, receivedItems: 0, napkins: 0, napkinsQty: 0 }
-    const sentItems = data.sent.reduce(
-      (s, o) => s + (o.order_items || []).reduce((ss, i) => ss + (i.quantity_sent || 0), 0), 0)
-    const receivedItems = data.received.reduce(
-      (s, o) => s + (o.order_items || []).reduce((ss, i) => ss + (i.quantity_received ?? 0), 0), 0)
-    const napkinsQty = data.napkins.reduce((s, n) => s + (n.quantity || 0), 0)
+    const sentItems = sentNonPool.reduce(
+      (s, o) => s + nonPoolItems(o).reduce((ss, i) => ss + (i.quantity_sent || 0), 0), 0)
+    const receivedItems = [...fullReceived, ...partialReceived].reduce(
+      (s, o) => s + nonPoolItems(o).reduce((ss, i) => ss + (i.quantity_received ?? 0), 0), 0)
+    const napkinsQty = (data?.napkins ?? []).reduce((s, n) => s + (n.quantity || 0), 0)
     return {
-      sent: data.sent.length,
+      sent: sentNonPool.length,
       sentItems,
-      received: data.received.length,
+      received: fullReceived.length,
+      partial: partialReceived.length,
       receivedItems,
-      napkins: data.napkins.length,
+      napkins: data?.napkins.length ?? 0,
       napkinsQty,
     }
-  }, [data])
+  }, [data, fullReceived, partialReceived, sentNonPool])
 
   const outstandingTotal = outstanding.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0)
-  const isEmpty = !loading && data && counts.sent === 0 && counts.received === 0 && counts.napkins === 0
+  const isEmpty = !loading && data && counts.sent === 0 && counts.received === 0 && counts.partial === 0 && counts.napkins === 0
 
   async function handleSend() {
     if (!data || sending) return
@@ -334,9 +353,9 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
                 <SummaryCard
                   icon={<Package className="w-4 h-4" />}
                   label="Received"
-                  value={counts.received}
-                  detail={`${counts.receivedItems} items`}
-                  color={counts.received > 0 ? 'teal' : 'gray'}
+                  value={counts.received + counts.partial}
+                  detail={`${counts.receivedItems} items${counts.partial > 0 ? ` • ${counts.partial} partial` : ''}`}
+                  color={counts.partial > 0 ? 'orange' : counts.received > 0 ? 'teal' : 'gray'}
                 />
                 <SummaryCard
                   icon={<Truck className="w-4 h-4" />}
@@ -367,17 +386,54 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
                 </div>
               )}
 
-              {/* 1. Received today — what actually came back */}
-              {data.received.length > 0 && (
-                <PreviewSection title="Received Today" tone="teal" countLabel={`${counts.received} order${counts.received !== 1 ? 's' : ''}, ${counts.receivedItems} items`}>
-                  <OrderListTable orders={data.received} mode="received" />
+              {/* 1. Received today — complete tickets */}
+              {fullReceived.length > 0 && (
+                <PreviewSection title="Received Today" tone="teal" countLabel={`${counts.received} order${counts.received !== 1 ? 's' : ''} complete`}>
+                  <OrderListTable orders={fullReceived} mode="received" />
                 </PreviewSection>
               )}
 
-              {/* 2. Sent today — what the laundry company collected */}
-              {data.sent.length > 0 && (
+              {/* 2. Partially received — came back short */}
+              {partialReceived.length > 0 && (
+                <PreviewSection title="Partially Received Today" tone="orange" countLabel={`${counts.partial} ticket${counts.partial !== 1 ? 's' : ''} came back short`}>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-gray-500 border-b border-gray-200 dark:border-gray-700">
+                        <th className="py-1.5 pr-2">Docket</th>
+                        <th className="py-1.5 pr-2">Name</th>
+                        <th className="py-1.5 pr-2">Dept</th>
+                        <th className="py-1.5 pr-2 text-right">Received</th>
+                        <th className="py-1.5 text-left text-red-600">Still Awaiting</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {partialReceived.map((o) => {
+                        const items = nonPoolItems(o)
+                        const totalSent = items.reduce((s, i) => s + (i.quantity_sent || 0), 0)
+                        const totalRecv = items.reduce((s, i) => s + (i.quantity_received ?? 0), 0)
+                        const awaiting = items
+                          .filter((i) => (i.quantity_received ?? 0) < (i.quantity_sent || 0))
+                          .map((i) => `${(i.quantity_sent || 0) - (i.quantity_received ?? 0)}× ${i.item_name}`)
+                          .join(', ')
+                        return (
+                          <tr key={o.id} className="border-b border-gray-100 dark:border-gray-700/50 last:border-0">
+                            <td className="py-1.5 pr-2 font-mono">#{o.docket_number}</td>
+                            <td className="py-1.5 pr-2">{o.staff_name || o.guest_name || '—'}</td>
+                            <td className="py-1.5 pr-2">{o.departments?.name || '—'}</td>
+                            <td className="py-1.5 pr-2 text-right">{totalRecv} of {totalSent}</td>
+                            <td className="py-1.5 font-medium text-red-600">{awaiting}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </PreviewSection>
+              )}
+
+              {/* 3. Sent today — what the laundry company collected (napkin pool excluded) */}
+              {sentNonPool.length > 0 && (
                 <PreviewSection title="Sent to Laundry Today" tone="orange" countLabel={`${counts.sent} order${counts.sent !== 1 ? 's' : ''}, ${counts.sentItems} items`}>
-                  <OrderListTable orders={data.sent} mode="sent" />
+                  <OrderListTable orders={sentNonPool} mode="sent" />
                 </PreviewSection>
               )}
 
@@ -564,10 +620,11 @@ function OrderListTable({ orders, mode }: { orders: ReportOrder[]; mode: 'receiv
       </thead>
       <tbody>
         {orders.map((o) => {
-          const totalSent = (o.order_items || []).reduce((s, i) => s + (i.quantity_sent || 0), 0)
-          const totalRecv = (o.order_items || []).reduce((s, i) => s + (i.quantity_received ?? 0), 0)
+          const items = nonPoolItems(o)
+          const totalSent = items.reduce((s, i) => s + (i.quantity_sent || 0), 0)
+          const totalRecv = items.reduce((s, i) => s + (i.quantity_received ?? 0), 0)
           const out = totalSent - totalRecv
-          const itemsDesc = (o.order_items || []).map((i) => `${i.quantity_sent}× ${i.item_name}`).join(', ')
+          const itemsDesc = items.map((i) => `${i.quantity_sent}× ${i.item_name}`).join(', ')
           return (
             <tr key={o.id} className="border-b border-gray-100 dark:border-gray-700/50 last:border-0">
               <td className="py-1.5 pr-2 font-mono">#{o.docket_number}</td>

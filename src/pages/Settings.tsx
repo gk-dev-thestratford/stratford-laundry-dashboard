@@ -10,6 +10,7 @@ interface AdminUser {
   is_active: boolean
   can_delete_orders: boolean
   can_reject_orders: boolean
+  can_send_report: boolean
 }
 
 interface SettingsProps {
@@ -140,6 +141,21 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
     }
   }
 
+  async function handleToggleCanSendReport(admin: AdminUser) {
+    const newVal = !admin.can_send_report
+    const { error } = await supabase
+      .from('admin_users')
+      .update({ can_send_report: newVal })
+      .eq('id', admin.id)
+
+    if (error) {
+      setError(error.message)
+    } else {
+      setSuccess(`"${admin.name}" ${newVal ? 'can now see the report panel and send the daily report' : 'can no longer see the report panel or send the daily report'}`)
+      fetchAdmins()
+    }
+  }
+
   async function handleResetPin(admin: AdminUser) {
     const newPin = window.prompt(`Enter new PIN for "${admin.name}" (min 4 digits):`)
     if (!newPin || newPin.length < 4) {
@@ -254,6 +270,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
                 <th className="px-6 py-3 text-left font-medium text-gray-600">Status</th>
                 <th className="px-6 py-3 text-center font-medium text-gray-600">Can Delete Orders</th>
                 <th className="px-6 py-3 text-center font-medium text-gray-600">Can Reject Orders</th>
+                <th className="px-6 py-3 text-center font-medium text-gray-600">Can Send Report</th>
                 <th className="px-6 py-3 text-right font-medium text-gray-600">Actions</th>
               </tr>
             </thead>
@@ -320,6 +337,21 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
                       />
                     </button>
                   </td>
+                  <td className="px-6 py-3 text-center">
+                    <button
+                      onClick={() => handleToggleCanSendReport(admin)}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        admin.can_send_report ? 'bg-gold' : 'bg-gray-300'
+                      }`}
+                      title={admin.can_send_report ? 'Click to hide the report panel and revoke report sending' : 'Click to allow the report panel and report sending'}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${
+                          admin.can_send_report ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </td>
                   <td className="px-6 py-3 text-right">
                     <div className="flex items-center justify-end gap-2">
                       <button
@@ -341,7 +373,7 @@ export default function Settings({ currentUser: _currentUser }: SettingsProps) {
               ))}
               {admins.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-6 py-12 text-center text-gray-500">No admin users found</td>
+                  <td colSpan={6} className="px-6 py-12 text-center text-gray-500">No admin users found</td>
                 </tr>
               )}
             </tbody>
