@@ -50,7 +50,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   static const _kNapkinReturns = 6;
   static const _kReport = 7;
 
-  static const _tabs = ['Rejected', 'Pending', 'Approved', 'Sent', 'Received', 'All', 'Napkins', 'Report'];
+  // Tab names are ACTIONS (what staff do there), not states: Send = approved
+  // tickets ready to go out; Receive = tickets at the laundry awaiting return;
+  // Collect = received tickets awaiting owner pick-up. Ticket chips still show
+  // the status names.
+  static const _tabs = ['Rejected', 'Pending', 'Send', 'Receive', 'Collect', 'All', 'Napkins', 'Report'];
   static const _statusFilters = [
     AppConstants.statusRejected,
     AppConstants.statusSubmitted,
@@ -954,9 +958,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   IconData _tabIcon(String tab) {
     return switch (tab) {
       'Pending' => Icons.schedule_rounded,
-      'Approved' => Icons.check_circle_outline_rounded,
-      'Sent' => Icons.local_shipping_rounded,
-      'Received' => Icons.done_all_rounded,
+      'Send' => Icons.local_shipping_rounded,
+      'Receive' => Icons.move_to_inbox_rounded,
+      'Collect' => Icons.done_all_rounded,
       'All' => Icons.list_alt_rounded,
       'Rejected' => Icons.cancel_outlined,
       'Napkins' => Icons.dining,
@@ -1111,7 +1115,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                       )
                     : RefreshIndicator(
                         onRefresh: _loadData,
-                        child: isLandscape
+                        // Width-aware, not orientation-aware: with the Today
+                        // panel expanded the list gets ~half the screen, where
+                        // two columns clip the cards — drop to a single column.
+                        child: LayoutBuilder(
+                          builder: (context, constraints) => constraints.maxWidth >= 860
                             ? GridView.builder(
                                 padding: EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.sm),
                                 gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -1128,6 +1136,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                 itemCount: _orders.length,
                                 itemBuilder: (context, index) => _buildOrderCard(index),
                               ),
+                        ),
                       ),
           ),
         ];
@@ -1203,9 +1212,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   int _getTabCount(String tab) {
     return switch (tab) {
       'Pending' => _counts[AppConstants.statusSubmitted] ?? 0,
-      'Approved' => _counts[AppConstants.statusApproved] ?? 0,
-      'Sent' => _counts[AppConstants.statusSent] ?? 0,
-      'Received' => _counts[AppConstants.statusReceived] ?? 0,
+      'Send' => _counts[AppConstants.statusApproved] ?? 0,
+      'Receive' => _counts[AppConstants.statusSent] ?? 0,
+      'Collect' => _counts[AppConstants.statusReceived] ?? 0,
       'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       _ => 0, // All + Napkins — no counter
     };
