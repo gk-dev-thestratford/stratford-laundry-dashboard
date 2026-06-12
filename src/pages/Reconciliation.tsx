@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
-import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale } from 'lucide-react'
+import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale, StickyNote } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
@@ -82,6 +82,16 @@ type ResolutionType = 'accepted' | 'challenged' | 'written_off' | 'deferred' | '
 interface Resolution {
   type: ResolutionType
   note?: string
+}
+
+// Snapshot of the per-line work, saved to reconciliations.line_resolutions (jsonb) and
+// restored when the same invoice is uploaded again. Keys are notFoundKey() / order ids,
+// which are deterministic for the same PDF.
+interface LineResolutionsSnapshot {
+  notFound?: Record<string, Resolution>
+  missing?: Record<string, Resolution>
+  challenged?: string[]
+  lineNotes?: Record<string, string>
 }
 
 /** Unique key for a not_found invoice line */
@@ -328,7 +338,22 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   // Key by canonicalDocket so a reset-booklet ticket "6" matches a stored "0006", etc.
   const byDocket = new Map<string, Order[]>()
   const byRoom = new Map<string, Order[]>()
+  // Explicit human links (made via the Link modal) are stamped as "[ref:ticket|date|net]"
+  // in order notes. They take PRIORITY over docket/room heuristics — a manual link must
+  // never be overridden by a coincidental docket match. An order pinned to one of THIS
+  // invoice's lines is kept OUT of the docket/room pools so another line can't steal it.
+  const wantedRefs = invoiceRefKeys(invoice)
+  const byRef = new Map<string, Order[]>()
   for (const o of orders) {
+    const refs = o.notes?.match(/\[ref:[^\]]+\]/g) ?? []
+    let pinned = false
+    for (const r of refs) {
+      if (!wantedRefs.has(r)) continue
+      pinned = true
+      if (!byRef.has(r)) byRef.set(r, [])
+      byRef.get(r)!.push(o)
+    }
+    if (pinned) continue
     const dk = canonicalDocket(o.docket_number)
     if (!byDocket.has(dk)) byDocket.set(dk, [])
     byDocket.get(dk)!.push(o)
@@ -347,9 +372,15 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     const orderType = sectionTypeToOrderType(section.type)
     for (const line of section.lines) {
       if (line.isTopUp) { topUpCharges.push(line); continue }
-      // Issue 2: Pick first unclaimed order with this docket (canonicalised both sides)
-      const docketCandidates = byDocket.get(canonicalDocket(line.ticket)) ?? []
-      let order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
+      // 1) Explicit manual link (ref-key) wins over everything
+      const refKey = `[ref:${line.ticket}|${line.date}|${line.net}]`
+      let order = (byRef.get(refKey) ?? []).find(o => !matchedOrderIds.has(o.id)) ?? null
+      // 2) Issue 2: Pick first unclaimed order with this docket (canonicalised both sides)
+      if (!order) {
+        const docketCandidates = byDocket.get(canonicalDocket(line.ticket)) ?? []
+        order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
+      }
+      // 3) Guest lines: fall back to room-number match
       if (!order && section.type === 'guest' && line.ticket) {
         const candidates = (byRoom.get(line.ticket) ?? []).filter(o => !matchedOrderIds.has(o.id))
         if (candidates.length === 1) order = candidates[0]
@@ -357,14 +388,6 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
           const name = line.guestInfo.replace(/[()]/g, '').toLowerCase()
           order = candidates.find(o => o.guest_name?.toLowerCase().includes(name)) ?? candidates[0]
         }
-      }
-      // Fallback: match orders added from reconciliation by embedded ref key
-      if (!order) {
-        const refKey = `[ref:${line.ticket}|${line.date}|${line.net}]`
-        order = orders.find(o => {
-          if (matchedOrderIds.has(o.id)) return false
-          return o.notes?.includes(refKey) === true
-        }) ?? null
       }
       if (order) matchedOrderIds.add(order.id)
       const systemTotal = order ? computeOrderCost(order) : 0
@@ -404,6 +427,54 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     systemTotal: rows.reduce((s, r) => s + r.systemTotal, 0),
     departmentBreakdown: buildDepartmentBreakdown(rows, topUpCharges),
   }
+}
+
+// Fetch the orders the matcher works against: everything inside the invoice period
+// (optionally extended 1 month back), PLUS any order carrying a manual "[ref:...]" link
+// key in its notes. Linked orders can live OUTSIDE the period (whole-DB link search) —
+// without this merge a link to an order from another month silently disappears on
+// refetch and on every re-upload.
+function invoiceRefKeys(invoice: ParsedInvoice): Set<string> {
+  const keys = new Set<string>()
+  for (const section of invoice.sections) {
+    for (const line of section.lines) {
+      if (!line.isTopUp) keys.add(`[ref:${line.ticket}|${line.date}|${line.net}]`)
+    }
+  }
+  return keys
+}
+
+async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { start: Date; end: Date } | null, broaderSearch: boolean): Promise<Order[]> {
+  let fetched: Order[] = []
+  if (period) {
+    let fetchStart = period.start
+    if (broaderSearch) {
+      fetchStart = new Date(period.start)
+      fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
+    }
+    const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+      .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
+      .order('created_at', { ascending: true })
+    fetched = (data as Order[] | null) ?? []
+  } else {
+    const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+      .order('created_at', { ascending: false }).limit(500)
+    fetched = (data as Order[] | null) ?? []
+  }
+  // Merge only orders whose ref-key belongs to one of THIS invoice's lines — merging all
+  // ref-linked orders would let an order linked to a different invoice docket-match here.
+  const wanted = invoiceRefKeys(invoice)
+  const { data: refLinked } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
+    .ilike('notes', '%[ref:%').limit(500)
+  if (refLinked?.length) {
+    const seen = new Set(fetched.map(o => o.id))
+    for (const o of refLinked as Order[]) {
+      if (seen.has(o.id)) continue
+      const refs = o.notes?.match(/\[ref:[^\]]+\]/g)
+      if (refs?.some(r => wanted.has(r))) fetched.push(o)
+    }
+  }
+  return fetched
 }
 
 type FilterTab = 'all' | 'matched' | 'mismatch' | 'not_found' | 'missing'
@@ -453,6 +524,11 @@ export default function Reconciliation() {
   const [notFoundResolutions, setNotFoundResolutions] = useState<Record<string, Resolution>>({})
   const [missingResolutions, setMissingResolutions] = useState<Record<string, Resolution>>({})
   const [challengedItems, setChallengedItems] = useState<Set<string>>(new Set()) // "nf:{key}" or "miss:{orderId}" or "mm:{key}"
+  // Per-line notes (keyed by notFoundKey) — shown as a flag on the row, persisted in
+  // reconciliations.line_resolutions and restored when the same invoice is re-uploaded.
+  const [lineNotes, setLineNotes] = useState<Record<string, string>>({})
+  // created_at of the saved reconciliation whose per-line work was restored (banner)
+  const [restoredFrom, setRestoredFrom] = useState<string | null>(null)
   const [showChallengePanel, setShowChallengePanel] = useState(false)
   const [challengeEmail, setChallengeEmail] = useState('')
 
@@ -480,6 +556,8 @@ export default function Reconciliation() {
   // invoice ticket or keep ours), and whether to also sync the order's price to the invoice.
   const [addModalLinkDocket, setAddModalLinkDocket] = useState('')
   const [addModalLinkUpdatePrice, setAddModalLinkUpdatePrice] = useState(false)
+  // Optional department correction when linking ('' = keep the order's current department)
+  const [addModalLinkDept, setAddModalLinkDept] = useState('')
   // Link search hits the WHOLE database (not just this period's unmatched orders), so any
   // existing order — matched elsewhere, or from another month — can be found and linked.
   const [addModalLinkDbResults, setAddModalLinkDbResults] = useState<Order[]>([])
@@ -544,23 +622,7 @@ export default function Reconciliation() {
     if (!invoice) return
     const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
     setParsedPeriod(period)
-    let fetchedOrders: Order[] = []
-    if (period) {
-      // Issue 1: If broader search is ON, extend start date back 1 month
-      let fetchStart = period.start
-      if (broaderSearch) {
-        fetchStart = new Date(period.start)
-        fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
-      }
-      const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-        .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
-        .order('created_at', { ascending: true })
-      fetchedOrders = data ?? []
-    } else {
-      const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-        .order('created_at', { ascending: false }).limit(500)
-      fetchedOrders = data ?? []
-    }
+    const fetchedOrders = await fetchOrdersForReconciliation(invoice, period, broaderSearch)
     setOrders(fetchedOrders)
     // Pass original period as strictPeriod so broader-search orders don't appear in "In System Only"
     setResult(reconcile(invoice, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
@@ -571,7 +633,7 @@ export default function Reconciliation() {
     setFile(f); setError(''); setParsing(true)
     setInvoice(null); setResult(null); setSaved(false); setShowHistory(false)
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
-    setReconciliationNote('')
+    setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
     try {
       const lines = await extractPdfLines(f)
       console.log('[Reconciliation] Extracted PDF lines:', lines.slice(0, 30))
@@ -583,24 +645,30 @@ export default function Reconciliation() {
       setInvoice(parsed)
       const period = parseInvoicePeriod(parsed.invoicePeriod) || derivePeriodFromLines(parsed)
       setParsedPeriod(period)
-      let fetchedOrders: Order[] = []
-      if (period) {
-        let fetchStart = period.start
-        if (broaderSearch) {
-          fetchStart = new Date(period.start)
-          fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
-        }
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .gte('created_at', fetchStart.toISOString()).lte('created_at', period.end.toISOString())
-          .order('created_at', { ascending: true })
-        fetchedOrders = data ?? []
-      } else {
-        const { data } = await supabase.from('orders').select('*, department:departments(*), order_items(*)')
-          .order('created_at', { ascending: false }).limit(500)
-        fetchedOrders = data ?? []
-      }
+      const fetchedOrders = await fetchOrdersForReconciliation(parsed, period, broaderSearch)
       setOrders(fetchedOrders)
       setResult(reconcile(parsed, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
+
+      // Restore previously saved per-line work (resolutions, challenges, notes) for this
+      // invoice so re-uploading doesn't lose decisions already made.
+      if (parsed.invoiceNumber) {
+        const { data: prevRecs } = await supabase.from('reconciliations')
+          .select('created_at, notes, line_resolutions')
+          .eq('invoice_number', parsed.invoiceNumber)
+          .order('created_at', { ascending: false }).limit(1)
+        const prevRec = prevRecs?.[0] as { created_at: string; notes: string | null; line_resolutions?: LineResolutionsSnapshot | null } | undefined
+        if (prevRec) {
+          const lr = prevRec.line_resolutions
+          if (lr) {
+            if (lr.notFound) setNotFoundResolutions(lr.notFound)
+            if (lr.missing) setMissingResolutions(lr.missing)
+            if (Array.isArray(lr.challenged)) setChallengedItems(new Set(lr.challenged))
+            if (lr.lineNotes) setLineNotes(lr.lineNotes)
+          }
+          if (prevRec.notes) setReconciliationNote(prevRec.notes)
+          setRestoredFrom(prevRec.created_at)
+        }
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to parse PDF')
     } finally { setParsing(false) }
@@ -612,8 +680,8 @@ export default function Reconciliation() {
     setUpdatingPrices(new Set()); setNotFoundResolutions({}); setMissingResolutions({})
     setAddModalDocket(''); setAddModalDate(''); setSearchTerm('')
     setAddModalMode('create'); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch('')
-    setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([])
-    setReconciliationNote('')
+    setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([]); setAddModalLinkDept('')
+    setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
     setD140Report(null); setShowD140Prompt(false); setLastSavedRecId(null); setD140Saved(false)
   }
@@ -1213,7 +1281,7 @@ export default function Reconciliation() {
       console.error('Failed to upload PDF report:', e)
     }
 
-    const { data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert({
+    const insertPayload: Record<string, unknown> = {
       invoice_number: invoice.invoiceNumber, invoice_date: invoice.invoiceDate,
       invoice_period: invoice.invoicePeriod, created_by: user?.email || 'unknown',
       invoice_net: +result.invoiceTotal.toFixed(2), invoice_gross: +(result.invoiceTotal * 1.2).toFixed(2),
@@ -1224,12 +1292,25 @@ export default function Reconciliation() {
       report_file_path: reportPath,
       invoice_category: invoiceCategory,
       notes: reconciliationNote.trim() || null,
+      // Per-line work snapshot — restored when this invoice is uploaded again
+      line_resolutions: {
+        notFound: notFoundResolutions,
+        missing: missingResolutions,
+        challenged: Array.from(challengedItems),
+        lineNotes,
+      } satisfies LineResolutionsSnapshot,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
         invoiceNet: +d.invoiceNet.toFixed(2), systemTotal: +d.systemTotal.toFixed(2),
         allocatedTopUp: d.allocatedTopUp, totalCostNet: d.totalCostNet, totalCostGross: d.totalCostGross,
       })),
-    }).select('id').single()
+    }
+    let { data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert(insertPayload).select('id').single()
+    if (saveErr && /line_resolutions/i.test(saveErr.message || '')) {
+      // DB migration not applied yet — save without the snapshot rather than losing the save
+      delete insertPayload.line_resolutions
+      ;({ data: savedRec, error: saveErr } = await supabase.from('reconciliations').insert(insertPayload).select('id').single())
+    }
     if (saveErr) console.error('Failed to save reconciliation:', saveErr)
     if (savedRec) setLastSavedRecId(savedRec.id)
 
@@ -1293,7 +1374,7 @@ export default function Reconciliation() {
     setSaving(false); setSaved(true); loadHistory()
     // Prompt for D140 upload after saving a guest invoice
     if (invoice.sections.some(s => s.type === 'guest')) setShowD140Prompt(true)
-  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote])
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote, notFoundResolutions, missingResolutions, challengedItems, lineNotes])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1513,9 +1594,13 @@ export default function Reconciliation() {
       const invoiceNet = row.invoiceLine.net
 
       if (items.length === 0) {
-        const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+        const { error: orderErr, data: updRows } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId).select('id')
         if (orderErr) {
           setPriceUpdateError(`Docket ${docket}: Failed to update order total — ${orderErr.message}`)
+          return
+        }
+        if (!updRows || updRows.length === 0) {
+          setPriceUpdateError(`Docket ${docket}: Order total update had no effect (possible RLS policy)`)
           return
         }
         await refetchAndReconcile()
@@ -1542,8 +1627,9 @@ export default function Reconciliation() {
         else if (!updatedRows || updatedRows.length === 0) errors.push(`Item "${item.item_name}": update had no effect (possible RLS policy)`)
       }
 
-      const { error: orderErr } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId)
+      const { error: orderErr, data: ordRows } = await supabase.from('orders').update({ total_price: +invoiceNet.toFixed(2) }).eq('id', orderId).select('id')
       if (orderErr) errors.push(`Order total: ${orderErr.message}`)
+      else if (!ordRows || ordRows.length === 0) errors.push('Order total: update had no effect (possible RLS policy)')
 
       if (errors.length > 0) {
         setPriceUpdateError(`Docket ${docket}: ${errors.join('; ')}`)
@@ -1699,6 +1785,16 @@ export default function Reconciliation() {
       const target = orders.find(o => o.id === addModalLinkOrderId) ?? addModalLinkDbResults.find(o => o.id === addModalLinkOrderId)
       if (!target) throw new Error('Selected order not found')
       const refKey = `[ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`
+
+      // Re-linking: remove this line's ref-key from any OTHER order that carries it,
+      // so the old link can't shadow the new one on the next matching pass.
+      const { data: stale } = await supabase.from('orders')
+        .select('id, notes').ilike('notes', `%${refKey}%`).neq('id', target.id)
+      for (const s of stale ?? []) {
+        const cleaned = (s.notes || '').split(refKey).join(' ').replace(/\s{2,}/g, ' ').trim()
+        await supabase.from('orders').update({ notes: cleaned || null }).eq('id', s.id)
+      }
+
       // The docket to record on the order — user may correct a wrong invoice ticket here.
       const newDocket = addModalLinkDocket.trim() || target.docket_number
       const docketChanged = newDocket !== target.docket_number
@@ -1716,8 +1812,10 @@ export default function Reconciliation() {
       const orderUpdate: Record<string, unknown> = { notes: newNotes, reconciliation_id: null }
       if (docketChanged) orderUpdate.docket_number = newDocket
       if (addModalLinkUpdatePrice) orderUpdate.total_price = +row.invoiceLine.net.toFixed(2)
-      const { error: updErr } = await supabase.from('orders').update(orderUpdate).eq('id', target.id)
+      if (addModalLinkDept && addModalLinkDept !== target.department_id) orderUpdate.department_id = addModalLinkDept
+      const { error: updErr, data: updRows } = await supabase.from('orders').update(orderUpdate).eq('id', target.id).select('id')
       if (updErr) throw updErr
+      if (!updRows || updRows.length === 0) throw new Error('Order update had no effect (possible RLS policy)')
 
       // Optionally sync per-item prices to the invoice (distribute net by quantity)
       if (addModalLinkUpdatePrice) {
@@ -1742,16 +1840,20 @@ export default function Reconciliation() {
       })
 
       const key = notFoundKey(row)
-      setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system', note: addModalNote.trim() || undefined } }))
+      if (row.status === 'not_found') {
+        setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system', note: addModalNote.trim() || undefined } }))
+      }
+      if (addModalNote.trim()) setLineNotes(prev => ({ ...prev, [key]: addModalNote.trim() }))
       await refetchAndReconcile()
       setAddModal(null); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch(''); setAddModalMode('create')
-      setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([])
+      setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([]); setAddModalLinkDept('')
     } catch (e) {
       console.error('Failed to link existing order:', e)
+      setPriceUpdateError(`Link failed (docket ${addModal.row.invoiceLine.ticket}): ${e instanceof Error ? e.message : 'unknown error'}`)
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, orders, addModalLinkDbResults, refetchAndReconcile])
+  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, addModalLinkDept, orders, addModalLinkDbResults, refetchAndReconcile])
 
   // ── Open the Add/Link modal for ANY row (not-found, mismatch, or matched) ──
   // Lets the user link/relink a line to the right order (by docket, room, name…) and add
@@ -1759,7 +1861,7 @@ export default function Reconciliation() {
   const openAddModal = useCallback((row: ReconciliationRow, index: number, mode: 'create' | 'link') => {
     setAddModal({ row, index }); setAddModalDept('')
     setAddModalMode(mode); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkDocket('')
-    setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([])
+    setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([]); setAddModalLinkDept('')
     // For a line that already has an order, pre-seed the search with the room (guest) or
     // docket so the current order surfaces immediately — they can re-select to add a note,
     // or search for a different one.
@@ -2082,13 +2184,14 @@ export default function Reconciliation() {
       </div>
 
       {/* Issue 4: Warning if this invoice was already reconciled */}
-      {history.some(h => h.invoice_number === invoice.invoiceNumber) && (
+      {(restoredFrom || history.some(h => h.invoice_number === invoice.invoiceNumber)) && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex items-center gap-3">
           <AlertTriangle className="w-5 h-5 text-blue-500 flex-shrink-0" />
           <p className="text-sm text-blue-800">
-            This invoice (<span className="font-medium">{invoice.invoiceNumber}</span>) was previously reconciled on{' '}
-            <span className="font-medium">{format(new Date(history.find(h => h.invoice_number === invoice.invoiceNumber)!.created_at), 'dd MMM yyyy')}</span>.
-            Previously matched orders are excluded from this reconciliation.
+            This invoice (<span className="font-medium">{invoice.invoiceNumber}</span>) was previously reconciled
+            {restoredFrom
+              ? <> on <span className="font-medium">{format(new Date(restoredFrom), 'dd MMM yyyy HH:mm')}</span>. Your earlier work — resolutions, challenge flags, per-line notes and the invoice note — has been <span className="font-medium">restored</span>; links made to system orders are picked up automatically.</>
+              : <>. No saved per-line work was found to restore.</>}
           </p>
         </div>
       )}
@@ -2523,6 +2626,11 @@ export default function Reconciliation() {
                   : row.status === 'price_mismatch'
                     ? challengedItems.has(`mm:${nfKey}`)
                     : false
+                // Note attached to this line (this session, a restored save, or stamped on
+                // the linked order's notes) — flagged so it resurfaces on re-reconciliation.
+                const rowNote = lineNotes[nfKey]
+                  || nfRes?.note
+                  || row.order?.notes?.match(/Note:\s*([^[]+)/)?.[1]?.trim()
                 return (
                 <tr key={i} className={`border-b border-gray-100 ${
                   nfRes?.type === 'accepted' ? 'bg-green-50/40' :
@@ -2535,6 +2643,11 @@ export default function Reconciliation() {
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
                     {row.invoiceLine.ticket}{row.invoiceLine.guestInfo && <span className="text-gray-400 ml-1">{row.invoiceLine.guestInfo}</span>}
+                    {rowNote && (
+                      <span title={rowNote} className="inline-flex align-middle ml-1.5 cursor-help">
+                        <StickyNote className="w-3.5 h-3.5 text-amber-500" />
+                      </span>
+                    )}
                   </td>
                   <td className="px-3 py-2.5 text-gray-600">{row.order?.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-700 max-w-[220px] truncate" title={row.invoiceLine.description}>{row.invoiceLine.description}</td>
@@ -3169,6 +3282,16 @@ export default function Reconciliation() {
                         <input type="text" value={addModalLinkDocket} onChange={e => setAddModalLinkDocket(e.target.value)}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy/30" />
                         <p className="text-[10px] text-gray-500 mt-0.5">Correct it if the invoice ticket is wrong, or keep our docket {'\u2014'} the two are linked either way.</p>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Department (correct it if wrong)</label>
+                        <select value={addModalLinkDept} onChange={e => setAddModalLinkDept(e.target.value)}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30">
+                          <option value="">
+                            Keep current ({(orders.find(o => o.id === addModalLinkOrderId) ?? addModalLinkDbResults.find(o => o.id === addModalLinkOrderId))?.department?.name || 'Unallocated'})
+                          </option>
+                          {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                        </select>
                       </div>
                       {(() => {
                         const t = orders.find(o => o.id === addModalLinkOrderId) ?? addModalLinkDbResults.find(o => o.id === addModalLinkOrderId)

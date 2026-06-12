@@ -7,7 +7,6 @@
         "npx",
         "-y",
         "@supabase/mcp-server-supabase@0.8.1",
-        "--read-only",
         "--project-ref=uhpiwiaadzwgmnusjinv",
         "--features=database,debugging,development,docs"
       ],
