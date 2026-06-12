@@ -124,13 +124,21 @@ class SupabaseService {
 
   // ── Edge Functions ──
 
-  /// Invoke the daily-report Edge Function to send collection report emails
-  Future<void> invokeDailyReport() async {
-    if (!isInitialized) return;
+  /// Invoke the daily-report Edge Function to send the combined daily report.
+  /// Returns true when the function ran and every email was accepted.
+  Future<bool> invokeDailyReport() async {
+    if (!isInitialized) return false;
     try {
-      await _client!.functions.invoke('daily-report');
+      final res = await _client!.functions.invoke('daily-report');
+      final data = res.data;
+      if (data is Map && data['success'] == false) {
+        debugPrint('[Supabase] daily-report reported failure: $data');
+        return false;
+      }
+      return true;
     } catch (e) {
       debugPrint('[Supabase] Failed to invoke daily-report: $e');
+      return false;
     }
   }
 

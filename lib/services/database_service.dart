@@ -23,7 +23,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 8,
+      version: 9,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -94,6 +94,31 @@ class DatabaseService {
         )
       ''');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_announcements_window ON announcements(starts_at, ends_at) WHERE is_active = 1');
+    }
+    if (oldVersion < 9) {
+      // Status model rename (2026-06-12):
+      //   old 'collected' (sent to laundry) + 'in_processing'  -> 'sent'
+      //   old 'completed'                                      -> 'received'
+      //   old 'picked_up'                                      -> 'collected' (owner pick-up)
+      // Local rows written before this APK still hold old strings — rewrite
+      // both the orders table and the local status log.
+      const statusCaseMapping = '''
+        CASE status
+          WHEN 'collected' THEN 'sent'
+          WHEN 'in_processing' THEN 'sent'
+          WHEN 'completed' THEN 'received'
+          WHEN 'picked_up' THEN 'collected'
+          ELSE status
+        END
+      ''';
+      await db.execute(
+        "UPDATE orders SET status = $statusCaseMapping "
+        "WHERE status IN ('collected','in_processing','completed','picked_up')",
+      );
+      await db.execute(
+        "UPDATE order_status_log SET status = $statusCaseMapping "
+        "WHERE status IN ('collected','in_processing','completed','picked_up')",
+      );
     }
   }
 
@@ -462,7 +487,7 @@ class DatabaseService {
       'guest_name': original['guest_name'],
       'bag_count': original['bag_count'],
       'notes': 'Outstanding from #${original['docket_number']}',
-      'status': 'in_processing',
+      'status': 'sent',
       'total_price': null,
       'parent_order_id': originalOrderId,
       'created_at': now,
@@ -830,14 +855,14 @@ class DatabaseService {
     return result.map((r) => r['parent_order_id'] as String).toSet();
   }
 
-  /// Auto-expires completed orders older than [days] days.
-  Future<int> autoExpireCompletedOrders({int days = 20}) async {
+  /// Auto-expires received orders older than [days] days.
+  Future<int> autoExpireReceivedOrders({int days = 20}) async {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
     final now = DateTime.now().toIso8601String();
 
     final orders = await db.query('orders',
-      where: "status = 'completed' AND updated_at < ?",
+      where: "status = 'received' AND updated_at < ?",
       whereArgs: [cutoff],
     );
 
@@ -867,15 +892,15 @@ class DatabaseService {
     return orders.length;
   }
 
-  /// Auto-collects completed orders older than [days] days.
-  /// Marks them as picked_up with a system status log.
-  Future<int> autoCollectCompletedOrders({int days = 21}) async {
+  /// Auto-collects received orders older than [days] days.
+  /// Marks them as collected (owner pick-up) with a system status log.
+  Future<int> autoCollectReceivedOrders({int days = 21}) async {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
     final now = DateTime.now().toIso8601String();
 
     final orders = await db.query('orders',
-      where: "status = 'completed' AND updated_at < ?",
+      where: "status = 'received' AND updated_at < ?",
       whereArgs: [cutoff],
     );
 
@@ -887,14 +912,14 @@ class DatabaseService {
       final orderId = order['id'] as String;
       batch.update(
         'orders',
-        {'status': 'picked_up', 'updated_at': now},
+        {'status': 'collected', 'updated_at': now},
         where: 'id = ?',
         whereArgs: [orderId],
       );
       batch.insert('order_status_log', {
         'id': uuid.v4(),
         'order_id': orderId,
-        'status': 'picked_up',
+        'status': 'collected',
         'changed_by_name': 'System',
         'reason': 'Automatic Rule — Collected after $days days',
         'created_at': now,
@@ -905,14 +930,97 @@ class DatabaseService {
   }
 
   /// Returns a set of parent order IDs where the outstanding (child) order
-  /// has been completed/received, meaning the outstanding is resolved.
+  /// has been received/collected, meaning the outstanding is resolved.
   Future<Set<String>> getResolvedOutstandingOrderIds() async {
     final db = await database;
     final result = await db.rawQuery(
       "SELECT DISTINCT parent_order_id FROM orders "
-      "WHERE parent_order_id IS NOT NULL AND status IN ('completed', 'picked_up', 'expired')",
+      "WHERE parent_order_id IS NOT NULL AND status IN ('received', 'collected', 'expired')",
     );
     return result.map((r) => r['parent_order_id'] as String).toSet();
+  }
+
+  /// Latest status-log timestamp per order for a given [status]
+  /// (e.g. when each order was last marked 'sent') — used for aging badges.
+  Future<Map<String, String>> getLatestStatusLogDates(
+    List<String> orderIds, String status,
+  ) async {
+    if (orderIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = List.filled(orderIds.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT order_id, MAX(created_at) AS latest FROM order_status_log '
+      'WHERE status = ? AND order_id IN ($placeholders) GROUP BY order_id',
+      [status, ...orderIds],
+    );
+    return {
+      for (final r in rows)
+        if (r['latest'] != null) r['order_id'] as String: r['latest'] as String,
+    };
+  }
+
+  /// Orders that gained a [status] status-log entry today (since local
+  /// midnight), with department name — used by the Daily Report preview.
+  Future<List<Map<String, dynamic>>> getOrdersWithStatusLogToday(String status) async {
+    final db = await database;
+    final now = DateTime.now();
+    final todayIso = DateTime(now.year, now.month, now.day).toIso8601String();
+    return db.rawQuery('''
+      SELECT o.*, d.name AS department_name, d.code AS department_code
+      FROM orders o
+      LEFT JOIN departments d ON o.department_id = d.id
+      WHERE o.id IN (
+        SELECT order_id FROM order_status_log
+        WHERE status = ? AND created_at >= ?
+      )
+      ORDER BY o.created_at ASC
+    ''', [status, todayIso]);
+  }
+
+  /// All items for the given orders, grouped by order ID — bulk version of
+  /// [getOrderItems] used by the Daily Report preview.
+  Future<Map<String, List<Map<String, dynamic>>>> getOrderItemsByOrderIds(
+    List<String> orderIds,
+  ) async {
+    if (orderIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = List.filled(orderIds.length, '?').join(',');
+    final rows = await db.query(
+      'order_items',
+      where: 'order_id IN ($placeholders)',
+      whereArgs: orderIds,
+    );
+    final map = <String, List<Map<String, dynamic>>>{};
+    for (final r in rows) {
+      map.putIfAbsent(r['order_id'] as String, () => []).add(r);
+    }
+    return map;
+  }
+
+  /// Per-order summary of items still awaited (quantity_received < quantity_sent),
+  /// e.g. "awaiting 2× Chef Jacket, 1× Apron". Pool-tracked napkins are
+  /// excluded — they're never received per-ticket. Orders with no shortfall
+  /// are absent from the map.
+  Future<Map<String, String>> getAwaitingSummaries(List<String> orderIds) async {
+    if (orderIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = List.filled(orderIds.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT order_id, item_name, quantity_sent - COALESCE(quantity_received, 0) AS awaited '
+      'FROM order_items '
+      "WHERE order_id IN ($placeholders) "
+      'AND quantity_sent > COALESCE(quantity_received, 0) '
+      "AND LOWER(item_name) NOT LIKE '%napkin%'",
+      orderIds,
+    );
+    final parts = <String, List<String>>{};
+    for (final r in rows) {
+      parts.putIfAbsent(r['order_id'] as String, () => [])
+          .add('${r['awaited']}× ${r['item_name']}');
+    }
+    return {
+      for (final e in parts.entries) e.key: 'awaiting ${e.value.join(', ')}',
+    };
   }
 
   // ── Data Cleanup ──

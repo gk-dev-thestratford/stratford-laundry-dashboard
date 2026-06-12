@@ -95,14 +95,13 @@ class AppColors {
   static const grey800 = Color(0xFF424242);
   static const grey900 = Color(0xFF212121);
 
-  // Status colors
+  // Status colors (five-stage model: submitted → approved → sent → received → collected)
   static const statusSubmitted = Color(0xFF2196F3); // Blue
   static const statusApproved = Color(0xFF4CAF50);  // Green
   static const statusRejected = Color(0xFFE53935);  // Red
-  static const statusCollected = Color(0xFFFF9800);  // Orange
-  static const statusInProcessing = Color(0xFFFF9800); // Amber
-  static const statusReceived = Color(0xFF26A69A);   // Teal
-  static const statusCompleted = Color(0xFF4CAF50);  // Green
+  static const statusSent = Color(0xFFFF9800);      // Orange — at the laundry
+  static const statusReceived = Color(0xFF26A69A);  // Teal — back in laundry room
+  static const statusCollected = Color(0xFF4CAF50); // Green — owner picked up
 
   // Functional
   static const error = Color(0xFFE53935);

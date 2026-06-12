@@ -1,5 +1,7 @@
+// NOTE 2026-06-12: material_design_icons_flutter removed — it extends IconData,
+// which Flutter 3.44 made final, so the package no longer compiles and is
+// unmaintained. Icons below use closest built-in Material equivalents.
 import 'package:flutter/material.dart';
-import 'package:material_design_icons_flutter/material_design_icons_flutter.dart';
 
 class CatalogueItem {
   final String id;
@@ -57,29 +59,29 @@ class CatalogueItem {
     final lower = name.toLowerCase();
 
     // ── Uniform items (from Supabase) ──
-    if (lower.contains('t-shirt') || lower.contains('polo shirt'))  return MdiIcons.polo;          // Polo collar shirt
-    if (lower.contains('shirt') && !lower.contains('chef'))          return MdiIcons.tshirtCrewOutline; // Crew-neck shirt
-    if (lower.contains('blouse'))                                     return MdiIcons.tshirtVOutline;   // V-neck blouse
-    if (lower.contains('chef') && lower.contains('trouser'))         return MdiIcons.chefHat;          // Chef uniform bottom
-    if (lower.contains('trouser') || lower.contains('jean'))         return MdiIcons.humanMaleHeight;  // Standing figure (trousers/full-length)
-    if (lower.contains('dress'))                                      return MdiIcons.humanFemale;      // Female silhouette (dress shape)
-    if (lower.contains('chef') && lower.contains('jacket'))          return MdiIcons.chefHat;          // Chef hat
-    if (lower.contains('jacket') || lower.contains('blazer'))        return MdiIcons.hanger;           // Jacket on hanger
-    if (lower.contains('apron'))                                      return Icons.restaurant_menu;     // Service/kitchen
-    if (lower.contains('waistcoat') || lower.contains('vest'))       return MdiIcons.bowTie;           // Formal vest
-    if (lower.contains('suit'))                                       return MdiIcons.tie;              // Necktie = formal suit
-    if (lower.contains('hoody') || lower.contains('hoodie') || lower.contains('jumper')) return MdiIcons.tshirtCrew; // Heavy crew-neck
-    if (lower.contains('coat'))                                       return MdiIcons.coatRack;         // Coat on rack
-    if (lower.contains('pullover') || lower.contains('sweater'))     return MdiIcons.tshirtV;          // V-neck knitwear
+    if (lower.contains('t-shirt') || lower.contains('polo shirt'))  return Icons.checkroom_outlined;   // Casual top
+    if (lower.contains('shirt') && !lower.contains('chef'))          return Icons.dry_cleaning_outlined; // Shirt on hanger
+    if (lower.contains('blouse'))                                     return Icons.dry_cleaning;          // Blouse on hanger
+    if (lower.contains('chef') && lower.contains('trouser'))         return Icons.soup_kitchen;          // Chef uniform bottom
+    if (lower.contains('trouser') || lower.contains('jean'))         return Icons.accessibility_new;     // Standing figure (trousers/full-length)
+    if (lower.contains('dress'))                                      return Icons.woman;                 // Female silhouette (dress shape)
+    if (lower.contains('chef') && lower.contains('jacket'))          return Icons.soup_kitchen;          // Chef
+    if (lower.contains('jacket') || lower.contains('blazer'))        return Icons.checkroom;             // Jacket on hanger
+    if (lower.contains('apron'))                                      return Icons.restaurant_menu;       // Service/kitchen
+    if (lower.contains('waistcoat') || lower.contains('vest'))       return Icons.style;                 // Formal vest
+    if (lower.contains('suit'))                                       return Icons.business_center;       // Formal suit
+    if (lower.contains('hoody') || lower.contains('hoodie') || lower.contains('jumper')) return Icons.dry_cleaning; // Heavy top
+    if (lower.contains('coat'))                                       return Icons.checkroom;             // Coat on rack
+    if (lower.contains('pullover') || lower.contains('sweater'))     return Icons.dry_cleaning_outlined; // Knitwear
 
     // ── HSK linen items ──
     if (lower.contains('curtain'))                                    return Icons.curtains;
     if (lower.contains('duvet cover'))                                return Icons.bed_outlined;
     if (lower.contains('duvet'))                                      return Icons.bed;
-    if (lower.contains('bathrobe') || lower.contains('robe'))        return MdiIcons.bathtubOutline;
+    if (lower.contains('bathrobe') || lower.contains('robe'))        return Icons.bathtub_outlined;
     if (lower.contains('bath towel'))                                 return Icons.dry;
     if (lower.contains('hand towel'))                                 return Icons.dry_outlined;
-    if (lower.contains('bath mat'))                                   return MdiIcons.scaleBathroom;
+    if (lower.contains('bath mat'))                                   return Icons.rectangle_outlined;
     if (lower.contains('bed sheet') || lower.contains('sheet'))      return Icons.single_bed;
     if (lower.contains('pillowcase') || lower.contains('pillow'))    return Icons.airline_seat_individual_suite;
 
@@ -112,15 +114,15 @@ class CatalogueItem {
 
   /// Uniform items — prices TBC by Georgi
   static final List<CatalogueItem> uniformItems = [
-    CatalogueItem(id: 'uni001', code: 'UNI-001', name: 'Shirt', category: 'uniform', price: 3.50, sortOrder: 1, icon: MdiIcons.tshirtCrewOutline),
-    CatalogueItem(id: 'uni002', code: 'UNI-002', name: 'Blouse', category: 'uniform', price: 3.50, sortOrder: 2, icon: MdiIcons.tshirtVOutline),
+    CatalogueItem(id: 'uni001', code: 'UNI-001', name: 'Shirt', category: 'uniform', price: 3.50, sortOrder: 1, icon: Icons.dry_cleaning_outlined),
+    CatalogueItem(id: 'uni002', code: 'UNI-002', name: 'Blouse', category: 'uniform', price: 3.50, sortOrder: 2, icon: Icons.dry_cleaning),
     CatalogueItem(id: 'uni003', code: 'UNI-003', name: 'Trousers', category: 'uniform', price: 4.00, sortOrder: 3, icon: Icons.checkroom),
-    CatalogueItem(id: 'uni004', code: 'UNI-004', name: 'Dress', category: 'uniform', price: 5.00, sortOrder: 4, icon: Icons.dry_cleaning),
-    CatalogueItem(id: 'uni005', code: 'UNI-005', name: 'Jacket / Blazer', category: 'uniform', price: 6.00, sortOrder: 5, icon: MdiIcons.hanger),
+    CatalogueItem(id: 'uni004', code: 'UNI-004', name: 'Dress', category: 'uniform', price: 5.00, sortOrder: 4, icon: Icons.woman),
+    CatalogueItem(id: 'uni005', code: 'UNI-005', name: 'Jacket / Blazer', category: 'uniform', price: 6.00, sortOrder: 5, icon: Icons.checkroom),
     CatalogueItem(id: 'uni006', code: 'UNI-006', name: 'Apron', category: 'uniform', price: 2.50, sortOrder: 6, icon: Icons.kitchen),
-    CatalogueItem(id: 'uni007', code: 'UNI-007', name: 'Tie', category: 'uniform', price: 2.00, sortOrder: 7, icon: MdiIcons.tie),
-    CatalogueItem(id: 'uni008', code: 'UNI-008', name: 'Waistcoat', category: 'uniform', price: 4.00, sortOrder: 8, icon: MdiIcons.bowTie),
-    CatalogueItem(id: 'uni009', code: 'UNI-009', name: 'Chef Jacket', category: 'uniform', price: 4.50, sortOrder: 9, icon: MdiIcons.chefHat),
+    CatalogueItem(id: 'uni007', code: 'UNI-007', name: 'Tie', category: 'uniform', price: 2.00, sortOrder: 7, icon: Icons.business_center),
+    CatalogueItem(id: 'uni008', code: 'UNI-008', name: 'Waistcoat', category: 'uniform', price: 4.00, sortOrder: 8, icon: Icons.style),
+    CatalogueItem(id: 'uni009', code: 'UNI-009', name: 'Chef Jacket', category: 'uniform', price: 4.50, sortOrder: 9, icon: Icons.soup_kitchen),
     CatalogueItem(id: 'uni010', code: 'UNI-010', name: 'Chef Trousers', category: 'uniform', price: 4.00, sortOrder: 10, icon: Icons.restaurant),
   ];
 

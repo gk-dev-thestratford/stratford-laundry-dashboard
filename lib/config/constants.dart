@@ -8,23 +8,25 @@ class AppConstants {
   // Admin auto-lock timeout
   static const Duration adminTimeout = Duration(minutes: 5);
 
-  // Order statuses
+  // Order statuses — five-stage model (renamed 2026-06-12):
+  // submitted -> approved -> sent -> received -> collected (+ rejected, expired)
   static const String statusSubmitted = 'submitted';
   static const String statusApproved = 'approved';
   static const String statusRejected = 'rejected';
-  static const String statusCollected = 'collected';
-  static const String statusInProcessing = 'in_processing';
+  /// Laundry company collected the items for washing (was 'collected'/'in_processing')
+  static const String statusSent = 'sent';
+  /// Items back from the laundry company, in the laundry room (was 'received'/'completed')
   static const String statusReceived = 'received';
-  static const String statusCompleted = 'completed';
-  static const String statusPickedUp = 'picked_up';
+  /// The owner (staff member) picked up their items (was 'picked_up')
+  static const String statusCollected = 'collected';
   static const String statusExpired = 'expired';
 
-  // Completed order auto-collect (mark as picked_up after N days)
+  // Received order auto-collect (mark as collected after N days)
   static const int autoCollectDays = 21;
 
-  // Completed order auto-expiry (archive after N days)
-  static const int completedExpiryDays = 20;
-  static const int completedExpiryWarningDays = 5;
+  // Received order auto-expiry (archive after N days)
+  static const int receivedExpiryDays = 20;
+  static const int receivedExpiryWarningDays = 5;
 
   // Order types
   static const String orderTypeUniform = 'uniform';
@@ -54,11 +56,14 @@ class AppLabels {
     AppConstants.statusSubmitted: 'Submitted',
     AppConstants.statusApproved: 'Approved',
     AppConstants.statusRejected: 'Rejected',
-    AppConstants.statusCollected: 'Collected',
-    AppConstants.statusInProcessing: 'In Processing',
+    AppConstants.statusSent: 'Sent',
     AppConstants.statusReceived: 'Received',
-    AppConstants.statusCompleted: 'Returned',
-    AppConstants.statusPickedUp: 'Picked Up',
+    AppConstants.statusCollected: 'Collected',
     AppConstants.statusExpired: 'Expired',
+    // Legacy display fallbacks — stale local status-log rows written before
+    // the 2026-06-12 rename still render with the new vocabulary.
+    'in_processing': 'Sent',
+    'completed': 'Received',
+    'picked_up': 'Collected',
   };
 }

@@ -8,7 +8,7 @@ import '../../theme/app_theme.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/sync_service.dart';
-import '../../widgets/success_toast.dart';
+import '../../widgets/thumbs_up_confirmation.dart';
 
 class NapkinReturnsScreen extends ConsumerStatefulWidget {
   const NapkinReturnsScreen({super.key});
@@ -77,14 +77,53 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
       return;
     }
 
+    final note = _noteController.text.trim().isEmpty
+        ? 'Bulk return from Laundrevo'
+        : _noteController.text.trim();
+
+    // Confirmation step — staff found the silent add-and-save flow confusing.
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Confirm Napkin Return'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Log $qty napkins returned from the laundry?',
+                style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: AppTextStyles.bodySize,
+                    fontWeight: AppTextStyles.medium)),
+            const SizedBox(height: AppSpacing.md),
+            Text('Note: $note',
+                style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: AppTextStyles.labelSize,
+                    color: AppColors.grey600)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () => Navigator.pop(ctx, true),
+            icon: const Icon(Icons.check, size: AppSizes.iconSizeSm),
+            label: const Text('Confirm'),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.success),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
     final admin = ref.read(adminProvider).currentAdmin;
     final db = DatabaseService.instance;
     final uuid = const Uuid();
     final now = DateTime.now().toIso8601String();
     final entryId = uuid.v4();
-    final note = _noteController.text.trim().isEmpty
-        ? 'Bulk return from Laundrevo'
-        : _noteController.text.trim();
 
     await db.insertLedgerEntry({
       'id': entryId,
@@ -115,7 +154,7 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
     await _loadData();
 
     if (mounted) {
-      SuccessToast.show(context, message: '$qty napkins logged');
+      showThumbsUpConfirmation(context, message: '$qty napkins logged');
     }
   }
 
@@ -194,14 +233,14 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
   Widget _buildBalanceCards() {
     return Row(
       children: [
-        Expanded(child: _statCard('Sent Out', _totalOut, AppColors.statusCollected, Icons.arrow_upward_rounded)),
+        Expanded(child: _statCard('Sent Out', _totalOut, AppColors.statusSent, Icons.arrow_upward_rounded)),
         const SizedBox(width: AppSpacing.base),
         Expanded(child: _statCard('Received In', _totalIn, AppColors.success, Icons.arrow_downward_rounded)),
         const SizedBox(width: AppSpacing.base),
         Expanded(child: _statCard(
           'Balance',
           _balance,
-          _balance > 0 ? AppColors.statusCollected : AppColors.success,
+          _balance > 0 ? AppColors.statusSent : AppColors.success,
           _balance > 0 ? Icons.pending_outlined : Icons.check_circle_outline,
         )),
       ],
@@ -395,7 +434,7 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
                           color: isOut
-                              ? AppColors.statusCollected.withValues(alpha: 0.12)
+                              ? AppColors.statusSent.withValues(alpha: 0.12)
                               : AppColors.success.withValues(alpha: 0.12),
                           borderRadius: AppRadius.smallBR,
                         ),
@@ -406,7 +445,7 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
                             fontFamily: 'Inter',
                             fontSize: AppTextStyles.captionSize,
                             fontWeight: AppTextStyles.bold,
-                            color: isOut ? AppColors.statusCollected : AppColors.success,
+                            color: isOut ? AppColors.statusSent : AppColors.success,
                           ),
                         ),
                       ),

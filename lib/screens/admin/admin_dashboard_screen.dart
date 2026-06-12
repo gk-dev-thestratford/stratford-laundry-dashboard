@@ -9,10 +9,9 @@ import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
-import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
 import '../../widgets/announcement_banner.dart';
-import '../../widgets/success_toast.dart';
+import '../../widgets/thumbs_up_confirmation.dart';
 import '../../widgets/sync_indicator.dart';
 
 class AdminDashboardScreen extends ConsumerStatefulWidget {
@@ -32,6 +31,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   Set<String> _selectedOrderIds = {};
   Map<String, String> _itemSummaries = {};
   Set<String> _partialOrderIds = {};
+  Map<String, String> _sentDates = {};
+  Map<String, String> _awaitingSummaries = {};
   String? _allTabDateFilter;
   String? _allTabTypeFilter;
 
@@ -39,20 +40,22 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   static const _kRejected = 0;
   static const _kPending = 1;
   static const _kApproved = 2;
-  static const _kInProgress = 3;
-  static const _kCompleted = 4;
+  static const _kSent = 3;
+  static const _kReceived = 4;
   static const _kAll = 5;
   static const _kNapkinReturns = 6;
+  static const _kReport = 7;
 
-  static const _tabs = ['Rejected', 'Pending', 'Approved', 'In Processing', 'Returned', 'All', 'Napkins'];
+  static const _tabs = ['Rejected', 'Pending', 'Approved', 'Sent', 'Received', 'All', 'Napkins', 'Report'];
   static const _statusFilters = [
     AppConstants.statusRejected,
     AppConstants.statusSubmitted,
     AppConstants.statusApproved,
-    null, // In Progress = collected + in_processing
-    AppConstants.statusCompleted,
+    AppConstants.statusSent,
+    AppConstants.statusReceived,
     null, // All
     null, // Napkin Returns — navigates to separate screen
+    null, // Daily Report — navigates to separate screen
   ];
 
   @override
@@ -95,7 +98,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   }
 
   Future<void> _loadData({bool silent = false}) async {
-    // autoCollectCompletedOrders and autoExpireCompletedOrders used to run
+    // autoCollectReceivedOrders and autoExpireReceivedOrders used to run
     // here on every tab change — wasteful, since they only need to run
     // periodically. They're now invoked once per hour by SyncService's
     // periodic cleanup, so loadData just reads.
@@ -113,12 +116,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final tabIndex = _tabController.index;
     List<Map<String, dynamic>> orders;
 
-    if (tabIndex == _kInProgress) {
-      // In Progress = collected + in_processing
-      final c = List.of(await DatabaseService.instance.getOrders(status: AppConstants.statusCollected, searchQuery: _searchQuery));
-      final p = List.of(await DatabaseService.instance.getOrders(status: AppConstants.statusInProcessing, searchQuery: _searchQuery));
-      orders = [...c, ...p];
-    } else if (tabIndex == _kAll) {
+    if (tabIndex == _kAll) {
       // All tab: search-first — only load when search or filters are active
       final hasFilters = _searchQuery.isNotEmpty || _allTabDateFilter != null || _allTabTypeFilter != null;
       if (!hasFilters) {
@@ -146,18 +144,32 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       ));
     }
 
-    // Load item summaries for In Progress tab
+    final orderIds = orders.map((o) => o['id'] as String).toList();
+
+    // Load item summaries for Sent tab
     Map<String, String> summaries = {};
-    if (tabIndex == _kInProgress && orders.isNotEmpty) {
-      summaries = await DatabaseService.instance.getOrderItemSummaries(
-        orders.map((o) => o['id'] as String).toList(),
-      );
+    if (tabIndex == _kSent && orders.isNotEmpty) {
+      summaries = await DatabaseService.instance.getOrderItemSummaries(orderIds);
     }
 
-    // Load partial receipt order IDs for Completed / All tabs
+    // Load partial receipt order IDs for Received / All / Sent tabs
     Set<String> partialIds = {};
-    if (tabIndex == _kCompleted || tabIndex == _kAll || tabIndex == _kInProgress) {
+    if (tabIndex == _kReceived || tabIndex == _kAll || tabIndex == _kSent) {
       partialIds = await DatabaseService.instance.getPartialReceiptOrderIds();
+    }
+
+    // Sent tab: when each order was marked 'sent' (for the aging badge)
+    Map<String, String> sentDates = {};
+    if (tabIndex == _kSent && orders.isNotEmpty) {
+      sentDates = await DatabaseService.instance
+          .getLatestStatusLogDates(orderIds, AppConstants.statusSent);
+    }
+
+    // Received tab: items still awaited (for the Discrepancy badge)
+    Map<String, String> awaitingSummaries = {};
+    if (tabIndex == _kReceived && orders.isNotEmpty) {
+      awaitingSummaries =
+          await DatabaseService.instance.getAwaitingSummaries(orderIds);
     }
 
     if (mounted) {
@@ -165,15 +177,17 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         _orders = orders;
         _itemSummaries = summaries;
         _partialOrderIds = partialIds;
+        _sentDates = sentDates;
+        _awaitingSummaries = awaitingSummaries;
         _isLoading = false;
       });
     }
   }
 
-  /// Animated thumbs-up toast — small, non-intrusive, appears in bottom-right
-  /// corner so it doesn't block the workflow.
+  /// Centered, double-size thumbs-up confirmation — auto-dismisses and lets
+  /// taps pass through, so it never blocks the workflow.
   void _showStatusSnackBar(String message) {
-    SuccessToast.show(context, message: message);
+    showThumbsUpConfirmation(context, message: message);
   }
 
   void _logout() {
@@ -186,8 +200,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
   bool get _isPendingTab => _tabController.index == _kPending;
   bool get _isApprovedTab => _tabController.index == _kApproved;
-  bool get _isInProgressTab => _tabController.index == _kInProgress;
-  bool get _isCompletedTab => _tabController.index == _kCompleted;
+  bool get _isSentTab => _tabController.index == _kSent;
+  bool get _isReceivedTab => _tabController.index == _kReceived;
   bool get _isRejectedTab => _tabController.index == _kRejected;
 
   Future<void> _quickAction(String orderId, String newStatus, {String? reason}) async {
@@ -195,12 +209,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final db = DatabaseService.instance;
 
     // Optimistic UI: remove order instantly (new list — sqflite lists are unmodifiable)
-    // Find the order's actual status BEFORE removing it (needed for In Processing tab)
+    // Find the order's actual status BEFORE removing it
     final orderStatus = _orders.where((o) => o['id'] == orderId).firstOrNull?['status'] as String?;
     setState(() {
       _orders = _orders.where((o) => o['id'] != orderId).toList();
       _selectedOrderIds.remove(orderId);
-      // Decrement: use actual order status (In Processing tab has mixed statuses)
+      // Decrement: use actual order status when known
       final decrementKey = orderStatus ?? _statusForCurrentTab();
       if (decrementKey != null && _counts.containsKey(decrementKey)) {
         _counts[decrementKey] = (_counts[decrementKey]! - 1).clamp(0, 999999);
@@ -290,7 +304,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     });
   }
 
-  Future<void> _bulkCollect() async {
+  Future<void> _bulkSend() async {
     if (_selectedOrderIds.isEmpty) return;
     final count = _selectedOrderIds.length;
     final admin = ref.read(adminProvider).currentAdmin;
@@ -299,51 +313,49 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final now = DateTime.now().toIso8601String();
 
     // Optimistic UI
-    final collectedIds = _selectedOrderIds.toSet();
+    final sentIds = _selectedOrderIds.toSet();
     setState(() {
-      _orders = _orders.where((o) => !collectedIds.contains(o['id'])).toList();
+      _orders = _orders.where((o) => !sentIds.contains(o['id'])).toList();
       _selectedOrderIds.clear();
       final currentStatus = _statusForCurrentTab();
       if (currentStatus != null && _counts.containsKey(currentStatus)) {
         _counts[currentStatus] = (_counts[currentStatus]! - count).clamp(0, 999999);
       }
-      _counts[AppConstants.statusCollected] = (_counts[AppConstants.statusCollected] ?? 0) + count;
+      _counts[AppConstants.statusSent] = (_counts[AppConstants.statusSent] ?? 0) + count;
     });
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
-      _showStatusSnackBar('$count order(s) marked as Collected');
+      _showStatusSnackBar(count == 1 ? '1 order sent to laundry' : '$count orders sent to laundry');
     }
 
-    for (final orderId in collectedIds) {
-      await db.updateOrderStatus(orderId, AppConstants.statusCollected);
+    for (final orderId in sentIds) {
+      await db.updateOrderStatus(orderId, AppConstants.statusSent);
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': orderId,
-        'status': AppConstants.statusCollected,
+        'status': AppConstants.statusSent,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
         'created_at': now,
       });
 
-      await _logNapkinOutAndAutoComplete(orderId, admin, db, uuid, now);
+      await _logNapkinOutAndAutoReceive(orderId, admin, db, uuid, now);
 
       final order = await db.getOrder(orderId);
-      final finalStatus = order?['status'] ?? AppConstants.statusCollected;
+      final finalStatus = order?['status'] ?? AppConstants.statusSent;
       await db.addToSyncQueue('orders', orderId, 'update',
           jsonEncode({'id': orderId, 'status': finalStatus}));
     }
 
-    // Push immediately and WAIT for sync to complete before sending report
+    // Push immediately and WAIT for sync to complete
     await SyncService.instance.pushPendingAndWait();
-
-    // Send the daily collection report email now (instead of scheduled 3pm cron)
-    SupabaseService.instance.invokeDailyReport();
   }
 
   /// For napkin items: logs OUT to the linen ledger.
-  /// For napkin-only orders: auto-completes (skips receiving step).
-  Future<void> _logNapkinOutAndAutoComplete(
+  /// For napkin-only orders: auto-moves to 'received' (skips receiving step —
+  /// the pool ledger tracks them, not per-ticket counts).
+  Future<void> _logNapkinOutAndAutoReceive(
     String orderId, dynamic admin, DatabaseService db, Uuid uuid, String now,
   ) async {
     final napkinQty = await db.getNapkinQuantityForOrder(orderId);
@@ -361,7 +373,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'quantity': napkinQty,
       'order_id': orderId,
       'department_id': order?['department_id'],
-      'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+      'note': 'Sent to laundry — Docket #${order?['docket_number'] ?? '?'}',
       'recorded_by': admin?.name,
       'created_at': now,
     });
@@ -374,22 +386,22 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       'quantity': napkinQty,
       'order_id': orderId,
       'department_id': order?['department_id'],
-      'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+      'note': 'Sent to laundry — Docket #${order?['docket_number'] ?? '?'}',
       'recorded_by': admin?.name,
       'created_at': now,
     }));
 
-    // If order is napkins-only, auto-complete (skip receiving)
+    // If order is napkins-only, auto-move to received (skip per-ticket receiving)
     final isNapkinsOnly = await db.orderIsNapkinsOnly(orderId);
     if (isNapkinsOnly) {
-      await db.updateOrderStatus(orderId, AppConstants.statusCompleted);
+      await db.updateOrderStatus(orderId, AppConstants.statusReceived);
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': orderId,
-        'status': AppConstants.statusCompleted,
+        'status': AppConstants.statusReceived,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
-        'reason': 'Napkins — pool tracked, auto-completed on collection',
+        'reason': 'Napkins — pool tracked, auto-received on send',
         'created_at': now,
       });
     }
@@ -416,8 +428,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     }
   }
 
+  /// Owner picked up their items from the laundry room.
   Future<void> _markCollected(String orderId) async {
-    await _quickAction(orderId, AppConstants.statusPickedUp);
+    await _quickAction(orderId, AppConstants.statusCollected);
   }
 
   bool get _isAllTab => _tabController.index == _kAll;
@@ -465,8 +478,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final items = await db.getOrderItems(orderId);
 
     if (items.isEmpty) {
-      // Bag-only order (guest laundry) — just complete it
-      await _quickAction(orderId, AppConstants.statusCompleted);
+      // Bag-only order (guest laundry) — just mark it received
+      await _quickAction(orderId, AppConstants.statusReceived);
       return;
     }
 
@@ -501,30 +514,36 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Check for outstanding items (pure computation)
     bool hasOutstanding = false;
+    int totalSent = 0;
+    int totalReceived = 0;
     for (final item in items) {
       final id = item['id'] as String;
       final sent = item['quantity_sent'] as int;
       final received = result[id] ?? 0;
+      totalSent += sent;
+      totalReceived += received;
       if (received < sent) hasOutstanding = true;
     }
 
-    // Optimistic UI — find actual order status before removing (In Processing has mixed statuses)
-    final orderStatus = _orders.where((o) => o['id'] == orderId).firstOrNull?['status'] as String?;
+    // Optimistic UI — capture order details before removing it from the list
+    final orderRow = _orders.where((o) => o['id'] == orderId).firstOrNull;
+    final orderStatus = orderRow?['status'] as String?;
+    final docket = orderRow?['docket_number'] ?? '?';
     setState(() {
       _orders = _orders.where((o) => o['id'] != orderId).toList();
       final decrementKey = orderStatus ?? _statusForCurrentTab();
       if (decrementKey != null && _counts.containsKey(decrementKey)) {
         _counts[decrementKey] = (_counts[decrementKey]! - 1).clamp(0, 999999);
       }
-      _counts[AppConstants.statusCompleted] = (_counts[AppConstants.statusCompleted] ?? 0) + 1;
+      _counts[AppConstants.statusReceived] = (_counts[AppConstants.statusReceived] ?? 0) + 1;
     });
 
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
       _showStatusSnackBar(
         hasOutstanding
-            ? 'Partial receipt — outstanding items on new ticket'
-            : 'All items received — order returned',
+            ? 'Partial receipt — follow-up ticket created'
+            : 'All items received',
       );
     }
 
@@ -541,36 +560,37 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': orderId,
-        'status': AppConstants.statusCompleted,
+        'status': AppConstants.statusReceived,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
-        'reason': 'Partial receipt — outstanding items moved to new ticket',
+        'reason': 'Partial receipt — received $totalReceived of $totalSent; '
+            'outstanding split to follow-up ticket',
         'created_at': now,
       });
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': newOrderId,
-        'status': AppConstants.statusInProcessing,
+        'status': AppConstants.statusSent,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
-        'reason': 'Outstanding items from partial receipt',
+        'reason': 'Outstanding items from partial receipt of #$docket',
         'created_at': now,
       });
     } else {
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': orderId,
-        'status': AppConstants.statusCompleted,
+        'status': AppConstants.statusReceived,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
         'created_at': now,
       });
     }
 
-    await db.updateOrderStatus(orderId, AppConstants.statusCompleted);
+    await db.updateOrderStatus(orderId, AppConstants.statusReceived);
 
     await db.addToSyncQueue('orders', orderId, 'update',
-        jsonEncode({'id': orderId, 'status': AppConstants.statusCompleted}));
+        jsonEncode({'id': orderId, 'status': AppConstants.statusReceived}));
     if (hasOutstanding && newOrderId != null) {
       final outstandingOrder = await db.getOrder(newOrderId);
       if (outstandingOrder != null) {
@@ -662,8 +682,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                           final idx = entry.key;
                           final label = entry.value;
                           final isNapkinTab = idx == _kNapkinReturns;
-                          final count = isNapkinTab ? 0 : _getTabCount(label);
-                          final isActive = !isNapkinTab && _tabController.index == idx;
+                          final isReportTab = idx == _kReport;
+                          // Gold "special" pills navigate to their own screen
+                          // instead of switching tabs.
+                          final isNapkinTabOrReport = isNapkinTab || isReportTab;
+                          final count = isNapkinTabOrReport ? 0 : _getTabCount(label);
+                          final isActive = !isNapkinTabOrReport && _tabController.index == idx;
 
                           return Padding(
                             padding: EdgeInsets.only(
@@ -676,6 +700,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                   context.push('/admin/napkin-returns').then((_) {
                                     _loadData(silent: true);
                                   });
+                                } else if (isReportTab) {
+                                  context.push('/admin/daily-report').then((_) {
+                                    _loadData(silent: true);
+                                  });
                                 } else {
                                   _tabController.animateTo(idx);
                                 }
@@ -684,14 +712,14 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                 duration: const Duration(milliseconds: 200),
                                 padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
                                 decoration: BoxDecoration(
-                                  color: isNapkinTab
+                                  color: isNapkinTabOrReport
                                       ? AppColors.gold.withValues(alpha: 0.2)
                                       : isActive
                                           ? AppColors.white
                                           : AppColors.white.withValues(alpha: 0.12),
                                   borderRadius: AppRadius.largeBR,
                                   border: Border.all(
-                                    color: isNapkinTab
+                                    color: isNapkinTabOrReport
                                         ? AppColors.gold.withValues(alpha: 0.5)
                                         : isActive ? AppColors.white : AppColors.white.withValues(alpha: 0.2),
                                     width: 1.5,
@@ -703,7 +731,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                     Icon(
                                       _tabIcon(label),
                                       size: 20,
-                                      color: isNapkinTab
+                                      color: isNapkinTabOrReport
                                           ? AppColors.gold
                                           : isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.8),
                                     ),
@@ -713,8 +741,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                       style: TextStyle(
                                         fontFamily: 'Inter',
                                         fontSize: AppTextStyles.captionSize,
-                                        fontWeight: isActive || isNapkinTab ? AppTextStyles.bold : AppTextStyles.medium,
-                                        color: isNapkinTab
+                                        fontWeight: isActive || isNapkinTabOrReport ? AppTextStyles.bold : AppTextStyles.medium,
+                                        color: isNapkinTabOrReport
                                             ? AppColors.gold
                                             : isActive ? AppColors.navy : AppColors.white.withValues(alpha: 0.85),
                                       ),
@@ -766,11 +794,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     return switch (tab) {
       'Pending' => Icons.schedule_rounded,
       'Approved' => Icons.check_circle_outline_rounded,
-      'In Processing' => Icons.local_shipping_rounded,
-      'Returned' => Icons.done_all_rounded,
+      'Sent' => Icons.local_shipping_rounded,
+      'Received' => Icons.done_all_rounded,
       'All' => Icons.list_alt_rounded,
       'Rejected' => Icons.cancel_outlined,
       'Napkins' => Icons.dining,
+      'Report' => Icons.summarize_rounded,
       _ => Icons.circle_outlined,
     };
   }
@@ -868,18 +897,18 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                   SizedBox(width: AppSpacing.sm),
                   Text(
                     _selectedOrderIds.isEmpty
-                        ? 'Select All for Collected'
+                        ? 'Select All for Sending'
                         : '${_selectedOrderIds.length} selected',
                     style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: AppColors.grey700),
                   ),
                   const Spacer(),
                   if (_selectedOrderIds.isNotEmpty)
                     ElevatedButton.icon(
-                      onPressed: _bulkCollect,
+                      onPressed: _bulkSend,
                       icon: Icon(Icons.local_shipping_rounded, size: AppSizes.iconSizeSm),
-                      label: Text('Collect (${_selectedOrderIds.length})'),
+                      label: Text('Send (${_selectedOrderIds.length})'),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: AppColors.statusCollected,
+                        backgroundColor: AppColors.statusSent,
                         foregroundColor: AppColors.white,
                         padding: EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
                         textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
@@ -940,23 +969,38 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   Widget _buildOrderCard(int index) {
     final orderId = _orders[index]['id'] as String;
     int? daysUntilExpiry;
-    if (_isCompletedTab) {
+    if (_isReceivedTab) {
       final updatedAt = DateTime.tryParse(_orders[index]['updated_at'] as String? ?? '');
       if (updatedAt != null) {
-        daysUntilExpiry = AppConstants.completedExpiryDays - DateTime.now().difference(updatedAt).inDays;
+        daysUntilExpiry = AppConstants.receivedExpiryDays - DateTime.now().difference(updatedAt).inDays;
       }
     }
+    // Sent tab: days since the order was sent to the laundry (aging badge)
+    int? daysSinceSent;
+    if (_isSentTab) {
+      final sentAt = DateTime.tryParse(_sentDates[orderId] ?? '') ??
+          DateTime.tryParse(_orders[index]['created_at'] as String? ?? '');
+      if (sentAt != null) {
+        daysSinceSent = DateTime.now().difference(sentAt).inDays;
+      }
+    }
+    // Received tab: discrepancy = has a child outstanding order OR short-received items
+    final awaitingSummary = _awaitingSummaries[orderId];
+    final hasDiscrepancy = _isReceivedTab &&
+        (_partialOrderIds.contains(orderId) || awaitingSummary != null);
     return _OrderCard(
       order: _orders[index],
       itemSummary: _itemSummaries[orderId],
-      isPartiallyCompleted: _partialOrderIds.contains(orderId),
+      hasDiscrepancy: hasDiscrepancy,
+      awaitingSummary: awaitingSummary,
       daysUntilExpiry: daysUntilExpiry,
+      daysSinceSent: daysSinceSent,
       showActions: _isPendingTab,
       showCheckbox: _isApprovedTab,
       isSelected: _selectedOrderIds.contains(orderId),
       showReturnToPending: _isApprovedTab || _isRejectedTab,
-      showReceiveAction: _isInProgressTab,
-      showCollectedAction: _isCompletedTab,
+      showReceiveAction: _isSentTab,
+      showCollectedAction: _isReceivedTab,
       onTap: () {
         ref.read(adminProvider.notifier).refreshActivity();
         context.push('/admin/order/$orderId').then((_) {
@@ -993,8 +1037,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     return switch (tab) {
       'Pending' => _counts[AppConstants.statusSubmitted] ?? 0,
       'Approved' => _counts[AppConstants.statusApproved] ?? 0,
-      'In Processing' => (_counts[AppConstants.statusCollected] ?? 0) + (_counts[AppConstants.statusInProcessing] ?? 0),
-      'Returned' => _counts[AppConstants.statusCompleted] ?? 0,
+      'Sent' => _counts[AppConstants.statusSent] ?? 0,
+      'Received' => _counts[AppConstants.statusReceived] ?? 0,
       'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       _ => 0, // All + Napkins — no counter
     };
@@ -1004,8 +1048,13 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 class _OrderCard extends StatelessWidget {
   final Map<String, dynamic> order;
   final String? itemSummary;
-  final bool isPartiallyCompleted;
+  /// Received tab: child outstanding order exists OR items were short-received.
+  final bool hasDiscrepancy;
+  /// e.g. "awaiting 2× Chef Jacket" — what is still at the laundry.
+  final String? awaitingSummary;
   final int? daysUntilExpiry;
+  /// Sent tab: days since the order was sent to the laundry (aging badge).
+  final int? daysSinceSent;
   final bool showActions;
   final bool showCheckbox;
   final bool isSelected;
@@ -1023,8 +1072,10 @@ class _OrderCard extends StatelessWidget {
   const _OrderCard({
     required this.order,
     this.itemSummary,
-    this.isPartiallyCompleted = false,
+    this.hasDiscrepancy = false,
+    this.awaitingSummary,
     this.daysUntilExpiry,
+    this.daysSinceSent,
     this.showActions = false,
     this.showCheckbox = false,
     this.isSelected = false,
@@ -1120,8 +1171,11 @@ class _OrderCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    // Status chip + outstanding badge — small, above the name
-                    Row(
+                    // Status chip + badges — small, above the name
+                    Wrap(
+                      spacing: AppSpacing.xs,
+                      runSpacing: 2,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         Container(
                           padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
@@ -1130,17 +1184,15 @@ class _OrderCard extends StatelessWidget {
                             borderRadius: AppRadius.smallBR,
                           ),
                           child: Text(
-                            (status == AppConstants.statusCompleted && isPartiallyCompleted)
-                                ? 'Partly Returned'
-                                : (AppLabels.statusLabels[status] ?? status),
+                            AppLabels.statusLabels[status] ?? status,
                             style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.medium, color: statusColor),
                           ),
                         ),
-                        if (isOutstanding) ...[
-                          SizedBox(width: AppSpacing.xs),
+                        // Child order from a partial receipt — still awaiting items
+                        if (isOutstanding)
                           () {
-                            final isResolved = status == AppConstants.statusCompleted ||
-                                status == AppConstants.statusPickedUp ||
+                            final isResolved = status == AppConstants.statusReceived ||
+                                status == AppConstants.statusCollected ||
                                 status == AppConstants.statusExpired;
                             return Container(
                               padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
@@ -1151,13 +1203,40 @@ class _OrderCard extends StatelessWidget {
                                 borderRadius: AppRadius.smallBR,
                               ),
                               child: Text(
-                                isResolved ? 'Outstanding Resolved' : 'Outstanding',
+                                isResolved ? 'Outstanding Resolved' : 'Outstanding — partial',
                                 style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold,
                                     color: isResolved ? AppColors.success : AppColors.error),
                               ),
                             );
                           }(),
-                        ],
+                        // Sent tab: aging badge — hidden under 3 days, amber 3-6, red 7+
+                        if (daysSinceSent != null && daysSinceSent! >= 3)
+                          Container(
+                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: (daysSinceSent! >= 7 ? AppColors.error : AppColors.warning)
+                                  .withValues(alpha: 0.15),
+                              borderRadius: AppRadius.smallBR,
+                            ),
+                            child: Text(
+                              '${daysSinceSent}d at laundry',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold,
+                                  color: daysSinceSent! >= 7 ? AppColors.error : Colors.orange.shade800),
+                            ),
+                          ),
+                        // Received tab: short receipt or unreturned follow-up items
+                        if (hasDiscrepancy)
+                          Container(
+                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: AppColors.error.withValues(alpha: 0.12),
+                              borderRadius: AppRadius.smallBR,
+                            ),
+                            child: Text(
+                              'Discrepancy',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold, color: AppColors.error),
+                            ),
+                          ),
                       ],
                     ),
                     SizedBox(height: 2),
@@ -1170,7 +1249,7 @@ class _OrderCard extends StatelessWidget {
                         overflow: TextOverflow.ellipsis),
                     SizedBox(height: 1),
                     Text(dateStr, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, color: AppColors.grey500)),
-                    if (daysUntilExpiry != null && daysUntilExpiry! <= AppConstants.completedExpiryWarningDays)
+                    if (daysUntilExpiry != null && daysUntilExpiry! <= AppConstants.receivedExpiryWarningDays)
                       Text(
                         daysUntilExpiry! <= 1 ? 'Expires today' : '${daysUntilExpiry}d until auto-archive',
                         style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium,
@@ -1179,6 +1258,11 @@ class _OrderCard extends StatelessWidget {
                     if (itemSummary != null && itemSummary!.isNotEmpty)
                       Text(itemSummary!,
                           style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.navy.withValues(alpha: 0.7)),
+                          overflow: TextOverflow.ellipsis, maxLines: 1),
+                    // Received tab: what is still at the laundry for this docket
+                    if (awaitingSummary != null && awaitingSummary!.isNotEmpty)
+                      Text(awaitingSummary!,
+                          style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, fontWeight: AppTextStyles.medium, color: AppColors.error),
                           overflow: TextOverflow.ellipsis, maxLines: 1),
                     // Return to Pending button — absorb tap so it doesn't open card detail
                     if (showReturnToPending) ...[
@@ -1266,9 +1350,9 @@ class _OrderCard extends StatelessWidget {
                   child: ElevatedButton.icon(
                     onPressed: onMarkCollected,
                     icon: Icon(Icons.check_circle_outline_rounded, size: AppSizes.iconSizeSm),
-                    label: const Text('Picked Up'),
+                    label: const Text('Collected'),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.success,
+                      backgroundColor: AppColors.statusCollected,
                       foregroundColor: AppColors.white,
                       padding: EdgeInsets.symmetric(horizontal: AppSpacing.base),
                       textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
@@ -1292,11 +1376,9 @@ class _OrderCard extends StatelessWidget {
       AppConstants.statusSubmitted => AppColors.statusSubmitted,
       AppConstants.statusApproved => AppColors.statusApproved,
       AppConstants.statusRejected => AppColors.statusRejected,
-      AppConstants.statusCollected => AppColors.statusCollected,
-      AppConstants.statusInProcessing => AppColors.statusInProcessing,
+      AppConstants.statusSent => AppColors.statusSent,
       AppConstants.statusReceived => AppColors.statusReceived,
-      AppConstants.statusCompleted => AppColors.statusCompleted,
-      AppConstants.statusPickedUp => AppColors.success,
+      AppConstants.statusCollected => AppColors.statusCollected,
       AppConstants.statusExpired => AppColors.grey400,
       _ => AppColors.grey500,
     };

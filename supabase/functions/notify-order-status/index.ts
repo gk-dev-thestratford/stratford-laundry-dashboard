@@ -3,7 +3,7 @@
 //
 // This function is triggered by a database webhook on the order_status_log table.
 // It sends email notifications to staff who provided an email address.
-// For "collected" and "received" statuses, it also sends a report to Laundrevo.
+// Statuses: submitted -> approved -> sent -> received -> collected (renamed 2026-06-12).
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -12,9 +12,8 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
-// Report emails — daily report at 2pm + express alerts after 2pm
-const REPORT_EMAILS = ["georgi@thestratford.com", "set1000@hotmail.com"];
-const DAILY_REPORT_HOUR_UTC = 14; // 2pm GMT / 3pm BST
+// Report emails — daily report at 2pm UK + express alerts after 2pm UK
+const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -29,47 +28,59 @@ interface StatusLogPayload {
   };
 }
 
+// Status model renamed 2026-06-12: submitted -> approved -> sent -> received -> collected
 const STATUS_LABELS: Record<string, string> = {
   submitted: "Order Submitted",
   approved: "Order Approved",
   rejected: "Order Rejected",
-  collected: "Items Collected by Laundrevo",
-  in_processing: "Items Being Processed",
+  sent: "Items Sent to the Laundry",
   received: "Clean Items Received",
-  completed: "Order Completed",
+  collected: "Items Collected",
 };
 
 const STATUS_MESSAGES: Record<string, string> = {
   submitted:
     "Your laundry order has been submitted successfully and is now awaiting approval from the laundry team. You will receive another email once your order has been reviewed.",
   approved:
-    "Great news! Your laundry order has been approved and is now scheduled for collection by Laundrevo. You will be notified once your items have been picked up.",
+    "Great news! Your laundry order has been approved and is prepared for sending to the laundry company. You will be notified once your items have been sent for washing.",
   rejected:
     "Unfortunately, your laundry order could not be approved. Please see the reason below and resubmit if needed. If you have questions, contact the laundry team.",
-  collected:
-    "Your laundry items have been collected by Laundrevo and are now on their way to the cleaning facility. We will notify you once processing begins.",
-  in_processing:
-    "Your items are currently being cleaned and processed at the Laundrevo facility. We will notify you as soon as your clean items are ready for delivery.",
+  sent:
+    "Your laundry items have been collected by the laundry company and are now on their way to the cleaning facility. We will notify you once your clean items are back at the hotel.",
   received:
     "Your clean items have been received back at The Stratford Hotel. Please see the item summary below for any discrepancies. Items are ready for collection from the laundry room.",
-  completed:
-    "Your laundry order is now complete. All items have been returned and the order is closed. Thank you for using The Stratford laundry service.",
+  collected:
+    "You have collected your items from the laundry room and this order is now closed. Thank you for using The Stratford laundry service.",
 };
 
 const STATUS_COLOURS: Record<string, string> = {
   submitted: "#1565C0",
   approved: "#2E7D32",
   rejected: "#C62828",
-  collected: "#E65100",
-  in_processing: "#6A1B9A",
+  sent: "#E65100",
   received: "#00838F",
-  completed: "#2E7D32",
+  collected: "#2E7D32",
 };
 
+// ── Helper: get current UK hour (handles GMT/BST automatically) ──
+function getUKHour(): number {
+  return parseInt(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/London",
+      hour: "numeric",
+      hour12: false,
+    }).format(new Date()),
+    10
+  );
+}
+
 // ── Helper: send an email via Resend ──
-async function sendEmail(to: string, subject: string, html: string) {
-  if (!RESEND_API_KEY) return;
-  await fetch("https://api.resend.com/emails", {
+async function sendEmail(to: string, subject: string, html: string): Promise<{ ok: boolean; error?: string }> {
+  if (!RESEND_API_KEY) {
+    console.error("RESEND_API_KEY not configured — skipping email to", to);
+    return { ok: false, error: "RESEND_API_KEY not configured" };
+  }
+  const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${RESEND_API_KEY}`,
@@ -82,6 +93,12 @@ async function sendEmail(to: string, subject: string, html: string) {
       html,
     }),
   });
+  if (!res.ok) {
+    const err = await res.text();
+    console.error(`Resend error for ${to}: ${err}`);
+    return { ok: false, error: err };
+  }
+  return { ok: true };
 }
 
 // ── Helper: build items table HTML ──
@@ -169,7 +186,7 @@ function buildStaffEmail(order: any, status: string, statusLabel: string, reason
           </tr>
           <tr>
             <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Date</td>
-            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${new Date(order.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}</td>
+            <td style="padding:10px 16px;color:#333;border-bottom:1px solid #eee">${new Date(order.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" })}</td>
           </tr>
           <tr>
             <td style="padding:10px 16px;color:#777;font-size:13px;border-bottom:1px solid #eee">Department</td>
@@ -224,7 +241,7 @@ async function fetchTodaysOrders(targetStatus: string) {
 
 // ── Helper: build combined daily collection report for Laundrevo ──
 function buildCollectionReport(orders: any[]) {
-  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
 
   // One row per docket — items combined into description
   const rows = orders.map((order: any) => {
@@ -284,7 +301,7 @@ function buildCollectionReport(orders: any[]) {
 
 // ── Helper: build combined daily receiving report for Laundrevo ──
 function buildReceivedReport(orders: any[]) {
-  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
 
   // One row per docket — items combined into description, totals per order
   let grandSent = 0;
@@ -358,11 +375,11 @@ function buildReceivedReport(orders: any[]) {
 
 // ── Helper: build express alert for after-2pm collections/returns ──
 function buildExpressAlert(order: any, status: string) {
-  const isCollected = status === "collected";
-  const label = isCollected ? "Express Collection" : "Express Return";
-  const colour = isCollected ? "#E65100" : "#00838F";
-  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
-  const time = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const isSent = status === "sent";
+  const label = isSent ? "Express Collection" : "Express Return";
+  const colour = isSent ? "#E65100" : "#00838F";
+  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
+  const time = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" });
 
   const items = order.order_items || [];
   const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
@@ -431,10 +448,32 @@ function buildExpressAlert(order: any, status: string) {
   `;
 }
 
+// Only send individual emails for these statuses (saves Resend quota).
+// approved and collected (owner pick-up) are skipped — daily report covers them.
+const NOTIFY_STATUSES = ["submitted", "rejected", "sent", "received"];
+
 serve(async (req: Request) => {
   try {
     const payload: StatusLogPayload = await req.json();
     const { order_id, status, reason } = payload.record;
+
+    // Skip statuses that don't need individual emails
+    if (!NOTIFY_STATUSES.includes(status)) {
+      return new Response(JSON.stringify({ message: `Status "${status}" — no notification needed` }), { status: 200 });
+    }
+
+    // Detect bulk operations: if 5+ orders moved to the same status in the
+    // last 60 seconds, this is a bulk update from the dashboard. Skip
+    // individual emails — the daily report will cover all of them.
+    const { count } = await supabase
+      .from("order_status_log")
+      .select("id", { count: "exact", head: true })
+      .eq("status", status)
+      .gte("created_at", new Date(Date.now() - 60_000).toISOString());
+
+    if (count && count >= 5) {
+      return new Response(JSON.stringify({ message: "Bulk operation detected, skipping individual email" }), { status: 200 });
+    }
 
     // Fetch order with items
     const { data: order, error } = await supabase
@@ -451,26 +490,11 @@ serve(async (req: Request) => {
     const subject = `The Stratford Hotel — ${statusLabel} (Docket #${order.docket_number})`;
     const emailsSent: string[] = [];
 
-    // 1. Send to the staff/guest who submitted the order
+    // Send to the staff/guest who submitted the order
     if (order.email) {
       const html = buildStaffEmail(order, status, statusLabel, reason);
-      await sendEmail(order.email, subject, html);
-      emailsSent.push(order.email);
-    }
-
-    // 2. After the daily report (2pm), send express alerts to the laundry company
-    //    for any new collections or returns that happen later in the day.
-    if ((status === "collected" || status === "received") && REPORT_EMAILS.length > 0) {
-      const nowUTC = new Date();
-      if (nowUTC.getUTCHours() >= DAILY_REPORT_HOUR_UTC) {
-        const expressHtml = buildExpressAlert(order, status);
-        const expressLabel = status === "collected" ? "Express Collection" : "Express Return";
-        const expressSubject = `${expressLabel} — Docket #${order.docket_number} (After Daily Report)`;
-        for (const email of REPORT_EMAILS) {
-          await sendEmail(email, expressSubject, expressHtml);
-          emailsSent.push(`express:${email}`);
-        }
-      }
+      const result = await sendEmail(order.email, subject, html);
+      emailsSent.push(`${order.email}:${result.ok ? "sent" : "failed"}`);
     }
 
     if (emailsSent.length === 0) {

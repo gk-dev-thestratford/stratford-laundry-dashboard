@@ -188,8 +188,8 @@ class SyncService {
     if (_lastCleanup == null || now.difference(_lastCleanup!) > const Duration(hours: 1)) {
       _lastCleanup = now;
       try {
-        await DatabaseService.instance.autoCollectCompletedOrders(days: 21);
-        await DatabaseService.instance.autoExpireCompletedOrders(days: 20);
+        await DatabaseService.instance.autoCollectReceivedOrders(days: 21);
+        await DatabaseService.instance.autoExpireReceivedOrders(days: 20);
         await DatabaseService.instance.purgeExpiredOrders(daysAfterExpiry: 30);
         await DatabaseService.instance.cleanSyncQueue(days: 7);
       } catch (_) {
@@ -271,11 +271,16 @@ class SyncService {
         final lastPull = await db.getMeta(_kLastOrdersPullAt);
         if (lastPull != null) {
           final parsed = DateTime.tryParse(lastPull);
-          // Subtract a small overlap to absorb clock skew between client/server
-          if (parsed != null) since = parsed.subtract(const Duration(minutes: 1));
+          // UTC is mandatory here: a local-time bookmark is sent to PostgREST
+          // without a zone marker and read as UTC, which during BST pushed
+          // `since` an hour into the future — incremental pulls then missed
+          // every web-created order until the daily full pull / app restart.
+          // .toUtc() also corrects legacy local-format bookmarks on upgrade.
+          // Subtract a small overlap to absorb clock skew between client/server.
+          if (parsed != null) since = parsed.toUtc().subtract(const Duration(minutes: 5));
         }
       }
-      final pullStart = DateTime.now();
+      final pullStart = DateTime.now().toUtc();
       final remoteOrders = await SupabaseService.instance.fetchOrders(since: since);
       debugPrint('[Sync] Pulled ${remoteOrders.length} orders '
           '(${since == null ? "FULL" : "since ${since.toIso8601String()}"})');
@@ -302,10 +307,11 @@ class SyncService {
         final lastPull = await db.getMeta(_kLastStatusLogsPullAt);
         if (lastPull != null) {
           final parsed = DateTime.tryParse(lastPull);
-          if (parsed != null) since = parsed.subtract(const Duration(minutes: 1));
+          // UTC for the same BST reason as the orders pull above.
+          if (parsed != null) since = parsed.toUtc().subtract(const Duration(minutes: 5));
         }
       }
-      final pullStart = DateTime.now();
+      final pullStart = DateTime.now().toUtc();
       final remoteLogs = await SupabaseService.instance.fetchOrderStatusLogs(since: since);
       debugPrint('[Sync] Pulled ${remoteLogs.length} status logs '
           '(${since == null ? "FULL" : "since ${since.toIso8601String()}"})');

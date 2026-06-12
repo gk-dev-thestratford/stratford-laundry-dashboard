@@ -10,7 +10,7 @@ import '../../providers/admin_provider.dart';
 import '../../services/database_service.dart';
 import '../../services/supabase_service.dart';
 import '../../services/sync_service.dart';
-import '../../widgets/success_toast.dart';
+import '../../widgets/thumbs_up_confirmation.dart';
 
 class AdminOrderDetailScreen extends ConsumerStatefulWidget {
   final String orderId;
@@ -128,8 +128,8 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       'created_at': now,
     });
 
-    // When collected: log napkin OUT to ledger + auto-complete napkin-only orders
-    if (newStatus == AppConstants.statusCollected) {
+    // When sent to laundry: log napkin OUT to ledger + auto-receive napkin-only orders
+    if (newStatus == AppConstants.statusSent) {
       final napkinQty = await db.getNapkinQuantityForOrder(widget.orderId);
       if (napkinQty > 0) {
         final order = await db.getOrder(widget.orderId);
@@ -141,7 +141,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           'quantity': napkinQty,
           'order_id': widget.orderId,
           'department_id': order?['department_id'],
-          'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+          'note': 'Sent to laundry — Docket #${order?['docket_number'] ?? '?'}',
           'recorded_by': admin?.name,
           'created_at': now,
         });
@@ -152,29 +152,29 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           'quantity': napkinQty,
           'order_id': widget.orderId,
           'department_id': order?['department_id'],
-          'note': 'Collected — Docket #${order?['docket_number'] ?? '?'}',
+          'note': 'Sent to laundry — Docket #${order?['docket_number'] ?? '?'}',
           'recorded_by': admin?.name,
           'created_at': now,
         }));
 
-        // Napkin-only orders skip receiving — auto-complete
+        // Napkin-only orders skip per-ticket receiving — auto-move to received
         final isNapkinsOnly = await db.orderIsNapkinsOnly(widget.orderId);
         if (isNapkinsOnly) {
-          await db.updateOrderStatus(widget.orderId, AppConstants.statusCompleted);
+          await db.updateOrderStatus(widget.orderId, AppConstants.statusReceived);
           await db.insertStatusLog({
             'id': uuid.v4(),
             'order_id': widget.orderId,
-            'status': AppConstants.statusCompleted,
+            'status': AppConstants.statusReceived,
             'changed_by': admin?.id,
             'changed_by_name': admin?.name,
-            'reason': 'Napkins — pool tracked, auto-completed on collection',
+            'reason': 'Napkins — pool tracked, auto-received on send',
             'created_at': now,
           });
         }
       }
     }
 
-    // Queue for Supabase sync — use current order status (may have been auto-completed)
+    // Queue for Supabase sync — use current order status (may have been auto-received)
     final currentOrder = await db.getOrder(widget.orderId);
     final finalStatus = currentOrder?['status'] ?? newStatus;
     await db.addToSyncQueue('orders', widget.orderId, 'update',
@@ -183,7 +183,8 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     await _loadOrder();
     if (mounted) {
-      SuccessToast.show(context, message: '${AppLabels.statusLabels[finalStatus]}');
+      showThumbsUpConfirmation(context,
+          message: 'Order ${AppLabels.statusLabels[finalStatus] ?? finalStatus}');
     }
   }
 
@@ -198,6 +199,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     final received = <String, int>{};
     bool hasOutstanding = false;
     int totalReceived = 0;
+    int totalSent = 0;
 
     for (final item in _items) {
       final id = item['id'] as String;
@@ -216,6 +218,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           : 0;
       received[id] = qty;
       totalReceived += qty;
+      totalSent += sent;
       if (qty < sent) hasOutstanding = true;
     }
 
@@ -231,10 +234,10 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     // Build confirmation message
     final message = hasOutstanding
         ? 'Some items have outstanding quantities. This will:\n'
-          '• Complete this ticket with the received amounts\n'
-          '• Create a new In Progress ticket for the outstanding items\n\n'
+          '• Mark this ticket as Received with the received amounts\n'
+          '• Create a follow-up ticket in Sent for the outstanding items\n\n'
           'Continue?'
-        : 'All items fully received. Complete this order?';
+        : 'All items fully received. Mark this order as Received?';
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -256,6 +259,8 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     // Save received quantities on original order
     await db.updateReceivedQuantities(widget.orderId, received);
 
+    final docket = _order?['docket_number'] ?? '?';
+
     // Log "received" status so the webhook fires and user gets the email
     await db.insertStatusLog({
       'id': uuid.v4(),
@@ -263,57 +268,39 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
       'status': AppConstants.statusReceived,
       'changed_by': admin?.id,
       'changed_by_name': admin?.name,
-      'reason': hasOutstanding ? 'Partial receipt' : null,
+      'reason': hasOutstanding
+          ? 'Partial receipt — received $totalReceived of $totalSent; '
+              'outstanding split to follow-up ticket'
+          : null,
       'created_at': DateTime.now().toIso8601String(),
     });
 
     String? newOrderId;
     if (hasOutstanding) {
-      // Create new ticket with outstanding quantities
+      // Create new follow-up ticket (status 'sent') with outstanding quantities
       newOrderId = await db.createOutstandingOrder(
         originalOrderId: widget.orderId,
         receivedQuantities: received,
       );
 
-      // Log original as completed (partial receipt)
-      await db.insertStatusLog({
-        'id': uuid.v4(),
-        'order_id': widget.orderId,
-        'status': AppConstants.statusCompleted,
-        'changed_by': admin?.id,
-        'changed_by_name': admin?.name,
-        'reason': 'Partial receipt — outstanding items moved to new ticket',
-        'created_at': DateTime.now().toIso8601String(),
-      });
-
       // Log the new outstanding order
       await db.insertStatusLog({
         'id': uuid.v4(),
         'order_id': newOrderId,
-        'status': AppConstants.statusInProcessing,
+        'status': AppConstants.statusSent,
         'changed_by': admin?.id,
         'changed_by_name': admin?.name,
-        'reason': 'Outstanding items from partial receipt',
-        'created_at': DateTime.now().toIso8601String(),
-      });
-    } else {
-      // All received — log completion
-      await db.insertStatusLog({
-        'id': uuid.v4(),
-        'order_id': widget.orderId,
-        'status': AppConstants.statusCompleted,
-        'changed_by': admin?.id,
-        'changed_by_name': admin?.name,
+        'reason': 'Outstanding items from partial receipt of #$docket',
         'created_at': DateTime.now().toIso8601String(),
       });
     }
 
-    // Mark original as completed (went through received → completed)
-    await db.updateOrderStatus(widget.orderId, AppConstants.statusCompleted);
+    // Mark original as received
+    await db.updateOrderStatus(widget.orderId, AppConstants.statusReceived);
 
-    // Queue for Supabase sync — sync both the received status log and final completed status
+    // Queue for Supabase sync — the received status + the follow-up ticket
     await db.addToSyncQueue('orders', widget.orderId, 'update',
-        jsonEncode({'id': widget.orderId, 'status': AppConstants.statusCompleted}));
+        jsonEncode({'id': widget.orderId, 'status': AppConstants.statusReceived}));
     if (hasOutstanding && newOrderId != null) {
       final outstandingOrder = await db.getOrder(newOrderId);
       if (outstandingOrder != null) {
@@ -325,7 +312,10 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     await _loadOrder();
     if (mounted) {
-      SuccessToast.show(context, message: hasOutstanding ? 'Partial receipt' : 'All received');
+      showThumbsUpConfirmation(context,
+          message: hasOutstanding
+              ? 'Partial receipt — follow-up ticket created'
+              : 'All items received');
     }
   }
 
@@ -447,9 +437,9 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     }
 
     final status = _order!['status'] as String;
-    final showReceived = status == AppConstants.statusInProcessing ||
+    final showReceived = status == AppConstants.statusSent ||
         status == AppConstants.statusReceived ||
-        status == AppConstants.statusCompleted;
+        status == AppConstants.statusCollected;
 
     return Card(
       child: Padding(
@@ -509,7 +499,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
                             // Napkins are pool-tracked — no per-ticket receiving
                             ? Text('—', textAlign: TextAlign.center,
                                 style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, color: AppColors.grey400))
-                            : status == AppConstants.statusInProcessing
+                            : status == AppConstants.statusSent
                                 ? SizedBox(
                                     height: 42,
                                     child: TextField(
@@ -633,11 +623,11 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           ]);
         }
       case AppConstants.statusApproved:
-        actions.add(_actionButton('Mark Collected', Icons.local_shipping, AppColors.statusCollected, () => _confirmAction('Mark as Collected', AppConstants.statusCollected)));
-      case AppConstants.statusCollected:
-        actions.add(_actionButton('Mark In Processing', Icons.settings, AppColors.statusInProcessing, () => _confirmAction('Mark as In Processing', AppConstants.statusInProcessing)));
-      case AppConstants.statusInProcessing:
+        actions.add(_actionButton('Mark Sent', Icons.local_shipping, AppColors.statusSent, () => _confirmAction('Mark as Sent', AppConstants.statusSent)));
+      case AppConstants.statusSent:
         actions.add(_actionButton('Receive Items', Icons.inventory, AppColors.statusReceived, _receiveItems));
+      case AppConstants.statusReceived:
+        actions.add(_actionButton('Mark Collected', Icons.check_circle_outline, AppColors.statusCollected, () => _confirmAction('Mark as Collected', AppConstants.statusCollected)));
       case AppConstants.statusRejected:
         actions.add(
           _actionButton('Reinstate', Icons.undo_rounded, AppColors.statusSubmitted, () => _confirmAction('Reinstate to Pending', AppConstants.statusSubmitted)),
@@ -729,7 +719,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
           jsonEncode({'id': widget.orderId}));
       SyncService.instance.pushPendingNow();
       if (mounted) {
-        SuccessToast.show(context, message: 'Deleted');
+        showThumbsUpConfirmation(context, message: 'Order deleted');
         context.pop();
       }
     }

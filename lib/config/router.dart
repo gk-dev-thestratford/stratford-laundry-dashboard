@@ -9,6 +9,7 @@ import '../screens/admin/admin_login_screen.dart';
 import '../screens/admin/admin_dashboard_screen.dart';
 import '../screens/admin/order_detail_screen.dart';
 import '../screens/admin/napkin_returns_screen.dart';
+import '../screens/admin/daily_report_screen.dart';
 
 class AppRouter {
   static final router = GoRouter(
@@ -69,6 +70,11 @@ class AppRouter {
         path: '/admin/napkin-returns',
         name: 'napkinReturns',
         builder: (context, state) => const NapkinReturnsScreen(),
+      ),
+      GoRoute(
+        path: '/admin/daily-report',
+        name: 'dailyReport',
+        builder: (context, state) => const DailyReportScreen(),
       ),
     ],
   );
