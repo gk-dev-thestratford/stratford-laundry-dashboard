@@ -161,6 +161,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
           DateTime.tryParse(order['created_at'] as String? ?? '') ??
           now;
       final days = now.difference(sentAt).inDays.clamp(0, 9999);
+      // Exclude tickets sent TODAY (days == 0): they appear under "Sent to
+      // Laundry Today", so listing them as outstanding double-counts and
+      // wrongly flags same-day sends as overdue. Matches the side panel and
+      // the report email (days >= 1).
+      if (days < 1) continue;
 
       backlog.add(_BacklogRow(
         docket: '${order['docket_number']}',
