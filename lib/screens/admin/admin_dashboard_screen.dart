@@ -40,26 +40,33 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   final GlobalKey<TodayReportPanelState> _panelKey =
       GlobalKey<TodayReportPanelState>();
 
-  // Tab indices — use these constants instead of hardcoded numbers
+  // Tab indices — use these constants instead of hardcoded numbers.
+  // The daily flow is receive-first: staff record what came back from the
+  // laundry (Receive) BEFORE sending the day's approved items out (Send), so
+  // Receive sits at index 2 and Send at index 3. The constants are keyed by
+  // the STATUS each tab filters on, so all index-driven logic follows the
+  // swap automatically: _kSent (the Receive tab, status 'sent') = 2,
+  // _kApproved (the Send tab, status 'approved') = 3.
   static const _kRejected = 0;
   static const _kPending = 1;
-  static const _kApproved = 2;
-  static const _kSent = 3;
+  static const _kSent = 2;      // "Receive" tab — status 'sent' tickets to receive
+  static const _kApproved = 3;  // "Send" tab — status 'approved' tickets to send
   static const _kReceived = 4;
   static const _kAll = 5;
   static const _kNapkinReturns = 6;
   static const _kReport = 7;
 
-  // Tab names are ACTIONS (what staff do there), not states: Send = approved
-  // tickets ready to go out; Receive = tickets at the laundry awaiting return;
-  // Collect = received tickets awaiting owner pick-up. Ticket chips still show
-  // the status names.
-  static const _tabs = ['Rejected', 'Pending', 'Send', 'Receive', 'Collect', 'All', 'Napkins', 'Report'];
+  // Tab names are ACTIONS (what staff do there), not states: Receive =
+  // tickets at the laundry awaiting return; Send = approved tickets ready to
+  // go out; Collect = received tickets awaiting owner pick-up. Ticket chips
+  // still show the status names. Order matches the daily procedure
+  // (receive first, then send).
+  static const _tabs = ['Rejected', 'Pending', 'Receive', 'Send', 'Collect', 'All', 'Napkins', 'Report'];
   static const _statusFilters = [
     AppConstants.statusRejected,
     AppConstants.statusSubmitted,
-    AppConstants.statusApproved,
-    AppConstants.statusSent,
+    AppConstants.statusSent,      // Receive tab — receive these 'sent' tickets
+    AppConstants.statusApproved,  // Send tab — send these 'approved' tickets
     AppConstants.statusReceived,
     null, // All
     null, // Napkin Returns — navigates to separate screen
@@ -721,7 +728,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   @override
   Widget build(BuildContext context) {
     final admin = ref.watch(adminProvider);
+    final width = MediaQuery.of(context).size.width;
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    // Narrow / portrait: the docked panel would crush the order list, so it
+    // becomes a right-side overlay drawer instead (see _buildBodyArea).
+    final isNarrow = width < 900;
 
     // Enforce auto-lock timeout
     if (!admin.isAuthenticated || admin.isTimedOut) {
@@ -771,8 +782,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text('Admin Dashboard',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: TextStyle(fontFamily: 'Inter', color: AppColors.white, fontSize: AppTextStyles.titleSize, fontWeight: AppTextStyles.bold)),
                               Text(admin.currentAdmin?.name ?? 'Admin',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: TextStyle(fontFamily: 'Inter', color: AppColors.gold, fontSize: AppTextStyles.captionSize)),
                             ],
                           ),
@@ -904,54 +919,80 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
           const AnnouncementBanner(
             padding: EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.md, AppSpacing.lg, 0),
           ),
-          // ── Body content + docked Today's Report panel ──
+          // ── Body content + Today's Report panel (docked landscape /
+          //    overlay drawer in portrait) ──
           Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  child: Column(children: _buildBodyContent(isLandscape)),
-                ),
-                // Admins without can_send_report never see the panel —
-                // not even the collapsed tab.
-                if (admin.currentAdmin?.canSendReport ?? true)
-                  TodayReportPanel(
-                    key: _panelKey,
-                    // Approved-tab selection shows as "ready to add" ghost
-                    // chips in the Sent Today card before Add is pressed.
-                    selectedDockets: _isApprovedTab
-                        ? _orders
-                            .where((o) => _selectedOrderIds.contains(o['id']))
-                            .map((o) => '${o['docket_number']}')
-                            .toList()
-                        : const [],
-                    // Sent-tab selection shows as ghost chips in the
-                    // Received Today card (bulk Add = fully received).
-                    selectedReceiveDockets: _isSentTab
-                        ? _orders
-                            .where((o) => _selectedOrderIds.contains(o['id']))
-                            .map((o) => '${o['docket_number']}')
-                            .toList()
-                        : const [],
-                    adminName: admin.currentAdmin?.name,
-                    onOpenReport: () {
-                      ref.read(adminProvider.notifier).refreshActivity();
-                      context.push('/admin/daily-report').then((_) {
-                        _loadData(silent: true);
-                      });
-                    },
-                    onLogNapkins: () {
-                      ref.read(adminProvider.notifier).refreshActivity();
-                      context.push('/admin/napkin-returns').then((_) {
-                        _loadData(silent: true);
-                      });
-                    },
-                  ),
-              ],
-            ),
+            child: _buildBodyArea(admin, isLandscape, isNarrow),
           ),
         ],
       ),
+    );
+  }
+
+  /// Body = order list + the Today's Report panel.
+  ///
+  /// Landscape / wide: the panel is docked inline to the right of the list
+  /// (its own expand/collapse). Portrait / narrow: the panel becomes a
+  /// right-side overlay drawer that slides OVER a full-width order list, so it
+  /// never crushes the content. Admins without can_send_report never see the
+  /// panel (not even the collapsed tab) in either layout.
+  Widget _buildBodyArea(AdminState admin, bool isLandscape, bool isNarrow) {
+    final showPanel = admin.currentAdmin?.canSendReport ?? true;
+    final orderList = Column(children: _buildBodyContent(isLandscape));
+
+    if (!showPanel) return orderList;
+
+    final panel = TodayReportPanel(
+      key: _panelKey,
+      overlay: isNarrow,
+      // Send-tab (status 'approved') selection shows as "ready to add" ghost
+      // chips in the Sent Today card before Add is pressed.
+      selectedDockets: _isApprovedTab
+          ? _orders
+              .where((o) => _selectedOrderIds.contains(o['id']))
+              .map((o) => '${o['docket_number']}')
+              .toList()
+          : const [],
+      // Receive-tab (status 'sent') selection shows as ghost chips in the
+      // Received Today card (bulk Add = fully received).
+      selectedReceiveDockets: _isSentTab
+          ? _orders
+              .where((o) => _selectedOrderIds.contains(o['id']))
+              .map((o) => '${o['docket_number']}')
+              .toList()
+          : const [],
+      adminName: admin.currentAdmin?.name,
+      onOpenReport: () {
+        ref.read(adminProvider.notifier).refreshActivity();
+        context.push('/admin/daily-report').then((_) {
+          _loadData(silent: true);
+        });
+      },
+      onLogNapkins: () {
+        ref.read(adminProvider.notifier).refreshActivity();
+        context.push('/admin/napkin-returns').then((_) {
+          _loadData(silent: true);
+        });
+      },
+    );
+
+    // Portrait / narrow: order list full-width, panel as an overlay drawer.
+    if (isNarrow) {
+      return Stack(
+        children: [
+          Positioned.fill(child: orderList),
+          Positioned.fill(child: panel),
+        ],
+      );
+    }
+
+    // Landscape / wide: inline docked column to the right of the list.
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(child: orderList),
+        panel,
+      ],
     );
   }
 
@@ -1045,9 +1086,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                 ),
               ),
             ),
-          // Bulk select bar — Approved tab: Add (→ sent to laundry);
-          // Sent tab: Add (→ fully received). Same pattern, different verb
-          // under the hood.
+          // Bulk select bar — Receive tab (status 'sent'): Add (→ fully
+          // received); Send tab (status 'approved'): Add (→ sent to laundry).
+          // Same pattern, different verb under the hood.
           if ((_isApprovedTab || _isSentTab) && _orders.isNotEmpty && !_isLoading)
             Padding(
               padding: EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.xs),
@@ -1114,7 +1155,13 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                         ),
                       )
                     : RefreshIndicator(
-                        onRefresh: _loadData,
+                        // Pull-to-refresh hits the SERVER (forced full pull with
+                        // orphan cleanup) then reloads locally — previously it
+                        // only re-read local data, so remote deletions never showed.
+                        onRefresh: () async {
+                          await SyncService.instance.fullSync(force: true);
+                          await _loadData(silent: true);
+                        },
                         // Width-aware, not orientation-aware: with the Today
                         // panel expanded the list gets ~half the screen, where
                         // two columns clip the cards — drop to a single column.

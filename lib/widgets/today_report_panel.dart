@@ -1,12 +1,8 @@
-import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:uuid/uuid.dart';
 import '../config/constants.dart';
 import '../services/database_service.dart';
-import '../services/sync_service.dart';
 import '../theme/app_theme.dart';
-import 'thumbs_up_confirmation.dart';
 
 /// Right-side "Today's Report" panel for the admin dashboard.
 ///
@@ -14,8 +10,8 @@ import 'thumbs_up_confirmation.dart';
 /// compact cards — the same groups the daily report email contains:
 ///
 ///   Row 1: RECEIVED today (fully)   | PARTIALLY RECEIVED today
-///   Row 2: SENT today               | OUTSTANDING (still at laundry)
-///   Row 3: NAPKINS strip (pool-tracked — own card, quick inline entry)
+///   Row 2: SENT today               | OUTSTANDING (still at laundry, ≥1 day)
+///   Row 3: NAPKINS strip (pool-tracked — state only + "Open Napkin Returns")
 ///
 /// followed by the step checkmarks and the "Preview & Send Report" button
 /// pinned at the bottom.
@@ -23,11 +19,16 @@ import 'thumbs_up_confirmation.dart';
 /// Pool-tracked napkins (AppConstants.isPoolTracked) are balanced via the
 /// linen pool, NOT per-ticket — napkin LINES are excluded from the counts
 /// and napkin-ONLY tickets are excluded entirely from the four order groups.
-/// The server-side email builder applies the identical rule.
+/// The server-side email builder applies the identical rule. Napkin logging
+/// and the "no returns today" marker live on the Napkin Returns screen; the
+/// strip here only shows whether today's napkins are resolved.
 ///
-/// Collapses to a slim vertical "Today" tab in portrait, when toggled, or on
-/// narrow screens. All data comes from local SQLite — the dashboard calls
-/// [TodayReportPanelState.refresh] after every relevant action (no polling).
+/// In landscape / on wide screens it docks inline to the right of the order
+/// list. In portrait / narrow ([overlay] = true) it becomes a right-anchored
+/// sliding drawer over a dismissable scrim, so it never crushes the content.
+/// Collapses to a slim vertical "Today" edge tab. All data comes from local
+/// SQLite — the host calls [TodayReportPanelState.refresh] after every
+/// relevant action (no polling).
 class TodayReportPanel extends StatefulWidget {
   /// Docket numbers currently selected on the Approved tab — rendered as
   /// dashed "ready to add" ghost chips inside the SENT today card.
@@ -46,6 +47,12 @@ class TodayReportPanel extends StatefulWidget {
   /// Navigates to the Napkin Returns screen.
   final VoidCallback onLogNapkins;
 
+  /// Overlay (portrait) mode. When true the panel renders as a right-anchored
+  /// sliding sheet over a dark scrim instead of an inline docked column, so it
+  /// never shrinks the content beneath it. The host must place this inside a
+  /// Stack that fills the body. Defaults to false (inline docked, landscape).
+  final bool overlay;
+
   const TodayReportPanel({
     super.key,
     required this.selectedDockets,
@@ -53,6 +60,7 @@ class TodayReportPanel extends StatefulWidget {
     this.adminName,
     required this.onOpenReport,
     required this.onLogNapkins,
+    this.overlay = false,
   });
 
   @override
@@ -97,9 +105,6 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   int _napkinQtyToday = 0;
   bool _napkinNoneToday = false;
   int _approvedCount = 0;
-  bool _napkinLogging = false;
-
-  final TextEditingController _napkinQtyController = TextEditingController();
 
   /// null = follow the orientation default (landscape expanded).
   bool? _userExpanded;
@@ -109,12 +114,6 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   void initState() {
     super.initState();
     _load();
-  }
-
-  @override
-  void dispose() {
-    _napkinQtyController.dispose();
-    super.dispose();
   }
 
   @override
@@ -190,9 +189,15 @@ class TodayReportPanelState extends State<TodayReportPanel> {
       final sentAt = DateTime.tryParse(sentDates[orderId] ?? '') ??
           DateTime.tryParse(order['created_at'] as String? ?? '') ??
           now;
+      final days = now.difference(sentAt).inDays.clamp(0, 9999);
+      // Tickets sent TODAY (days == 0) already appear in the Sent card —
+      // listing them as Outstanding double-counts and wrongly flags same-day
+      // sends. Only items at the laundry a day or more are "outstanding".
+      // (The server email builder applies the identical days >= 1 rule.)
+      if (days < 1) continue;
       outstanding.add(_OutstandingRow(
         docket: '${order['docket_number']}',
-        days: now.difference(sentAt).inDays.clamp(0, 9999),
+        days: days,
       ));
     }
     outstanding.sort((a, b) => b.days.compareTo(a.days));
@@ -263,100 +268,27 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   bool get _addDone => _sentTodayRawCount > 0 || _approvedCount == 0;
 
   /// Napkin step resolved: returns logged today OR explicitly marked none.
+  /// Logging and "none today" both happen on the Napkin Returns screen now;
+  /// the panel only reflects the resolved state.
   bool get _napkinsResolved => _napkinQtyToday > 0 || _napkinNoneToday;
-
-  Future<void> _markNoneToday() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('No Napkin Returns Today?'),
-        content: const Text(
-          'Mark today as having no napkin returns from the laundry. '
-          'If napkins are logged later today, this marker is ignored.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(backgroundColor: AppColors.navy),
-            child: const Text('Confirm'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-
-    await DatabaseService.instance.markNapkinNoneToday();
-    await _load();
-    if (mounted) {
-      showThumbsUpConfirmation(context,
-          message: 'Marked no napkin returns today');
-    }
-  }
-
-  /// Quick inline napkin return — writes a linen_ledger 'in' entry directly
-  /// (same shape as the full Napkin Returns screen) and clears any
-  /// "none today" marker.
-  Future<void> _logNapkinsInline() async {
-    final qty = int.tryParse(_napkinQtyController.text.trim()) ?? 0;
-    if (qty <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter a valid napkin quantity')),
-      );
-      return;
-    }
-    setState(() => _napkinLogging = true);
-
-    final db = DatabaseService.instance;
-    final entryId = const Uuid().v4();
-    final now = DateTime.now().toIso8601String();
-
-    await db.insertLedgerEntry({
-      'id': entryId,
-      'item_name': 'Linen Napkins',
-      'direction': 'in',
-      'quantity': qty,
-      'order_id': null,
-      'department_id': null,
-      'note': 'Logged from Today panel',
-      'recorded_by': widget.adminName,
-      'created_at': now,
-    });
-
-    // Queue for Supabase sync
-    await db.addToSyncQueue('linen_ledger', entryId, 'insert', jsonEncode({
-      'id': entryId,
-      'item_name': 'Linen Napkins',
-      'direction': 'in',
-      'quantity': qty,
-      'note': 'Logged from Today panel',
-      'recorded_by': widget.adminName,
-      'created_at': now,
-    }));
-    // Real returns override any "no returns today" marker set earlier.
-    await db.clearNapkinNoneToday();
-    SyncService.instance.pushPendingNow();
-
-    _napkinQtyController.clear();
-    if (mounted) {
-      FocusScope.of(context).unfocus();
-      setState(() => _napkinLogging = false);
-    }
-    await _load();
-    if (mounted) {
-      showThumbsUpConfirmation(context,
-          message: '$qty napkin${qty == 1 ? '' : 's'} logged');
-    }
-  }
 
   // ── Build ──
 
   @override
   Widget build(BuildContext context) {
     final mq = MediaQuery.of(context);
+
+    // ── Overlay (portrait) mode — slides over the content, never shrinks it.
+    if (widget.overlay) {
+      // An overlay can always expand: it floats above the content rather than
+      // taking width from it, so the narrow-screen "open full report instead"
+      // fallback never applies. Default state is collapsed (don't cover the
+      // content on load).
+      final expanded = _userExpanded ?? false;
+      return _buildOverlay(expanded, mq);
+    }
+
+    // ── Inline docked mode (landscape / wide screens) — unchanged. ──
     final canExpand = mq.size.width >= _minWidthToExpand;
     final expanded =
         canExpand && (_userExpanded ?? mq.orientation == Orientation.landscape);
@@ -368,6 +300,59 @@ class TodayReportPanelState extends State<TodayReportPanel> {
       curve: Curves.easeInOut,
       width: expanded ? expandedWidth : _collapsedWidth,
       child: expanded ? _buildExpanded() : _buildCollapsedTab(canExpand),
+    );
+  }
+
+  // ── Overlay: right-anchored sliding sheet over a dismissable scrim ──
+
+  Widget _buildOverlay(bool expanded, MediaQueryData mq) {
+    // ~85% of the screen, capped so it never feels oversized on larger
+    // portrait tablets.
+    final sheetWidth = (mq.size.width * 0.85).clamp(280.0, 560.0);
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        // Dark scrim — fades in with the sheet, dismisses on tap.
+        Positioned.fill(
+          child: IgnorePointer(
+            ignoring: !expanded,
+            child: GestureDetector(
+              onTap: () => setState(() => _userExpanded = false),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                color: Colors.black
+                    .withValues(alpha: expanded ? 0.45 : 0.0),
+              ),
+            ),
+          ),
+        ),
+        // Thin "Today" edge tab — only while collapsed, on the right edge.
+        if (!expanded)
+          Positioned(
+            top: 0,
+            bottom: 0,
+            right: 0,
+            child: SizedBox(
+              width: _collapsedWidth,
+              child: _buildCollapsedTab(true),
+            ),
+          ),
+        // Sliding sheet — full height, slides in from the right edge.
+        AnimatedPositioned(
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeInOut,
+          top: 0,
+          bottom: 0,
+          right: expanded ? 0 : -sheetWidth,
+          width: sheetWidth,
+          child: Material(
+            elevation: 12,
+            child: expanded
+                ? _buildExpanded()
+                : const SizedBox.shrink(),
+          ),
+        ),
+      ],
     );
   }
 
@@ -921,6 +906,9 @@ class TodayReportPanelState extends State<TodayReportPanel> {
 
   // ── Napkins strip (full width, pool-tracked — own card) ──
 
+  /// State-only napkin strip. All logging + "none today" now happens on the
+  /// Napkin Returns screen — this just shows whether today's napkins are
+  /// resolved and links across to record them.
   Widget _napkinStrip() {
     return Container(
       padding: const EdgeInsets.symmetric(
@@ -945,85 +933,27 @@ class TodayReportPanelState extends State<TodayReportPanel> {
             ),
           ),
           const SizedBox(width: AppSpacing.sm),
-          // State
+          // State only — no inline entry.
           Expanded(child: _napkinState()),
-          // Quick inline entry: qty + Log
-          SizedBox(
-            width: 64,
-            height: 38,
-            child: TextField(
-              controller: _napkinQtyController,
-              keyboardType: TextInputType.number,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  fontFamily: 'Inter',
-                  fontSize: AppTextStyles.labelSize,
-                  fontWeight: AppTextStyles.bold),
-              decoration: InputDecoration(
-                hintText: 'Qty',
-                hintStyle: TextStyle(
-                    fontFamily: 'Inter',
-                    fontSize: 13,
-                    color: AppColors.grey400),
-                isDense: true,
-                contentPadding: const EdgeInsets.symmetric(
-                    horizontal: AppSpacing.xs, vertical: AppSpacing.sm),
-                border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
-                filled: true,
-                fillColor: AppColors.white,
-              ),
-            ),
-          ),
-          const SizedBox(width: AppSpacing.xs + 2),
+          const SizedBox(width: AppSpacing.sm),
+          // Everything happens on the Napkin Returns screen now.
           SizedBox(
             height: 38,
-            child: ElevatedButton(
-              onPressed: _napkinLogging ? null : _logNapkinsInline,
+            child: ElevatedButton.icon(
+              onPressed: widget.onLogNapkins,
+              icon: const Icon(Icons.open_in_new_rounded, size: 16),
+              label: const Text('Open Napkin Returns'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppColors.navy,
                 foregroundColor: AppColors.white,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                 textStyle: TextStyle(
                     fontFamily: 'Inter',
                     fontSize: 13,
                     fontWeight: AppTextStyles.medium),
-                shape:
-                    RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
-              ),
-              child: const Text('Log'),
-            ),
-          ),
-          if (_napkinQtyToday == 0 && !_napkinNoneToday) ...[
-            const SizedBox(width: AppSpacing.xs + 2),
-            SizedBox(
-              height: 38,
-              child: OutlinedButton(
-                onPressed: _markNoneToday,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.grey700,
-                  side: BorderSide(
-                      color: AppColors.grey700.withValues(alpha: 0.5)),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
-                  textStyle: TextStyle(
-                      fontFamily: 'Inter',
-                      fontSize: 13,
-                      fontWeight: AppTextStyles.medium),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: AppRadius.smallBR),
-                ),
-                child: const Text('None today'),
+                shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
               ),
             ),
-          ],
-          // Link to the full napkin screen
-          IconButton(
-            onPressed: widget.onLogNapkins,
-            icon: const Icon(Icons.open_in_new_rounded,
-                size: 18, color: AppColors.goldDark),
-            tooltip: 'Open napkin returns',
-            visualDensity: VisualDensity.compact,
           ),
         ],
       ),
@@ -1037,7 +967,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     if (_napkinQtyToday > 0) {
       icon = Icons.check_circle_rounded;
       color = AppColors.success;
-      text = '$_napkinQtyToday logged today';
+      text = '$_napkinQtyToday napkin${_napkinQtyToday == 1 ? '' : 's'} logged today';
     } else if (_napkinNoneToday) {
       icon = Icons.check_circle_rounded;
       color = AppColors.success;
@@ -1045,7 +975,7 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     } else {
       icon = Icons.warning_amber_rounded;
       color = Colors.orange.shade800;
-      text = 'Not recorded yet';
+      text = 'Napkins not recorded yet';
     }
     return Row(
       children: [

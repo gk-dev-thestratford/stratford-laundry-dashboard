@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
 import '../../theme/app_theme.dart';
@@ -229,8 +230,25 @@ class _NapkinReturnsScreenState extends ConsumerState<NapkinReturnsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final canSendReport = ref.watch(adminProvider).currentAdmin?.canSendReport ?? true;
     return Scaffold(
       backgroundColor: AppColors.offWhite,
+      // Report access from the napkin screen — opens the full daily-report
+      // preview (gated to admins who can send reports).
+      floatingActionButton: canSendReport
+          ? FloatingActionButton.extended(
+              heroTag: 'napkinReport',
+              onPressed: () {
+                ref.read(adminProvider.notifier).refreshActivity();
+                context.push('/admin/daily-report').then((_) => _loadData());
+              },
+              backgroundColor: AppColors.gold,
+              foregroundColor: AppColors.navy,
+              icon: const Icon(Icons.summarize_rounded),
+              label: Text("Today's Report",
+                  style: TextStyle(fontFamily: 'Inter', fontWeight: AppTextStyles.bold)),
+            )
+          : null,
       body: Column(
         children: [
           // ── Header ──

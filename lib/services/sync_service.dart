@@ -119,12 +119,15 @@ class SyncService {
     _lastFullSyncStart = now;
     // Reset the pushing guard in case it got stuck
     _isPushing = false;
-    return _fullSync();
+    // A manual/forced sync also forces a FULL orders+logs pull with orphan
+    // cleanup, so deletions made elsewhere (e.g. on the web) reconcile now
+    // instead of waiting for the once-daily full pull.
+    return _fullSync(forceFullPull: force);
   }
 
   /// Full sync: pull reference data + push pending items.
   /// Called on connectivity restore and on first initialize.
-  Future<void> _fullSync() async {
+  Future<void> _fullSync({bool forceFullPull = false}) async {
     if (!SupabaseService.instance.isInitialized) {
       _debugInfo = 'Supabase not initialized';
       debugPrint('[Sync] $_debugInfo');
@@ -138,7 +141,7 @@ class SyncService {
     await _abandonStuckItems();
 
     await _pushPending();
-    await _pullReferenceData();
+    await _pullReferenceData(forceFullPull: forceFullPull);
 
     // Re-check pending state after both push and pull complete.
     final remaining = await DatabaseService.instance.getPendingSyncItems();
@@ -199,7 +202,9 @@ class SyncService {
   }
 
   /// Pull departments, items, admin users from Supabase into local SQLite.
-  Future<void> _pullReferenceData() async {
+  /// [forceFullPull] forces a full orders+status-logs pull WITH orphan cleanup
+  /// (used by manual sync / pull-to-refresh) so remote deletions reconcile now.
+  Future<void> _pullReferenceData({bool forceFullPull = false}) async {
     bool didSync = false;
 
     try {
@@ -262,7 +267,7 @@ class SyncService {
     // we do a FULL pull and orphan-cleanup so orders deleted on the web get
     // removed locally too.
     final db = DatabaseService.instance;
-    final shouldFullPull = _lastFullPull == null ||
+    final shouldFullPull = forceFullPull || _lastFullPull == null ||
         DateTime.now().difference(_lastFullPull!) > _fullPullInterval;
 
     try {

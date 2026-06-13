@@ -44,7 +44,9 @@ class SyncIndicator extends ConsumerWidget {
 
     return GestureDetector(
       onTap: () async {
-        await SyncService.instance.fullSync();
+        // Manual tap forces a FULL pull (orphan cleanup) so remote deletions
+        // reconcile immediately, not just on the once-daily full pull.
+        await SyncService.instance.fullSync(force: true);
         onSynced?.call();
       },
       onLongPress: () {
