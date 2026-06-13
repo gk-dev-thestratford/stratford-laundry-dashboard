@@ -197,6 +197,7 @@ function buildDailyReport(
   sentOrders: any[],
   outstandingOrders: OutstandingOrder[],
   napkinReturns: any[],
+  senderName?: string,
 ) {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
 
@@ -212,264 +213,209 @@ function buildDailyReport(
   const sentNonPool = sentOrders.filter((o: any) => nonPoolItems(o).length > 0);
   const outstandingFiltered = outstandingOrders
     .map((o) => ({ ...o, items: (o.items || []).filter((i) => !isPoolItem(i.item)) }))
-    .filter((o) => o.items.length > 0);
+    // Exclude tickets sent TODAY (days === 0): they already appear under
+    // "Sent to Laundry Today", so listing them as outstanding too would
+    // double-count and wrongly flag same-day sends as overdue.
+    .filter((o) => o.items.length > 0 && o.days >= 1);
 
+  // ── KPI numbers (napkin pool excluded; outstanding already excludes today's sends) ──
+  const receivedItems = [...fullReceived, ...partialReceived].reduce(
+    (s, o) => s + nonPoolItems(o).reduce((ss: number, i: any) => ss + (i.quantity_received || 0), 0), 0);
+  const receivedOrdersCount = fullReceived.length + partialReceived.length;
+  const sentItems = sentNonPool.reduce(
+    (s, o) => s + nonPoolItems(o).reduce((ss: number, i: any) => ss + (i.quantity_sent || 0), 0), 0);
   const totalOutstanding = outstandingFiltered.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0);
   const hasOutstanding = totalOutstanding > 0;
-  const hasOverdue = outstandingFiltered.some((o) => o.days >= AGING_AMBER_DAYS);
+  const napkinTotal = napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0);
 
-  // ── Section 1: Received Today — fully received tickets (teal) ──
-  let receivedSection = "";
+  const weekday = new Date().toLocaleDateString("en-GB", { weekday: "long", timeZone: "Europe/London" });
+  const time = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" });
+
+  // ── Shared styles & helpers ──
+  const TH = (align: string, edge: boolean) =>
+    `padding:9px ${edge ? "14px" : "8px"};font-size:10.5px;font-weight:700;color:#8A92A6;text-transform:uppercase;letter-spacing:0.4px;text-align:${align};`;
+  const cardOpen = `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#FFFFFF;border:1px solid #E6E9EF;border-radius:10px;overflow:hidden;">`;
+  const cardClose = `</table>`;
+  const emptyCard = (t: string) =>
+    `${cardOpen}<tr><td style="padding:15px;text-align:center;font-size:12.5px;color:#A6AEBF;">${t}</td></tr>${cardClose}`;
+  const stripe = (i: number) => (i % 2 === 1 ? "background:#FCFCFD;" : "");
+  const C = { received: "#0E9384", partial: "#C77700", sent: "#2563EB", outstanding: "#D64545", napkin: "#7C5CBF" };
+
+  const sectionHead = (dot: string, title: string, right: string) => `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:24px 0 9px;">
+      <tr>
+        <td style="vertical-align:middle;"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${dot};vertical-align:middle;"></span><span style="font-size:13px;font-weight:700;letter-spacing:0.6px;color:#1B2A4A;text-transform:uppercase;vertical-align:middle;margin-left:9px;">${title}</span></td>
+        <td align="right" style="font-size:12px;color:#8A92A6;vertical-align:middle;">${right}</td>
+      </tr>
+    </table>`;
+
+  const kpi = (num: string | number, label: string, sub: string, accent: string) => `
+    <td width="25%" valign="top" style="padding:0 5px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#FFFFFF;border:1px solid #E6E9EF;border-radius:10px;">
+        <tr><td style="height:3px;background:${accent};font-size:0;line-height:0;border-radius:10px 10px 0 0;">&nbsp;</td></tr>
+        <tr><td align="center" style="padding:14px 6px 12px;">
+          <div style="font-size:30px;font-weight:700;color:#1B2A4A;line-height:1;">${num}</div>
+          <div style="font-size:11px;font-weight:700;letter-spacing:0.5px;color:${accent};text-transform:uppercase;margin-top:7px;">${label}</div>
+          <div style="font-size:11px;color:#8A92A6;margin-top:2px;">${sub}</div>
+        </td></tr>
+      </table>
+    </td>`;
+
+  const dayPill = (days: number) => {
+    const overdue = days >= AGING_RED_DAYS, warn = days >= AGING_AMBER_DAYS;
+    const bg = overdue ? "#FBEAEA" : warn ? "#FBF1E3" : "#EEF0F4";
+    const fg = overdue ? "#D64545" : warn ? "#C77700" : "#8A92A6";
+    return `<span style="display:inline-block;padding:3px 9px;border-radius:11px;background:${bg};color:${fg};font-size:11.5px;font-weight:700;">${days}d${overdue ? " overdue" : ""}</span>`;
+  };
+
+  // ── Section 1: Received Today (complete tickets) ──
+  let receivedSection = sectionHead(C.received, "Received Today",
+    `${fullReceived.length} order${fullReceived.length !== 1 ? "s" : ""} &middot; ${fullReceived.reduce((s, o) => s + nonPoolItems(o).reduce((ss: number, i: any) => ss + (i.quantity_received || 0), 0), 0)} items`);
   if (fullReceived.length > 0) {
-    let grandReceived = 0;
-
-    const receivedRows = fullReceived.map((order: any) => {
+    const rows = fullReceived.map((order: any, idx: number) => {
       const items = nonPoolItems(order);
-      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
-      const totalReceived = items.reduce((sum: number, i: any) => sum + (i.quantity_received || 0), 0);
-      grandReceived += totalReceived;
-
-      return `<tr style="border-bottom:1px solid #eee">
-        <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
-        <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
-        <td style="padding:10px 8px">${order.departments?.name || "—"}</td>
-        <td style="padding:10px 8px">${itemsDesc || "—"}</td>
-        <td style="padding:10px 8px;text-align:center;font-weight:bold">${totalReceived}</td>
+      const qty = items.reduce((s: number, i: any) => s + (i.quantity_received || 0), 0);
+      const desc = items.map((i: any) => `${i.quantity_sent}&times; ${i.item_name}`).join(", ");
+      return `<tr style="border-top:1px solid #EEF0F4;${stripe(idx)}">
+        <td style="padding:11px 14px;font-size:13px;color:#1B2A4A;font-weight:700;">#${order.docket_number}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${order.staff_name || order.guest_name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${order.departments?.name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#5B6478;">${desc || "—"}</td>
+        <td align="right" style="padding:11px 14px;font-size:13px;color:#2D3340;font-weight:700;">${qty}</td>
       </tr>`;
     }).join("");
-
-    receivedSection = `
-      <div style="background:#00838F;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          1. Received Today — ${fullReceived.length} order${fullReceived.length !== 1 ? "s" : ""}, ${grandReceived} items, all complete ✓
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#1B2A4A;color:white">
-            <th style="padding:10px 8px;text-align:left">Docket</th>
-            <th style="padding:10px 8px;text-align:left">Name</th>
-            <th style="padding:10px 8px;text-align:left">Department</th>
-            <th style="padding:10px 8px;text-align:left">Items</th>
-            <th style="padding:10px 8px;text-align:center">Received</th>
-          </tr>
-          ${receivedRows}
-          <tr style="background:#f5f5f5;font-weight:bold">
-            <td colspan="4" style="padding:10px 8px;text-align:right">Total Items</td>
-            <td style="padding:10px 8px;text-align:center">${grandReceived}</td>
-          </tr>
-        </table>
-      </div>`;
+    receivedSection += `${cardOpen}
+      <tr style="background:#F7F8FA;"><th style="${TH("left", true)}">Docket</th><th style="${TH("left", false)}">Name</th><th style="${TH("left", false)}">Department</th><th style="${TH("left", false)}">Items</th><th style="${TH("right", true)}">Qty</th></tr>
+      ${rows}${cardClose}`;
   } else {
-    receivedSection = `
-      <div style="background:#00838F;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">1. Received Today</p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <p style="margin:0;color:#999;font-style:italic">No complete tickets received today.</p>
-      </div>`;
+    receivedSection += emptyCard("No complete tickets received today.");
   }
 
-  // ── Section 2: Partially Received Today — tickets that came back short (amber) ──
+  // ── Section 2: Partially Received (only if any) ──
   let partialSection = "";
   if (partialReceived.length > 0) {
-    const partialRows = partialReceived.map((order: any) => {
+    const rows = partialReceived.map((order: any, idx: number) => {
       const items = nonPoolItems(order);
-      const totalSent = items.reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0);
-      const totalReceived = items.reduce((s: number, i: any) => s + (i.quantity_received || 0), 0);
-      const awaitingDesc = items
-        .filter((i: any) => (i.quantity_received ?? 0) < (i.quantity_sent || 0))
-        .map((i: any) => `${(i.quantity_sent || 0) - (i.quantity_received ?? 0)}x ${i.item_name}`)
-        .join(", ");
-      return `<tr style="border-bottom:1px solid #eee">
-        <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
-        <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
-        <td style="padding:10px 8px">${order.departments?.name || "—"}</td>
-        <td style="padding:10px 8px;text-align:center">${totalReceived} of ${totalSent}</td>
-        <td style="padding:10px 8px;color:#C62828;font-weight:bold">${awaitingDesc}</td>
+      const sent = items.reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0);
+      const rec = items.reduce((s: number, i: any) => s + (i.quantity_received || 0), 0);
+      const awaiting = items.filter((i: any) => (i.quantity_received ?? 0) < (i.quantity_sent || 0))
+        .map((i: any) => `${(i.quantity_sent || 0) - (i.quantity_received ?? 0)}&times; ${i.item_name}`).join(", ");
+      return `<tr style="border-top:1px solid #EEF0F4;${stripe(idx)}">
+        <td style="padding:11px 14px;font-size:13px;color:#1B2A4A;font-weight:700;">#${order.docket_number}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${order.staff_name || order.guest_name || "—"} &middot; ${order.departments?.name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${rec} of ${sent}</td>
+        <td style="padding:11px 14px;font-size:13px;color:#D64545;font-weight:600;">${awaiting}</td>
       </tr>`;
     }).join("");
-
-    partialSection = `
-      <div style="background:#E65100;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          2. Partially Received Today — ${partialReceived.length} ticket${partialReceived.length !== 1 ? "s" : ""} came back short
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:#FFF8F0">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#E65100;color:white">
-            <th style="padding:10px 8px;text-align:left">Docket</th>
-            <th style="padding:10px 8px;text-align:left">Name</th>
-            <th style="padding:10px 8px;text-align:left">Department</th>
-            <th style="padding:10px 8px;text-align:center">Received</th>
-            <th style="padding:10px 8px;text-align:left">Still Awaiting</th>
-          </tr>
-          ${partialRows}
-        </table>
-        <p style="margin:12px 0 0;font-size:11px;color:#999">Awaiting items stay on a follow-up ticket in the Still at Laundry list until they come back.</p>
-      </div>`;
+    partialSection = sectionHead(C.partial, "Partially Received", `${partialReceived.length} ticket${partialReceived.length !== 1 ? "s" : ""} short`)
+      + `${cardOpen}
+        <tr style="background:#F7F8FA;"><th style="${TH("left", true)}">Docket</th><th style="${TH("left", false)}">Name</th><th style="${TH("left", false)}">Received</th><th style="${TH("left", true)}">Still Awaiting</th></tr>
+        ${rows}${cardClose}`;
   }
 
-  // ── Section 3: Sent to Laundry Today (orange) — napkin pool items excluded ──
-  let sentSection = "";
+  // ── Section 3: Sent to Laundry Today ──
+  let sentSection = sectionHead(C.sent, "Sent to Laundry Today",
+    `${sentNonPool.length} order${sentNonPool.length !== 1 ? "s" : ""} &middot; ${sentItems} items`);
   if (sentNonPool.length > 0) {
-    const sentGrandTotal = sentNonPool.reduce((sum: number, o: any) =>
-      sum + nonPoolItems(o).reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0), 0);
-
-    const sentRows = sentNonPool.map((order: any) => {
+    const rows = sentNonPool.map((order: any, idx: number) => {
       const items = nonPoolItems(order);
-      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
-      const totalQty = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
-      return `<tr style="border-bottom:1px solid #eee">
-        <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
-        <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
-        <td style="padding:10px 8px">${order.departments?.name || "—"}</td>
-        <td style="padding:10px 8px">${itemsDesc || "—"}</td>
-        <td style="padding:10px 8px;text-align:center;font-weight:bold">${totalQty}</td>
+      const qty = items.reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0);
+      const desc = items.map((i: any) => `${i.quantity_sent}&times; ${i.item_name}`).join(", ");
+      return `<tr style="border-top:1px solid #EEF0F4;${stripe(idx)}">
+        <td style="padding:11px 14px;font-size:13px;color:#1B2A4A;font-weight:700;">#${order.docket_number}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${order.staff_name || order.guest_name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${order.departments?.name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#5B6478;">${desc || "—"}</td>
+        <td align="right" style="padding:11px 14px;font-size:13px;color:#2D3340;font-weight:700;">${qty}</td>
       </tr>`;
     }).join("");
-
-    sentSection = `
-      <div style="background:#E65100;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          3. Sent to Laundry Today — ${sentNonPool.length} order${sentNonPool.length !== 1 ? "s" : ""}, ${sentGrandTotal} items
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#1B2A4A;color:white">
-            <th style="padding:10px 8px;text-align:left">Docket</th>
-            <th style="padding:10px 8px;text-align:left">Name</th>
-            <th style="padding:10px 8px;text-align:left">Department</th>
-            <th style="padding:10px 8px;text-align:left">Items</th>
-            <th style="padding:10px 8px;text-align:center">Qty</th>
-          </tr>
-          ${sentRows}
-          <tr style="background:#f5f5f5;font-weight:bold">
-            <td colspan="4" style="padding:10px 8px;text-align:right">Total Items</td>
-            <td style="padding:10px 8px;text-align:center">${sentGrandTotal}</td>
-          </tr>
-        </table>
-      </div>`;
+    sentSection += `${cardOpen}
+      <tr style="background:#F7F8FA;"><th style="${TH("left", true)}">Docket</th><th style="${TH("left", false)}">Name</th><th style="${TH("left", false)}">Department</th><th style="${TH("left", false)}">Items</th><th style="${TH("right", true)}">Qty</th></tr>
+      ${rows}${cardClose}`;
   } else {
-    sentSection = `
-      <div style="background:#E65100;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">3. Sent to Laundry Today</p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <p style="margin:0;color:#999;font-style:italic">Nothing sent to the laundry today${sentOrders.length > 0 ? " (napkin-only tickets are pool-balanced in the napkin section)" : ""}.</p>
-      </div>`;
+    sentSection += emptyCard(`Nothing sent to the laundry today${sentOrders.length > 0 ? " (napkin-only tickets are balanced in the napkin pool)" : ""}.`);
   }
 
-  // ── Section 4: Still at Laundry — the full not-received backlog with aging ──
-  let outstandingSection = "";
+  // ── Section 4: Still at Laundry (full backlog, days >= 1) ──
+  let outstandingSection = sectionHead(C.outstanding, "Still at Laundry",
+    `${outstandingFiltered.length} ticket${outstandingFiltered.length !== 1 ? "s" : ""} &middot; ${totalOutstanding} items`);
   if (outstandingFiltered.length > 0) {
-    const outstandingRows = outstandingFiltered.map((o, idx) => {
-      const ageColour = o.days >= AGING_RED_DAYS ? "#C62828" : o.days >= AGING_AMBER_DAYS ? "#E65100" : "#666";
-      const ageFlag = o.days >= AGING_RED_DAYS ? " ⚠ OVERDUE" : o.days >= AGING_AMBER_DAYS ? " ⚠" : "";
-      const awaitedDesc = o.items.map((i) => `${i.awaited}x ${i.item}`).join(", ");
-      return `
-      <tr style="border-bottom:1px solid #eee;background:${idx % 2 === 0 ? "#fff" : "#FFF8F8"}">
-        <td style="padding:8px;font-family:monospace;font-size:12px">#${o.docket}${o.isChild ? ' <span style="color:#E65100;font-size:10px">(partial)</span>' : ""}</td>
-        <td style="padding:8px">${o.department}</td>
-        <td style="padding:8px">${o.name}</td>
-        <td style="padding:8px">${awaitedDesc}</td>
-        <td style="padding:8px;text-align:center;color:${ageColour};font-weight:bold">${o.days}d${ageFlag}</td>
+    const rows = outstandingFiltered.map((o, idx) => {
+      const desc = o.items.map((i) => `${i.awaited}&times; ${i.item}`).join(", ");
+      return `<tr style="border-top:1px solid #EEF0F4;${stripe(idx)}">
+        <td style="padding:11px 14px;font-size:13px;color:#1B2A4A;font-weight:700;">#${o.docket}${o.isChild ? ' <span style="font-weight:500;color:#C77700;font-size:11px;">partial</span>' : ""}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#2D3340;">${o.department}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#5B6478;">${desc}</td>
+        <td align="right" style="padding:11px 14px;">${dayPill(o.days)}</td>
       </tr>`;
     }).join("");
-
-    outstandingSection = `
-      <div style="background:#C62828;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          4. Still at Laundry — ${totalOutstanding} item${totalOutstanding !== 1 ? "s" : ""} across ${outstandingFiltered.length} ticket${outstandingFiltered.length !== 1 ? "s" : ""} not yet received
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:#FFF8F8">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#C62828;color:white">
-            <th style="padding:8px;text-align:left">Docket</th>
-            <th style="padding:8px;text-align:left">Department</th>
-            <th style="padding:8px;text-align:left">Name</th>
-            <th style="padding:8px;text-align:left">Awaiting</th>
-            <th style="padding:8px;text-align:center">Days Out</th>
-          </tr>
-          ${outstandingRows}
-        </table>
-        <p style="margin:12px 0 0;font-size:11px;color:#999">Days Out = days since the ticket was sent to the laundry. ⚠ from ${AGING_AMBER_DAYS} days, ⚠ OVERDUE from ${AGING_RED_DAYS} days.</p>
-      </div>`;
+    outstandingSection += `${cardOpen}
+      <tr style="background:#F7F8FA;"><th style="${TH("left", true)}">Docket</th><th style="${TH("left", false)}">Department</th><th style="${TH("left", false)}">Awaiting</th><th style="${TH("right", true)}">Days Out</th></tr>
+      ${rows}${cardClose}`;
   } else {
-    outstandingSection = `
-      <div style="background:#2E7D32;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">4. Still at Laundry — nothing outstanding ✓</p>
-      </div>`;
+    outstandingSection += emptyCard("Nothing outstanding — everything is back &#10003;");
   }
 
-  // ── Section 4: Napkin Returns (purple, conditional) ──
+  // ── Section 5: Napkin Returns (only if any) ──
   let napkinSection = "";
   if (napkinReturns.length > 0) {
-    const napkinTotal = napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0);
-
-    const napkinRows = napkinReturns.map((n: any) => `
-      <tr style="border-bottom:1px solid #eee">
-        <td style="padding:8px">${n.department?.name || "—"}</td>
-        <td style="padding:8px;text-align:center;font-weight:bold">${n.quantity}</td>
-        <td style="padding:8px;color:#666">${n.note || "—"}</td>
+    const rows = napkinReturns.map((n: any, idx: number) => `<tr style="border-top:1px solid #EEF0F4;${stripe(idx)}">
+        <td style="padding:11px 14px;font-size:13px;color:#2D3340;">${n.department?.name || "—"}</td>
+        <td style="padding:11px 8px;font-size:13px;color:#5B6478;">${n.note || "—"}</td>
+        <td align="right" style="padding:11px 14px;font-size:13px;color:#2D3340;font-weight:700;">${n.quantity}</td>
       </tr>`).join("");
-
-    napkinSection = `
-      <div style="background:#6A1B9A;padding:12px 24px">
-        <p style="color:white;margin:0;font-size:14px;font-weight:bold;text-align:center">
-          5. Napkin Returns Today — ${napkinTotal} napkin${napkinTotal !== 1 ? "s" : ""} returned
-        </p>
-      </div>
-      <div style="padding:16px 24px;background:white">
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr style="background:#6A1B9A;color:white">
-            <th style="padding:8px;text-align:left">Department</th>
-            <th style="padding:8px;text-align:center">Qty Returned</th>
-            <th style="padding:8px;text-align:left">Note</th>
-          </tr>
-          ${napkinRows}
-          <tr style="background:#f5f5f5;font-weight:bold">
-            <td style="padding:8px">Total</td>
-            <td style="padding:8px;text-align:center">${napkinTotal}</td>
-            <td style="padding:8px"></td>
-          </tr>
-        </table>
-      </div>`;
+    napkinSection = sectionHead(C.napkin, "Napkin Returns", `${napkinTotal} napkin${napkinTotal !== 1 ? "s" : ""}`)
+      + `${cardOpen}
+        <tr style="background:#F7F8FA;"><th style="${TH("left", true)}">Department</th><th style="${TH("left", false)}">Note</th><th style="${TH("right", true)}">Qty</th></tr>
+        ${rows}${cardClose}`;
   }
 
-  // ── Assemble full report ──
-  const bannerColour = hasOverdue ? "#C62828" : hasOutstanding ? "#E65100" : "#2E7D32";
-  const bannerText = hasOverdue
-    ? "Action Required — Overdue Items at Laundry"
-    : hasOutstanding
-      ? "Items Still at Laundry"
-      : "All Clear — Nothing Outstanding";
+  const kpiRow = `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom:6px;">
+      <tr>
+        ${kpi(receivedItems, "Received", `${receivedOrdersCount} order${receivedOrdersCount !== 1 ? "s" : ""}`, C.received)}
+        ${kpi(sentItems, "Sent", `${sentNonPool.length} order${sentNonPool.length !== 1 ? "s" : ""}`, C.sent)}
+        ${kpi(totalOutstanding, "Outstanding", `${outstandingFiltered.length} ticket${outstandingFiltered.length !== 1 ? "s" : ""}`, hasOutstanding ? C.outstanding : "#2E7D32")}
+        ${kpi(napkinTotal, "Napkins", "returned", C.napkin)}
+      </tr>
+    </table>`;
 
+  const sentLine = senderName
+    ? `Sent by ${senderName} &middot; ${time}, ${today}`
+    : `Generated automatically &middot; ${time}, ${today}`;
+
+  // ── Assemble (modern, card-based, email-safe table layout) ──
   return `
-    <div style="font-family:sans-serif;max-width:750px;margin:0 auto;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
-      <div style="background:#1B2A4A;padding:24px;text-align:center">
-        <h1 style="color:white;margin:0;font-size:22px;letter-spacing:2px">THE STRATFORD HOTEL</h1>
-        <p style="color:#C9A84C;margin:6px 0 0;font-size:12px;letter-spacing:1px">Daily Laundry Report</p>
-      </div>
-
-      <div style="background:${bannerColour};padding:14px 24px;text-align:center">
-        <h2 style="color:white;margin:0;font-size:18px">${bannerText} — ${today}</h2>
-      </div>
-
-      ${receivedSection}
-      ${partialSection}
-      ${sentSection}
-      ${outstandingSection}
-      ${napkinSection}
-
-      <div style="background:#f5f5f5;padding:20px;text-align:center;font-size:11px;color:#999;border-top:1px solid #e0e0e0">
-        The Stratford Hotel — Laundry Management System<br>
-        Managed by the Housekeeping Department
-      </div>
-    </div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#EEF1F5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+      <tr><td align="center" style="padding:28px 16px;">
+        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="width:640px;max-width:100%;background:#FFFFFF;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(20,30,55,0.08);">
+          <tr><td style="background:#1B2A4A;padding:26px 32px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+              <td align="left" style="vertical-align:middle;">
+                <div style="color:#FFFFFF;font-size:18px;font-weight:700;letter-spacing:1.5px;">THE STRATFORD HOTEL</div>
+                <div style="color:#C9A84C;font-size:12px;font-weight:600;letter-spacing:0.5px;margin-top:5px;">Daily Laundry Report</div>
+              </td>
+              <td align="right" style="vertical-align:middle;">
+                <div style="color:#AEB6C9;font-size:12px;">${weekday}</div>
+                <div style="color:#FFFFFF;font-size:14px;font-weight:600;margin-top:2px;">${today}</div>
+              </td>
+            </tr></table>
+          </td></tr>
+          <tr><td style="padding:24px 28px 28px;">
+            ${kpiRow}
+            ${receivedSection}
+            ${partialSection}
+            ${sentSection}
+            ${outstandingSection}
+            ${napkinSection}
+          </td></tr>
+          <tr><td style="background:#F7F8FA;border-top:1px solid #E6E9EF;padding:18px 28px;text-align:center;">
+            <div style="font-size:12px;color:#5B6478;font-weight:600;">${sentLine}</div>
+            <div style="font-size:11px;color:#A6AEBF;line-height:1.6;margin-top:7px;">The Stratford Hotel &middot; Laundry Management System<br>Managed by the Housekeeping Department</div>
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
   `;
 }
 
@@ -511,7 +457,7 @@ serve(async (req: Request) => {
       ? payload.recipients
       : await fetchRecipients();
 
-    const reportHtml = buildDailyReport(receivedOrders, sentOrders, outstandingOrders, napkinReturns);
+    const reportHtml = buildDailyReport(receivedOrders, sentOrders, outstandingOrders, napkinReturns, payload?.senderName);
 
     const today = new Date().toLocaleDateString("en-GB", { timeZone: "Europe/London" });
     // Subject counts mirror the report body: napkin pool items/tickets excluded

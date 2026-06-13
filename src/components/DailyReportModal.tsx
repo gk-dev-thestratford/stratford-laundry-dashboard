@@ -196,7 +196,9 @@ export default function DailyReportModal({ onClose }: DailyReportModalProps) {
   const outstanding = useMemo(
     () => (data?.openSent ?? [])
       .map((o) => ({ ...o, items: o.items.filter((i) => !isPoolItem(i.item)) }))
-      .filter((o) => o.items.length > 0),
+      // Exclude tickets sent today (days === 0) — they show under "Sent Today",
+      // not as outstanding (they're not overdue, they just left).
+      .filter((o) => o.items.length > 0 && o.days >= 1),
     [data])
 
   const counts = useMemo(() => {
