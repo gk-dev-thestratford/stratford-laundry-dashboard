@@ -77,6 +77,12 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
   List<Map<String, dynamic>> _napkinReturns = [];
   Map<String, List<Map<String, dynamic>>> _itemsByOrder = {};
   DateTime? _lastSentAt;
+  /// True when [_lastSentAt] falls on today's local calendar day — drives the
+  /// "report sent today" banner, the express window, and the send gating.
+  bool _reportSentToday = false;
+  /// True when the windowed sections (received / partial / sent / napkins)
+  /// hold anything — i.e. there is something new to send.
+  bool _hasNewActivity = false;
   /// Today explicitly marked "no napkin returns" (app_meta, date-keyed).
   bool _napkinNoneToday = false;
 
@@ -100,10 +106,27 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     final now = DateTime.now();
     final todayMidnight = DateTime(now.year, now.month, now.day);
 
+    // ── "Since last send" window ──────────────────────────────────────────
+    // If a report was already sent earlier TODAY, the activity sections only
+    // show what happened since that send (the next express batch). Otherwise
+    // the window is the whole day (today midnight). The "Still at Laundry"
+    // backlog below is standing info and is NEVER windowed.
+    final lastSentIso = await db.getMeta(_kLastSentMetaKey);
+    final lastSentAt = lastSentIso != null ? DateTime.tryParse(lastSentIso) : null;
+    final reportSentToday = lastSentAt != null &&
+        lastSentAt.year == now.year &&
+        lastSentAt.month == now.month &&
+        lastSentAt.day == now.day;
+    final windowStartIso = (reportSentToday && lastSentIso != null)
+        ? lastSentIso
+        : todayMidnight.toIso8601String();
+    final windowStart = DateTime.parse(windowStartIso);
+
     final received =
-        await db.getOrdersWithStatusLogToday(AppConstants.statusReceived);
-    final sent = await db.getOrdersWithStatusLogToday(AppConstants.statusSent);
-    // The whole not-yet-received backlog, any day
+        await db.getOrdersWithStatusLogSince(AppConstants.statusReceived, windowStartIso);
+    final sent =
+        await db.getOrdersWithStatusLogSince(AppConstants.statusSent, windowStartIso);
+    // The whole not-yet-received backlog, any day (standing info, not windowed)
     final backlogOrders =
         await db.getOrders(status: AppConstants.statusSent, limit: 500);
 
@@ -182,12 +205,17 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     // Oldest first — matches the email's ordering
     backlog.sort((a, b) => b.days.compareTo(a.days));
 
-    final ledger = await db.getLedgerEntries(since: todayMidnight);
+    final ledger = await db.getLedgerEntries(since: windowStart);
     final napkinReturns =
         ledger.where((e) => e['direction'] == 'in').toList();
 
-    final lastSentIso = await db.getMeta(_kLastSentMetaKey);
     final napkinNoneToday = await db.isNapkinNoneMarkedToday();
+
+    // New activity = anything in the window across the four activity sections.
+    final hasNewActivity = receivedFull.isNotEmpty ||
+        receivedPartial.isNotEmpty ||
+        sentFiltered.isNotEmpty ||
+        napkinReturns.isNotEmpty;
 
     if (mounted) {
       setState(() {
@@ -197,8 +225,9 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
         _backlog = backlog;
         _napkinReturns = napkinReturns;
         _itemsByOrder = itemsByOrder;
-        _lastSentAt =
-            lastSentIso != null ? DateTime.tryParse(lastSentIso) : null;
+        _lastSentAt = lastSentAt;
+        _reportSentToday = reportSentToday;
+        _hasNewActivity = hasNewActivity;
         _napkinNoneToday = napkinNoneToday;
         _isLoading = false;
       });
@@ -218,12 +247,16 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
   Future<void> _sendReport() async {
     ref.read(adminProvider.notifier).refreshActivity();
 
+    // Express follow-up when a report already went out earlier today.
+    final isExpress = _reportSentToday && _hasNewActivity;
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Send Daily Report?'),
+        title: Text(isExpress ? 'Send Express Update?' : 'Send Daily Report?'),
         content: Text(
-          'Send daily report? ${_receivedToday.length} received, '
+          '${isExpress ? 'Send express update?' : 'Send daily report?'} '
+          '${_receivedToday.length} received, '
           '${_partialToday.length} partially received, '
           '${_sentToday.length} sent, $_stillAtLaundryQty items still at '
           'laundry, $_napkinQty napkins — will be emailed to the laundry '
@@ -237,7 +270,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
           ElevatedButton.icon(
             onPressed: () => Navigator.pop(ctx, true),
             icon: const Icon(Icons.send_rounded, size: AppSizes.iconSizeSm),
-            label: const Text('Send Report'),
+            label: Text(isExpress ? 'Send Express Update' : 'Send Report'),
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.navy),
           ),
         ],
@@ -261,8 +294,13 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
         return;
       }
 
-      // 2. Invoke the edge function (no payload — it self-fetches from the server).
-      final ok = await SupabaseService.instance.invokeDailyReport();
+      // 2. Invoke the edge function. For an express follow-up pass the last
+      //    send time so the email only covers the new batch since then; for a
+      //    first/full daily send pass null (whole day).
+      final since = _reportSentToday
+          ? await DatabaseService.instance.getMeta(_kLastSentMetaKey)
+          : null;
+      final ok = await SupabaseService.instance.invokeDailyReport(since: since);
       if (!ok) {
         _showError("Couldn't send the report — please try again");
         return;
@@ -272,8 +310,10 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       await DatabaseService.instance
           .setMeta(_kLastSentMetaKey, sentAt.toIso8601String());
       if (mounted) {
-        setState(() => _lastSentAt = sentAt);
         showThumbsUpConfirmation(context, message: 'Report sent');
+        // Re-load so the window recomputes from the new send time: sections
+        // empty out and the "sent today" banner appears. Stay on this screen.
+        await _loadData();
       }
     } finally {
       if (mounted) setState(() => _isSending = false);
@@ -329,9 +369,18 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                             child: ConstrainedBox(
                               constraints:
                                   const BoxConstraints(maxWidth: 1100),
-                              child: isWide
-                                  ? _buildGridLayout()
-                                  : _buildVerticalLayout(),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  if (_reportSentToday) ...[
+                                    _buildSentBanner(),
+                                    const SizedBox(height: AppSpacing.lg),
+                                  ],
+                                  isWide
+                                      ? _buildGridLayout()
+                                      : _buildVerticalLayout(),
+                                ],
+                              ),
                             ),
                           ),
                         );
@@ -897,14 +946,79 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     );
   }
 
+  // ── "Report sent today" banner (top of body when sent today) ──
+
+  Widget _buildSentBanner() {
+    final at = _lastSentAt != null
+        ? DateFormat('HH:mm').format(_lastSentAt!)
+        : '—';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      decoration: BoxDecoration(
+        color: AppColors.success.withValues(alpha: 0.10),
+        borderRadius: AppRadius.mediumBR,
+        border: Border.all(color: AppColors.success.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.check_circle_rounded,
+              color: AppColors.success, size: AppSizes.iconSizeLg),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Report sent today at $at',
+                    style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: AppTextStyles.titleSize,
+                        fontWeight: AppTextStyles.bold,
+                        color: AppColors.success)),
+                if (!_hasNewActivity)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text('Nothing new to report since.',
+                        style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: AppTextStyles.captionSize,
+                            color: AppColors.grey700)),
+                  )
+                else
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                        'New activity since — ready to send an express update.',
+                        style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: AppTextStyles.captionSize,
+                            color: AppColors.grey700)),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── Bottom send bar ──
 
   Widget _buildSendBar() {
-    final now = DateTime.now();
-    final sentToday = _lastSentAt != null &&
-        _lastSentAt!.year == now.year &&
-        _lastSentAt!.month == now.month &&
-        _lastSentAt!.day == now.day;
+    final sentToday = _reportSentToday;
+    // Re-send only allowed when nothing was sent yet today, or there is new
+    // activity since the last send (an express follow-up).
+    final canSend = _napkinsResolved && (!sentToday || _hasNewActivity);
+    final isExpress = sentToday && _hasNewActivity;
+    final atLabel = _lastSentAt != null
+        ? DateFormat('HH:mm').format(_lastSentAt!)
+        : '—';
+    final buttonLabel = _isSending
+        ? 'Sending…'
+        : isExpress
+            ? 'Send Express Update'
+            : 'Send Report';
 
     return Container(
       decoration: BoxDecoration(
@@ -925,7 +1039,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
           child: Row(
             children: [
               Expanded(
-                child: !_napkinsResolved
+                // The napkin warning only matters while a send is the goal —
+                // once a report is out for the day with nothing new, suppress
+                // it (the windowed napkin list is empty by design) and show the
+                // "nothing new" hint instead.
+                child: (!_napkinsResolved && (!sentToday || _hasNewActivity))
                     ? Row(
                         children: [
                           Icon(Icons.warning_amber_rounded,
@@ -946,7 +1064,9 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                       )
                     : sentToday
                         ? Text(
-                            'Last sent today at ${DateFormat('HH:mm').format(_lastSentAt!)}',
+                            _hasNewActivity
+                                ? 'Sent at $atLabel — new activity since, ready for an express update.'
+                                : 'Nothing new since the last report at $atLabel.',
                             style: TextStyle(
                                 fontFamily: 'Inter',
                                 fontSize: AppTextStyles.captionSize,
@@ -962,7 +1082,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                 height: AppSizes.buttonHeightLg,
                 child: ElevatedButton.icon(
                   onPressed:
-                      (_isSending || !_napkinsResolved) ? null : _sendReport,
+                      (_isSending || !canSend) ? null : _sendReport,
                   icon: _isSending
                       ? const SizedBox(
                           width: 22,
@@ -972,7 +1092,7 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                         )
                       : const Icon(Icons.send_rounded,
                           size: AppSizes.iconSizeMd),
-                  label: Text(_isSending ? 'Sending…' : 'Send Report'),
+                  label: Text(buttonLabel),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: AppColors.gold,
                     foregroundColor: AppColors.navy,

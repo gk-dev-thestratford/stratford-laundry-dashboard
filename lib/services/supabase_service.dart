@@ -126,10 +126,15 @@ class SupabaseService {
 
   /// Invoke the daily-report Edge Function to send the combined daily report.
   /// Returns true when the function ran and every email was accepted.
-  Future<bool> invokeDailyReport() async {
+  /// [since] (ISO-8601 UTC) makes it an express follow-up: Received/Sent/Napkins
+  /// then cover only items after that time (the new batch since the last send).
+  Future<bool> invokeDailyReport({String? since}) async {
     if (!isInitialized) return false;
     try {
-      final res = await _client!.functions.invoke('daily-report');
+      final res = await _client!.functions.invoke(
+        'daily-report',
+        body: since != null ? {'since': since} : null,
+      );
       final data = res.data;
       if (data is Map && data['success'] == false) {
         debugPrint('[Supabase] daily-report reported failure: $data');

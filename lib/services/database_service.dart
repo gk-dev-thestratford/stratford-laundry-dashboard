@@ -970,9 +970,17 @@ class DatabaseService {
   /// Orders that gained a [status] status-log entry today (since local
   /// midnight), with department name — used by the Daily Report preview.
   Future<List<Map<String, dynamic>>> getOrdersWithStatusLogToday(String status) async {
-    final db = await database;
     final now = DateTime.now();
     final todayIso = DateTime(now.year, now.month, now.day).toIso8601String();
+    return getOrdersWithStatusLogSince(status, todayIso);
+  }
+
+  /// Orders that gained a [status] status-log entry at/after [sinceIso].
+  /// Used for the "since the last report send" window (express follow-ups).
+  Future<List<Map<String, dynamic>>> getOrdersWithStatusLogSince(
+    String status, String sinceIso,
+  ) async {
+    final db = await database;
     return db.rawQuery('''
       SELECT o.*, d.name AS department_name, d.code AS department_code
       FROM orders o
@@ -982,7 +990,7 @@ class DatabaseService {
         WHERE status = ? AND created_at >= ?
       )
       ORDER BY o.created_at ASC
-    ''', [status, todayIso]);
+    ''', [status, sinceIso]);
   }
 
   /// All items for the given orders, grouped by order ID — bulk version of

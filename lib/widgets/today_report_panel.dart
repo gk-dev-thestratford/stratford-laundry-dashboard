@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import '../config/constants.dart';
 import '../services/database_service.dart';
 import '../theme/app_theme.dart';
@@ -93,6 +94,9 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   static const double _collapsedWidth = 56;
   // Below this width an expanded panel would crush the order list.
   static const double _minWidthToExpand = 700;
+  // Shared with DailyReportScreen — the last successful daily-report send (ISO,
+  // local). Drives the "since last send" express window.
+  static const _kLastSentMetaKey = 'daily_report_last_sent_at';
 
   bool _loading = true;
   List<_OutstandingRow> _outstanding = [];
@@ -105,6 +109,15 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   int _napkinQtyToday = 0;
   bool _napkinNoneToday = false;
   int _approvedCount = 0;
+
+  // ── "Since last send" sent-state ──
+  /// A daily report was already sent earlier today.
+  bool _reportSentToday = false;
+  /// There is windowed activity (received / partial / sent / napkins since the
+  /// last send) — i.e. an express follow-up is warranted.
+  bool _hasNewActivity = false;
+  /// When the last report went out today (HH:mm display).
+  DateTime? _lastSentAt;
 
   /// null = follow the orientation default (landscape expanded).
   bool? _userExpanded;
@@ -145,10 +158,30 @@ class TodayReportPanelState extends State<TodayReportPanel> {
 
   Future<void> _load() async {
     final db = DatabaseService.instance;
+    final now = DateTime.now();
+    final todayMidnight = DateTime(now.year, now.month, now.day);
 
-    final received =
-        await db.getOrdersWithStatusLogToday(AppConstants.statusReceived);
-    final sent = await db.getOrdersWithStatusLogToday(AppConstants.statusSent);
+    // ── "Since last send" window ──────────────────────────────────────────
+    // After a report goes out the activity cards (Received / Partial / Sent /
+    // Napkins) only show what happened since that send — the next express
+    // batch. Before any send today, the window is the whole day. The
+    // Outstanding backlog below is standing info and is NEVER windowed.
+    final lastSentIso = await db.getMeta(_kLastSentMetaKey);
+    final lastSentAt =
+        lastSentIso != null ? DateTime.tryParse(lastSentIso) : null;
+    final reportSentToday = lastSentAt != null &&
+        lastSentAt.year == now.year &&
+        lastSentAt.month == now.month &&
+        lastSentAt.day == now.day;
+    final windowStartIso = (reportSentToday && lastSentIso != null)
+        ? lastSentIso
+        : todayMidnight.toIso8601String();
+    final windowStart = DateTime.parse(windowStartIso);
+
+    final received = await db.getOrdersWithStatusLogSince(
+        AppConstants.statusReceived, windowStartIso);
+    final sent = await db.getOrdersWithStatusLogSince(
+        AppConstants.statusSent, windowStartIso);
     final backlogOrders =
         await db.getOrders(status: AppConstants.statusSent, limit: 500);
 
@@ -170,7 +203,6 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     // OUTSTANDING — mirror the daily report's "Still at Laundry" rules:
     // open 'sent' tickets with NON-NAPKIN items still awaited (bag-only
     // tickets with no items count too — they're awaited as a whole).
-    final now = DateTime.now();
     final outstanding = <_OutstandingRow>[];
     for (final order in backlogOrders) {
       final orderId = order['id'] as String;
@@ -240,6 +272,19 @@ class TodayReportPanelState extends State<TodayReportPanel> {
     final napkinNone = await db.isNapkinNoneMarkedToday();
     final counts = await db.getOrderCounts();
 
+    // Napkins WITHIN the window — only counts for "new activity" (the step
+    // gate below stays today-based on [napkinQty]).
+    final windowLedger = await db.getLedgerEntries(since: windowStart);
+    final napkinQtyWindow = windowLedger
+        .where((e) => e['direction'] == 'in')
+        .fold<int>(0, (s, e) => s + (e['quantity'] as int? ?? 0));
+
+    // New activity = anything in the window across the four activity cards.
+    final hasNewActivity = receivedFull.isNotEmpty ||
+        receivedPartial.isNotEmpty ||
+        sentDockets.isNotEmpty ||
+        napkinQtyWindow > 0;
+
     if (!mounted) return;
     setState(() {
       _outstanding = outstanding;
@@ -250,6 +295,9 @@ class TodayReportPanelState extends State<TodayReportPanel> {
       _napkinQtyToday = napkinQty;
       _napkinNoneToday = napkinNone;
       _approvedCount = counts[AppConstants.statusApproved] ?? 0;
+      _reportSentToday = reportSentToday;
+      _hasNewActivity = hasNewActivity;
+      _lastSentAt = lastSentAt;
       _loading = false;
     });
   }
@@ -428,7 +476,6 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   // ── Expanded panel: 2×2 grid of group cards + napkins strip ──
 
   Widget _buildExpanded() {
-    final partialColor = Colors.amber.shade800;
     return Container(
       decoration: BoxDecoration(
         color: AppColors.white,
@@ -444,92 +491,199 @@ class TodayReportPanelState extends State<TodayReportPanel> {
                 ? const Center(child: CircularProgressIndicator())
                 : Padding(
                     padding: const EdgeInsets.all(AppSpacing.sm + 2),
-                    child: Column(
-                      children: [
-                        Expanded(
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Expanded(
-                                child: _groupCard(
-                                  title: 'Received Today',
-                                  color: AppColors.statusReceived,
-                                  icon: Icons.done_all_rounded,
-                                  countLabel: widget
-                                          .selectedReceiveDockets.isEmpty
-                                      ? '${_receivedToday.length}'
-                                      : '${_receivedToday.length} +${widget.selectedReceiveDockets.length}',
-                                  emptyText: 'Nothing received yet',
-                                  chips: [
-                                    ..._receivedToday.map(_receivedChip),
-                                    ...widget.selectedReceiveDockets.map(
-                                        (d) => _ghostChip(
-                                            d, AppColors.statusReceived)),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: AppSpacing.sm),
-                              Expanded(
-                                child: _groupCard(
-                                  title: 'Partially Received',
-                                  color: partialColor,
-                                  icon: Icons.rule_rounded,
-                                  countLabel: '${_partialToday.length}',
-                                  emptyText: 'No partial receipts',
-                                  chips:
-                                      _partialToday.map(_partialChip).toList(),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: AppSpacing.sm),
-                        Expanded(
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Expanded(
-                                child: _groupCard(
-                                  title: 'Sent Today',
-                                  color: AppColors.statusSent,
-                                  icon: Icons.local_shipping_rounded,
-                                  countLabel: widget.selectedDockets.isEmpty
-                                      ? '${_sentTodayDockets.length}'
-                                      : '${_sentTodayDockets.length} +${widget.selectedDockets.length}',
-                                  emptyText: 'Nothing sent yet',
-                                  chips: [
-                                    ..._sentTodayDockets.map(_sentChip),
-                                    ...widget.selectedDockets.map((d) =>
-                                        _ghostChip(d, AppColors.statusSent)),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: AppSpacing.sm),
-                              Expanded(
-                                child: _groupCard(
-                                  title: 'Outstanding',
-                                  color: AppColors.error,
-                                  icon: Icons.local_laundry_service_rounded,
-                                  countLabel: '${_outstanding.length}',
-                                  emptyText: 'Nothing at the laundry',
-                                  chips: _outstanding
-                                      .map(_outstandingChip)
-                                      .toList(),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: AppSpacing.sm),
-                        _napkinStrip(),
-                      ],
-                    ),
+                    child: _buildBody(),
                   ),
           ),
           const Divider(height: 1),
           _buildStepsRow(),
           _buildSendButton(),
         ],
+      ),
+    );
+  }
+
+  /// Body content — switches on the "since last send" sent-state:
+  ///   • sent today, nothing new  → "Report sent" hero (replaces the four
+  ///     activity cards); Outstanding + Napkins stay below.
+  ///   • sent today, new activity → normal cards (the express batch) with a
+  ///     "New since last report (HH:mm)" caption above them.
+  ///   • not sent today           → normal cards (original layout).
+  Widget _buildBody() {
+    if (_reportSentToday && !_hasNewActivity) {
+      // Sent, nothing new: hero panel in place of the activity cards.
+      return Column(
+        children: [
+          Expanded(child: _buildSentHero()),
+          const SizedBox(height: AppSpacing.sm),
+          // Outstanding stays visible — it's standing info, never windowed.
+          SizedBox(
+            height: 120,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [Expanded(child: _outstandingCard())],
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          _napkinStrip(),
+        ],
+      );
+    }
+
+    // Normal cards (express batch when sent today + new activity, else today).
+    return Column(
+      children: [
+        if (_reportSentToday && _hasNewActivity) ...[
+          _buildNewSinceCaption(),
+          const SizedBox(height: AppSpacing.xs + 2),
+        ],
+        Expanded(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(child: _receivedCard()),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(child: _partialCard()),
+            ],
+          ),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Expanded(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(child: _sentCard()),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(child: _outstandingCard()),
+            ],
+          ),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        _napkinStrip(),
+      ],
+    );
+  }
+
+  // ── Individual activity cards (extracted so the sent-state can recompose) ──
+
+  Widget _receivedCard() => _groupCard(
+        title: 'Received Today',
+        color: AppColors.statusReceived,
+        icon: Icons.done_all_rounded,
+        countLabel: widget.selectedReceiveDockets.isEmpty
+            ? '${_receivedToday.length}'
+            : '${_receivedToday.length} +${widget.selectedReceiveDockets.length}',
+        emptyText: 'Nothing received yet',
+        chips: [
+          ..._receivedToday.map(_receivedChip),
+          ...widget.selectedReceiveDockets
+              .map((d) => _ghostChip(d, AppColors.statusReceived)),
+        ],
+      );
+
+  Widget _partialCard() => _groupCard(
+        title: 'Partially Received',
+        color: Colors.amber.shade800,
+        icon: Icons.rule_rounded,
+        countLabel: '${_partialToday.length}',
+        emptyText: 'No partial receipts',
+        chips: _partialToday.map(_partialChip).toList(),
+      );
+
+  Widget _sentCard() => _groupCard(
+        title: 'Sent Today',
+        color: AppColors.statusSent,
+        icon: Icons.local_shipping_rounded,
+        countLabel: widget.selectedDockets.isEmpty
+            ? '${_sentTodayDockets.length}'
+            : '${_sentTodayDockets.length} +${widget.selectedDockets.length}',
+        emptyText: 'Nothing sent yet',
+        chips: [
+          ..._sentTodayDockets.map(_sentChip),
+          ...widget.selectedDockets
+              .map((d) => _ghostChip(d, AppColors.statusSent)),
+        ],
+      );
+
+  Widget _outstandingCard() => _groupCard(
+        title: 'Outstanding',
+        color: AppColors.error,
+        icon: Icons.local_laundry_service_rounded,
+        countLabel: '${_outstanding.length}',
+        emptyText: 'Nothing at the laundry',
+        chips: _outstanding.map(_outstandingChip).toList(),
+      );
+
+  /// Small header caption shown above the express batch cards.
+  Widget _buildNewSinceCaption() {
+    final at = _lastSentAt != null
+        ? DateFormat('HH:mm').format(_lastSentAt!)
+        : '—';
+    return Row(
+      children: [
+        Icon(Icons.fiber_new_rounded,
+            size: 16, color: AppColors.statusSent),
+        const SizedBox(width: AppSpacing.xs),
+        Flexible(
+          child: Text(
+            'New since last report ($at)',
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: 13,
+              fontWeight: AppTextStyles.bold,
+              color: AppColors.navy,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Clean "Report sent at HH:mm" hero — shown in place of the activity cards
+  /// when a report already went out today and nothing new has happened since.
+  Widget _buildSentHero() {
+    final at = _lastSentAt != null
+        ? DateFormat('HH:mm').format(_lastSentAt!)
+        : '—';
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: AppColors.success.withValues(alpha: 0.08),
+        borderRadius: AppRadius.mediumBR,
+        border: Border.all(color: AppColors.success.withValues(alpha: 0.45)),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.check_circle_rounded,
+                  size: AppSizes.iconSizeLg, color: AppColors.success),
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                'Report sent at $at',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: AppTextStyles.titleSize,
+                  fontWeight: AppTextStyles.bold,
+                  color: AppColors.success,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                'Nothing new to report since.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: AppTextStyles.captionSize,
+                  color: AppColors.grey700,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1000,6 +1154,15 @@ class TodayReportPanelState extends State<TodayReportPanel> {
   // ── Bottom button ──
 
   Widget _buildSendButton() {
+    // Sent today with nothing new → muted "Report sent ✓" (still opens the
+    // report so they can review; the report screen gates the re-send).
+    final muted = _reportSentToday && !_hasNewActivity;
+    final label = muted
+        ? 'Report sent ✓'
+        : (_reportSentToday && _hasNewActivity)
+            ? 'Preview & Send Update'
+            : 'Preview & Send Report';
+
     return Container(
       padding: const EdgeInsets.fromLTRB(
           AppSpacing.base, 0, AppSpacing.base, AppSpacing.base),
@@ -1008,11 +1171,14 @@ class TodayReportPanelState extends State<TodayReportPanel> {
         height: AppSizes.buttonHeightSm,
         child: ElevatedButton.icon(
           onPressed: widget.onOpenReport,
-          icon: const Icon(Icons.send_rounded, size: 18),
-          label: const Text('Preview & Send Report'),
+          icon: Icon(muted ? Icons.check_rounded : Icons.send_rounded,
+              size: 18),
+          label: Text(label),
           style: ElevatedButton.styleFrom(
-            backgroundColor: AppColors.gold,
-            foregroundColor: AppColors.navy,
+            backgroundColor: muted ? AppColors.grey200 : AppColors.gold,
+            foregroundColor:
+                muted ? AppColors.grey700 : AppColors.navy,
+            elevation: muted ? 0 : null,
             textStyle: TextStyle(
               fontFamily: 'Inter',
               fontSize: 15,
