@@ -103,15 +103,17 @@ function getUKMidnightISO(): string {
   return new Date(candidate.getTime() - ukHourAtCandidate * 3_600_000).toISOString();
 }
 
-// ── Fetch orders that moved into a status TODAY (UK time) ──
-async function fetchTodaysOrders(targetStatus: string) {
-  const todayISO = getUKMidnightISO();
+// ── Fetch orders that moved into a status since [sinceISO] (default: today, UK) ──
+// For an express follow-up send, sinceISO = the last send time, so the report
+// covers only the new batch.
+async function fetchTodaysOrders(targetStatus: string, sinceISO?: string) {
+  const lowerBound = sinceISO || getUKMidnightISO();
 
   const { data: logs } = await supabase
     .from("order_status_log")
     .select("order_id")
     .eq("status", targetStatus)
-    .gte("created_at", todayISO);
+    .gte("created_at", lowerBound);
 
   if (!logs || logs.length === 0) return [];
 
@@ -129,15 +131,15 @@ async function fetchTodaysOrders(targetStatus: string) {
   return allOrders;
 }
 
-// ── Fetch today's napkin returns from linen_ledger ──
-async function fetchTodaysNapkinReturns() {
-  const todayISO = getUKMidnightISO();
+// ── Fetch napkin returns since [sinceISO] (default: today, UK) ──
+async function fetchTodaysNapkinReturns(sinceISO?: string) {
+  const lowerBound = sinceISO || getUKMidnightISO();
 
   const { data } = await supabase
     .from("linen_ledger")
     .select("*, department:departments(name)")
     .eq("direction", "in")
-    .gte("created_at", todayISO)
+    .gte("created_at", lowerBound)
     .order("created_at", { ascending: false });
 
   return data || [];
@@ -384,11 +386,12 @@ function buildDailyReport(
     ? `Sent by ${senderName} &middot; ${time}, ${today}`
     : `Generated automatically &middot; ${time}, ${today}`;
 
-  // ── Assemble (modern, card-based, email-safe table layout) ──
+  // ── Assemble (modern, card-based, email-safe + FLUID so it never forces a
+  //    fixed width wider than the screen — avoids a nested horizontal scroll) ──
   return `
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#EEF1F5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-      <tr><td align="center" style="padding:28px 16px;">
-        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="width:640px;max-width:100%;background:#FFFFFF;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(20,30,55,0.08);">
+      <tr><td align="center" style="padding:20px 12px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#FFFFFF;border-radius:14px;box-shadow:0 1px 4px rgba(20,30,55,0.08);">
           <tr><td style="background:#1B2A4A;padding:26px 32px;">
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
               <td align="left" style="vertical-align:middle;">
@@ -428,6 +431,9 @@ interface ManualPayload {
   napkinReturns?: any[];
   recipients?: string[];
   senderName?: string;
+  /** Express follow-up: ISO time of the previous send today. When set, the
+   *  self-fetched Received/Sent/Napkins cover only items after this time. */
+  since?: string;
 }
 
 async function readPayload(req: Request): Promise<ManualPayload | null> {
@@ -447,11 +453,15 @@ serve(async (req: Request) => {
   try {
     const payload = await readPayload(req);
 
-    // Mode selection: payload data wins; otherwise fetch today's from DB.
-    const receivedOrders = payload?.receivedOrders ?? await fetchTodaysOrders("received");
-    const sentOrders = payload?.sentOrders ?? payload?.collectedOrders ?? await fetchTodaysOrders("sent");
+    // Express follow-up: only items since the previous send today.
+    const since = payload?.since;
+
+    // Mode selection: payload data wins; otherwise fetch from DB (since the
+    // last send if provided, else since today's UK midnight).
+    const receivedOrders = payload?.receivedOrders ?? await fetchTodaysOrders("received", since);
+    const sentOrders = payload?.sentOrders ?? payload?.collectedOrders ?? await fetchTodaysOrders("sent", since);
     const outstandingOrders = payload?.outstandingOrders ?? await fetchOpenSentOrders();
-    const napkinReturns = payload?.napkinReturns ?? await fetchTodaysNapkinReturns();
+    const napkinReturns = payload?.napkinReturns ?? await fetchTodaysNapkinReturns(since);
 
     const recipients = (payload?.recipients && payload.recipients.length > 0)
       ? payload.recipients
@@ -474,7 +484,10 @@ serve(async (req: Request) => {
     if (napkinReturns.length > 0) parts.push(`${napkinReturns.reduce((s: number, n: any) => s + (n.quantity || 0), 0)} napkins`);
 
     const senderTag = payload?.senderName ? ` — sent by ${payload.senderName}` : "";
-    const subject = `Daily Laundry Report — ${today}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}${senderTag}`;
+    // Express follow-up sends (since set) are labelled as an update, not the
+    // first "Daily" report, so recipients can tell them apart.
+    const reportLabel = since ? "Laundry Update" : "Daily Laundry Report";
+    const subject = `${reportLabel} — ${today}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}${senderTag}`;
 
     const emailsSent: { to: string; ok: boolean; error?: string }[] = [];
     for (const email of recipients) {
