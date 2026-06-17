@@ -122,17 +122,27 @@ class OrderNotifier extends StateNotifier<OrderDraft> {
     await db.insertOrder(orderMap);
 
     // Insert order items
-    if (state.items.isNotEmpty) {
-      final itemMaps = state.items.map((entry) => {
-        'id': _uuid.v4(),
-        'order_id': orderId,
-        'item_id': entry.item.id,
-        'item_name': entry.item.name,
-        'quantity_sent': entry.quantity,
-        'price_at_time': entry.item.price,
-      }).toList();
+    final itemMaps = state.items
+        .map((entry) => {
+              'id': _uuid.v4(),
+              'order_id': orderId,
+              'item_id': entry.item.id,
+              'item_name': entry.item.name,
+              'quantity_sent': entry.quantity,
+              'price_at_time': entry.item.price,
+            })
+        .toList();
+    if (itemMaps.isNotEmpty) {
       await db.insertOrderItems(itemMaps);
     }
+
+    // Append-only journal: an independent, never-auto-deleted snapshot of the
+    // created ticket (pruned only by age). Safety net for recovery even if the
+    // main tables are later corrupted/wiped. Best-effort — a journal failure
+    // must never block the order from being saved or queued for sync.
+    try {
+      await db.appendTicketJournal(orderMap, itemMaps);
+    } catch (_) {}
 
     // Insert initial status log
     await db.insertStatusLog({

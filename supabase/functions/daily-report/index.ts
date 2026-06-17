@@ -59,43 +59,36 @@ async function sendEmail(to: string, subject: string, html: string): Promise<{ o
   return { ok: true };
 }
 
-// ── UK-timezone-aware midnight as a UTC ISO string (BST/GMT correct) ──
-function getUKMidnightISO(): string {
-  const now = new Date();
+// ── UK-local "today midnight" as a NAIVE ISO string (no zone marker) ──
+// The Flutter app writes timestamps as DateTime.now().toIso8601String() — naive
+// LOCAL clock time with no offset, which Postgres stores verbatim. To split the
+// day CONSISTENTLY with that data (and with the tablet preview, which also uses
+// naive local midnight), the report boundary must be the SAME naive local-clock
+// midnight — NOT a true-UTC instant. In GMT these are identical; in BST a
+// true-UTC midnight sat 1h off and pulled the last hour of the PREVIOUS day into
+// today's report. Returning the naive "YYYY-MM-DDT00:00:00.000" keeps the
+// boundary and the data on the same clock.
+function ukTodayMidnightLocalISO(): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/London",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(now);
+  }).formatToParts(new Date());
   const y = parts.find((p) => p.type === "year")!.value;
   const m = parts.find((p) => p.type === "month")!.value;
   const d = parts.find((p) => p.type === "day")!.value;
-
-  // Candidate: that calendar date at UTC midnight. During BST this is 01:00 UK,
-  // not 00:00 UK. Read what UK calls that instant — its hour reveals the offset.
-  const candidate = new Date(`${y}-${m}-${d}T00:00:00Z`);
-  const ukHourAtCandidate = parseInt(
-    new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Europe/London",
-      hour: "numeric",
-      hour12: false,
-    }).format(candidate),
-    10,
-  );
-  // UK midnight in UTC = candidate − offset hours.
-  return new Date(candidate.getTime() - ukHourAtCandidate * 3_600_000).toISOString();
+  return `${y}-${m}-${d}T00:00:00.000`;
 }
 
-// ── Fetch orders that moved into a status TODAY (UK time) ──
-async function fetchTodaysOrders(targetStatus: string) {
-  const todayISO = getUKMidnightISO();
-
+// ── Fetch orders that moved into a status since [sinceISO] — UK midnight for
+// the daily run, or the last-send time for an express follow-up ──
+async function fetchOrdersSince(targetStatus: string, sinceISO: string) {
   const { data: logs } = await supabase
     .from("order_status_log")
     .select("order_id")
     .eq("status", targetStatus)
-    .gte("created_at", todayISO);
+    .gte("created_at", sinceISO);
 
   if (!logs || logs.length === 0) return [];
 
@@ -113,15 +106,13 @@ async function fetchTodaysOrders(targetStatus: string) {
   return allOrders;
 }
 
-// ── Fetch today's napkin returns from linen_ledger ──
-async function fetchTodaysNapkinReturns() {
-  const todayISO = getUKMidnightISO();
-
+// ── Fetch napkin returns from linen_ledger since [sinceISO] ──
+async function fetchNapkinReturnsSince(sinceISO: string) {
   const { data } = await supabase
     .from("linen_ledger")
     .select("*, department:departments(name)")
     .eq("direction", "in")
-    .gte("created_at", todayISO)
+    .gte("created_at", sinceISO)
     .order("created_at", { ascending: false });
 
   return data || [];
@@ -141,7 +132,7 @@ interface OutstandingOrder {
 async function fetchOpenSentOrders(): Promise<OutstandingOrder[]> {
   const { data } = await supabase
     .from("orders")
-    .select("id, docket_number, staff_name, guest_name, parent_order_id, created_at, departments(name), order_items(item_name, quantity_sent, quantity_received), status_log:order_status_log(status, created_at)")
+    .select("id, docket_number, staff_name, guest_name, parent_order_id, created_at, bag_count, departments(name), order_items(item_name, quantity_sent, quantity_received), status_log:order_status_log(status, created_at)")
     .eq("status", "sent")
     .order("created_at", { ascending: true });
 
@@ -152,9 +143,17 @@ async function fetchOpenSentOrders(): Promise<OutstandingOrder[]> {
         ? sentLogs.reduce((b: any, l: any) => (new Date(l.created_at) > new Date(b.created_at) ? l : b)).created_at
         : o.created_at;
       const days = Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000));
-      const items = (o.order_items || [])
+      let items = (o.order_items || [])
+        .filter((i: any) => !isNapkinName(i.item_name)) // pool-tracked, never awaited per-ticket
         .map((i: any) => ({ item: i.item_name, awaited: (i.quantity_sent || 0) - (i.quantity_received ?? 0) }))
         .filter((i: { awaited: number }) => i.awaited > 0);
+      // Bag-based tickets (e.g. guest/resident laundry) have no line items —
+      // they are awaited as whole bags. Without this they were dropped from the
+      // backlog entirely (the guest-laundry "missing from report" bug).
+      if (items.length === 0 && (o.bag_count || 0) > 0) {
+        const bags = o.bag_count;
+        items = [{ item: `bag${bags === 1 ? "" : "s"}`, awaited: bags }];
+      }
       return {
         id: o.id,
         docket: o.docket_number,
@@ -165,7 +164,24 @@ async function fetchOpenSentOrders(): Promise<OutstandingOrder[]> {
         items,
       };
     })
-    .filter((o: OutstandingOrder) => o.items.length > 0);
+    // Keep tickets with something awaited; exclude same-day sends (days < 1)
+    // so the email matches the tablet preview (those appear under "Sent Today").
+    .filter((o: OutstandingOrder) => o.items.length > 0 && o.days >= 1);
+}
+
+// Pool-tracked napkin lines are balanced via the linen ledger, NOT per ticket.
+// Mirror the tablet preview: napkin LINES are excluded from item counts and
+// napkin-ONLY tickets are excluded from sections 1-3 + the backlog entirely
+// (they appear only in the Napkin Returns section).
+function isNapkinName(name: string): boolean {
+  return (name || "").toLowerCase().includes("napkin");
+}
+function nonNapkinItems(order: any): any[] {
+  return (order.order_items || []).filter((i: any) => !isNapkinName(i.item_name));
+}
+function isNapkinOnly(order: any): boolean {
+  const its = order.order_items || [];
+  return its.length > 0 && its.every((i: any) => isNapkinName(i.item_name));
 }
 
 // ── Build combined daily report HTML ──
@@ -175,6 +191,11 @@ function buildDailyReport(
   outstandingOrders: OutstandingOrder[],
   napkinReturns: any[],
 ) {
+  // Exclude napkin-only tickets from the order sections — mirrors the tablet
+  // preview so the email and the preview agree. Mixed tickets keep only their
+  // non-napkin lines (see nonNapkinItems use in the row builders below).
+  receivedOrders = receivedOrders.filter((o: any) => !isNapkinOnly(o));
+  sentOrders = sentOrders.filter((o: any) => !isNapkinOnly(o));
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
   const totalOutstanding = outstandingOrders.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.awaited, 0), 0);
   const hasOutstanding = totalOutstanding > 0;
@@ -187,10 +208,16 @@ function buildDailyReport(
     let grandReceived = 0;
 
     const receivedRows = receivedOrders.map((order: any) => {
-      const items = order.order_items || [];
-      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
-      const totalSent = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
-      const totalReceived = items.reduce((sum: number, i: any) => sum + (i.quantity_received || 0), 0);
+      const items = nonNapkinItems(order);
+      const bags = order.bag_count || 0;
+      const isBag = items.length === 0 && bags > 0;
+      const itemsDesc = isBag
+        ? `${bags} bag${bags === 1 ? "" : "s"}`
+        : items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
+      // A received bag ticket (guest/resident laundry) counts its bags as both
+      // sent and received — no per-bag shortfall is tracked.
+      const totalSent = isBag ? bags : items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
+      const totalReceived = isBag ? bags : items.reduce((sum: number, i: any) => sum + (i.quantity_received || 0), 0);
       const outstanding = totalSent - totalReceived;
       grandSent += totalSent;
       grandReceived += totalReceived;
@@ -247,13 +274,20 @@ function buildDailyReport(
   // ── Section 2: Sent to Laundry Today (orange) ──
   let sentSection = "";
   if (sentOrders.length > 0) {
-    const sentGrandTotal = sentOrders.reduce((sum: number, o: any) =>
-      sum + (o.order_items || []).reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0), 0);
+    const sentGrandTotal = sentOrders.reduce((sum: number, o: any) => {
+      const its = nonNapkinItems(o);
+      if (its.length === 0 && (o.bag_count || 0) > 0) return sum + o.bag_count;
+      return sum + its.reduce((s: number, i: any) => s + (i.quantity_sent || 0), 0);
+    }, 0);
 
     const sentRows = sentOrders.map((order: any) => {
-      const items = order.order_items || [];
-      const itemsDesc = items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
-      const totalQty = items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
+      const items = nonNapkinItems(order);
+      const bags = order.bag_count || 0;
+      const isBag = items.length === 0 && bags > 0;
+      const itemsDesc = isBag
+        ? `${bags} bag${bags === 1 ? "" : "s"}`
+        : items.map((i: any) => `${i.quantity_sent}x ${i.item_name}`).join(", ");
+      const totalQty = isBag ? bags : items.reduce((sum: number, i: any) => sum + (i.quantity_sent || 0), 0);
       return `<tr style="border-bottom:1px solid #eee">
         <td style="padding:10px 8px;font-weight:bold">#${order.docket_number}</td>
         <td style="padding:10px 8px">${order.staff_name || order.guest_name || "—"}</td>
@@ -414,6 +448,9 @@ interface ManualPayload {
   napkinReturns?: any[];
   recipients?: string[];
   senderName?: string;
+  /** Express follow-up window start (ISO). When set, the Received/Sent/Napkin
+   *  sections cover only activity since this time instead of the whole day. */
+  since?: string;
 }
 
 async function readPayload(req: Request): Promise<ManualPayload | null> {
@@ -433,11 +470,17 @@ serve(async (req: Request) => {
   try {
     const payload = await readPayload(req);
 
-    // Mode selection: payload data wins; otherwise fetch today's from DB.
-    const receivedOrders = payload?.receivedOrders ?? await fetchTodaysOrders("received");
-    const sentOrders = payload?.sentOrders ?? payload?.collectedOrders ?? await fetchTodaysOrders("sent");
+    // Window for the activity sections: an express follow-up passes `since`
+    // (the last-send time) so the email covers only the new batch; otherwise
+    // the window is the whole day from UK midnight. The "Still at Laundry"
+    // backlog is standing info and is never windowed.
+    const windowISO = payload?.since ?? ukTodayMidnightLocalISO();
+
+    // Mode selection: an explicit data payload wins; otherwise fetch from DB.
+    const receivedOrders = payload?.receivedOrders ?? await fetchOrdersSince("received", windowISO);
+    const sentOrders = payload?.sentOrders ?? payload?.collectedOrders ?? await fetchOrdersSince("sent", windowISO);
     const outstandingOrders = payload?.outstandingOrders ?? await fetchOpenSentOrders();
-    const napkinReturns = payload?.napkinReturns ?? await fetchTodaysNapkinReturns();
+    const napkinReturns = payload?.napkinReturns ?? await fetchNapkinReturnsSince(windowISO);
 
     const recipients = (payload?.recipients && payload.recipients.length > 0)
       ? payload.recipients

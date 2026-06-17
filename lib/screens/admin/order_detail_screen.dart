@@ -195,6 +195,30 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     final db = DatabaseService.instance;
     final uuid = const Uuid();
 
+    // Bag-based ticket (e.g. guest/resident laundry) has no line items to
+    // receive per-quantity. Mark the whole order received in one tap — mirrors
+    // the dashboard Receive path so the detail screen isn't a dead end.
+    if (_items.isEmpty) {
+      await db.updateOrderStatus(widget.orderId, AppConstants.statusReceived);
+      await db.insertStatusLog({
+        'id': uuid.v4(),
+        'order_id': widget.orderId,
+        'status': AppConstants.statusReceived,
+        'changed_by': admin?.id,
+        'changed_by_name': admin?.name,
+        'reason': null,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+      await db.addToSyncQueue('orders', widget.orderId, 'update',
+          jsonEncode({'id': widget.orderId, 'status': AppConstants.statusReceived}));
+      SyncService.instance.pushPendingNow();
+      await _loadOrder();
+      if (mounted) {
+        showThumbsUpConfirmation(context, message: 'All items received');
+      }
+      return;
+    }
+
     // Collect received quantities from text fields (skip pool-tracked napkin items)
     final received = <String, int>{};
     bool hasOutstanding = false;

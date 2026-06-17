@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:crypto/crypto.dart';
@@ -23,7 +22,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 10,
+      version: 12,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -125,6 +124,39 @@ class DatabaseService {
       // Defaults to 1 (allowed) — mirrors the Supabase column default.
       await db.execute('ALTER TABLE admin_users ADD COLUMN can_send_report INTEGER NOT NULL DEFAULT 1');
     }
+    if (oldVersion < 11) {
+      // Data-loss hardening (2026-06 incident): flag orders created on THIS
+      // device. The orphan-cleanup must never delete a locally-authored order
+      // that has not yet been confirmed present on the server. Backfill marks
+      // anything currently un-synced (synced_at IS NULL) as locally-originated
+      // so orders sitting on a device at upgrade time are protected.
+      await db.execute(
+          'ALTER TABLE orders ADD COLUMN locally_originated INTEGER NOT NULL DEFAULT 0');
+      await db.execute(
+          'UPDATE orders SET locally_originated = 1 WHERE synced_at IS NULL');
+    }
+    if (oldVersion < 12) {
+      // Append-only ticket journal — an independent, never-auto-deleted record
+      // of every created ticket (pruned only by age). Black-box recovery source
+      // even if the main tables are corrupted/wiped by a future bug.
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_journal (
+          id TEXT PRIMARY KEY,
+          order_id TEXT NOT NULL,
+          docket_number TEXT,
+          order_type TEXT,
+          department_id TEXT,
+          staff_name TEXT,
+          bag_count INTEGER,
+          items_json TEXT,
+          payload_json TEXT NOT NULL,
+          event TEXT NOT NULL DEFAULT 'created',
+          created_at TEXT NOT NULL
+        )
+      ''');
+      await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_ticket_journal_created_at ON ticket_journal(created_at)');
+    }
   }
 
   Future<void> _createTables(Database db, int version) async {
@@ -182,7 +214,8 @@ class DatabaseService {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         synced_at TEXT,
-        remote_id TEXT
+        remote_id TEXT,
+        locally_originated INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -274,6 +307,24 @@ class DatabaseService {
     await db.execute('CREATE INDEX idx_order_status_log_order_id ON order_status_log(order_id)');
     await db.execute('CREATE INDEX idx_order_status_log_created_at ON order_status_log(created_at)');
 
+    // Append-only ticket journal — independent recovery record (see v12 upgrade).
+    await db.execute('''
+      CREATE TABLE ticket_journal (
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        docket_number TEXT,
+        order_type TEXT,
+        department_id TEXT,
+        staff_name TEXT,
+        bag_count INTEGER,
+        items_json TEXT,
+        payload_json TEXT NOT NULL,
+        event TEXT NOT NULL DEFAULT 'created',
+        created_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('CREATE INDEX idx_ticket_journal_created_at ON ticket_journal(created_at)');
+
     // Seed data
     await _seedDepartments(db);
     await _seedCatalogueItems(db);
@@ -334,8 +385,61 @@ class DatabaseService {
 
   Future<String> insertOrder(Map<String, dynamic> order) async {
     final db = await database;
-    await db.insert('orders', order);
+    // Stamp device-authored orders so orphan-cleanup can never delete an order
+    // that originated here and has not yet been confirmed on the server. The
+    // flag is local-only (stripped before the Supabase upsert).
+    await db.insert('orders', {...order, 'locally_originated': 1});
     return order['id'] as String;
+  }
+
+  // ── Ticket Journal (append-only recovery record) ──
+
+  /// Append an immutable snapshot of a created ticket to the journal. Never
+  /// modified or deleted by the sync logic; pruned only by age via
+  /// [pruneTicketJournal]. A black-box recovery source independent of the
+  /// orders table — survives even if the main tables are wiped.
+  Future<void> appendTicketJournal(
+    Map<String, dynamic> order,
+    List<Map<String, dynamic>> items, {
+    String event = 'created',
+  }) async {
+    final db = await database;
+    await db.insert('ticket_journal', {
+      'id': const Uuid().v4(),
+      'order_id': order['id'],
+      'docket_number': order['docket_number'],
+      'order_type': order['order_type'],
+      'department_id': order['department_id'],
+      'staff_name': order['staff_name'],
+      'bag_count': order['bag_count'],
+      'items_json': jsonEncode(items),
+      'payload_json': jsonEncode(order),
+      'event': event,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// Delete journal entries older than [days] days — the ONLY way entries leave
+  /// the journal (keeps device storage bounded). Called from the hourly cleanup.
+  Future<int> pruneTicketJournal({int days = 60}) async {
+    final db = await database;
+    final cutoff =
+        DateTime.now().subtract(Duration(days: days)).toIso8601String();
+    return db.delete('ticket_journal',
+        where: 'created_at < ?', whereArgs: [cutoff]);
+  }
+
+  /// Recent journal entries (newest first) — for a future admin export/recovery.
+  Future<List<Map<String, dynamic>>> getJournalEntries({int limit = 500}) async {
+    final db = await database;
+    return db.query('ticket_journal', orderBy: 'created_at DESC', limit: limit);
+  }
+
+  /// Count of journal entries currently retained on the device.
+  Future<int> getJournalCount() async {
+    final db = await database;
+    final r = await db.rawQuery('SELECT COUNT(*) AS c FROM ticket_journal');
+    return (r.first['c'] as int?) ?? 0;
   }
 
   /// Returns the ID of a non-rejected order with the same docket number
@@ -498,6 +602,7 @@ class DatabaseService {
       'parent_order_id': originalOrderId,
       'created_at': now,
       'updated_at': now,
+      'locally_originated': 1,
     });
 
     final batch = db.batch();
@@ -689,9 +794,33 @@ class DatabaseService {
     return db.query('sync_queue', where: 'synced = 0', orderBy: 'created_at ASC');
   }
 
+  /// Count of unsynced sync_queue items — drives the dashboard discrepancy
+  /// banner and the sync-health heartbeat. Cheap COUNT, no row materialization.
+  Future<int> getPendingSyncCount() async {
+    final db = await database;
+    final r =
+        await db.rawQuery('SELECT COUNT(*) AS c FROM sync_queue WHERE synced = 0');
+    return (r.first['c'] as int?) ?? 0;
+  }
+
   Future<void> markSynced(int id) async {
     final db = await database;
     await db.update('sync_queue', {'synced': 1}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// Mark a locally-created order as confirmed on the server after a successful
+  /// push: clear the local-origin flag and stamp synced_at. Keeps the
+  /// locally_originated lifecycle symmetric (set on create, cleared on confirmed
+  /// push OR on a remote re-pull) so a web-deletion landing before the first
+  /// re-pull can't leave a permanent un-prunable local ghost.
+  Future<void> markOrderPushed(String orderId) async {
+    final db = await database;
+    await db.update(
+      'orders',
+      {'locally_originated': 0, 'synced_at': DateTime.now().toIso8601String()},
+      where: 'id = ?',
+      whereArgs: [orderId],
+    );
   }
 
   // -- Order Sync (pull from Supabase) --
@@ -759,6 +888,9 @@ class DatabaseService {
           'created_at': remote['created_at'] ?? nowIso,
           'updated_at': remote['updated_at'] ?? nowIso,
           'synced_at': nowIso,
+          // Present on the server => confirmed remote; clear the local-origin
+          // flag so a later legitimate remote deletion can prune it normally.
+          'locally_originated': 0,
         }, conflictAlgorithm: ConflictAlgorithm.replace);
 
         final remoteItems = (remote['order_items'] as List<dynamic>?) ?? [];
@@ -780,12 +912,20 @@ class DatabaseService {
         synced++;
       }
 
-      if (deleteOrphans) {
-        // Remove local orders that no longer exist in Supabase (deleted on web).
-        // Only safe when the caller is certain remoteIds is the FULL server set.
-        final localOrders = await txn.query('orders', columns: ['id']);
+      // Remove local orders that no longer exist in Supabase (deleted on web).
+      // Hardened after the 2026-06 data-loss incident:
+      //  • Only runs when the remote set is NON-EMPTY — a transient empty or
+      //    partial pull must never be treated as "the server has no orders" and
+      //    wipe the local table.
+      //  • Never deletes an order created on this device that has not yet been
+      //    confirmed present on the server (locally_originated = 1).
+      //  • Still skips orders with pending local changes (pendingOrderIds).
+      if (deleteOrphans && remoteOrders.isNotEmpty) {
+        final localOrders =
+            await txn.query('orders', columns: ['id', 'locally_originated']);
         for (final local in localOrders) {
           final localId = local['id'] as String;
+          if ((local['locally_originated'] as int? ?? 0) == 1) continue;
           if (!remoteIds.contains(localId) && !pendingOrderIds.contains(localId)) {
             batch.delete('order_items', where: 'order_id = ?', whereArgs: [localId]);
             batch.delete('order_status_log', where: 'order_id = ?', whereArgs: [localId]);
@@ -838,6 +978,14 @@ class DatabaseService {
       counts[row['status'] as String] = row['count'] as int;
     }
     return counts;
+  }
+
+  /// Total local order count — used by the sync-health heartbeat so a dashboard
+  /// can flag a device whose local count diverges from the server.
+  Future<int> getOrderCountTotal() async {
+    final db = await database;
+    final r = await db.rawQuery('SELECT COUNT(*) AS c FROM orders');
+    return (r.first['c'] as int?) ?? 0;
   }
 
   /// Returns a compact item summary string for each order ID, e.g. "62 Table Runner, 10 Napkin".
@@ -1042,7 +1190,9 @@ class DatabaseService {
   // ── Data Cleanup ──
 
   /// Permanently delete expired orders older than [daysAfterExpiry] days.
-  /// ON DELETE CASCADE handles order_items and order_status_log.
+  /// Children (order_items, order_status_log) are deleted EXPLICITLY below — the
+  /// schema's ON DELETE CASCADE is not relied upon (the foreign_keys pragma is
+  /// never enabled, so the cascade does not actually fire).
   Future<int> purgeExpiredOrders({int daysAfterExpiry = 30}) async {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: daysAfterExpiry)).toIso8601String();
@@ -1131,6 +1281,16 @@ class DatabaseService {
     await db.delete('app_meta', where: 'key = ?', whereArgs: [key]);
   }
 
+  /// Stable per-device id (persisted in app_meta) — identifies this tablet in
+  /// the cross-device sync-health heartbeat. Generated once, reused thereafter.
+  Future<String> getOrCreateDeviceId() async {
+    final existing = await getMeta('device_id');
+    if (existing != null && existing.isNotEmpty) return existing;
+    final id = const Uuid().v4();
+    await setMeta('device_id', id);
+    return id;
+  }
+
   // ── Daily-procedure helpers (Today's Report panel + workflow gating) ──
 
   /// Local-date key (yyyy-MM-dd) for date-scoped app_meta markers.
@@ -1202,26 +1362,19 @@ class DatabaseService {
     final db = await database;
     final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
 
-    // Clean old completed items
+    // Clean old completed items (already confirmed synced — safe to drop).
     final cleaned = await db.delete(
       'sync_queue',
       where: 'synced = 1 AND created_at < ?',
       whereArgs: [cutoff],
     );
 
-    // Also abandon stuck unsynced items older than 2 days — they'll never succeed
-    final stuckCutoff = DateTime.now().subtract(const Duration(days: 2)).toIso8601String();
-    final abandoned = await db.update(
-      'sync_queue',
-      {'synced': 1},
-      where: 'synced = 0 AND created_at < ?',
-      whereArgs: [stuckCutoff],
-    );
-    if (abandoned > 0) {
-      debugPrint('[Sync] Abandoned $abandoned stuck queue items older than 2 days');
-    }
-
-    return cleaned + abandoned;
+    // NOTE: we deliberately do NOT abandon un-synced items by age. Flipping a
+    // queued create/update to synced=1 without actually pushing it silently
+    // discards the change AND strips the order's orphan-delete protection —
+    // this was a primary cause of the 2026-06 data-loss incident. Un-pushable
+    // items now stay pending and visible until they genuinely succeed.
+    return cleaned;
   }
 
   /// Returns counts of data that can be cleaned up for display in admin UI.

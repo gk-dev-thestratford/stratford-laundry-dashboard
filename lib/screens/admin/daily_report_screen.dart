@@ -1,6 +1,10 @@
+import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
@@ -168,16 +172,26 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       if (_isNapkinOnly(items)) continue;
       final awaitedParts = <String>[];
       int awaitedQty = 0;
-      for (final item in items) {
-        if (_isNapkinLine(item)) continue; // pool-tracked, never awaited
-        final awaited = (item['quantity_sent'] as int? ?? 0) -
-            (item['quantity_received'] as int? ?? 0);
-        if (awaited > 0) {
-          awaitedParts.add('$awaited× ${item['item_name']}');
-          awaitedQty += awaited;
+      if (items.isEmpty) {
+        // Bag-based ticket (e.g. guest/resident laundry) — no line items;
+        // awaited as whole bags. Mirrors the side panel and the email.
+        final bags = order['bag_count'] as int? ?? 0;
+        if (bags > 0) {
+          awaitedParts.add('$bags bag${bags == 1 ? '' : 's'}');
+          awaitedQty += bags;
+        }
+      } else {
+        for (final item in items) {
+          if (_isNapkinLine(item)) continue; // pool-tracked, never awaited
+          final awaited = (item['quantity_sent'] as int? ?? 0) -
+              (item['quantity_received'] as int? ?? 0);
+          if (awaited > 0) {
+            awaitedParts.add('$awaited× ${item['item_name']}');
+            awaitedQty += awaited;
+          }
         }
       }
-      // Mirror the edge function: tickets with nothing awaited are omitted
+      // Tickets with nothing awaited are omitted
       if (awaitedParts.isEmpty) continue;
 
       final sentAt = DateTime.tryParse(sentDates[orderId] ?? '') ??
@@ -498,6 +512,43 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
     );
   }
 
+  /// Export the on-device ticket journal (an immutable snapshot of every
+  /// created ticket) as a JSON file via the share sheet — a root-free recovery
+  /// path so records can be retrieved (emailed / saved to Drive) even when the
+  /// tablet's app-private storage can't be reached directly.
+  Future<void> _exportJournal() async {
+    try {
+      final entries =
+          await DatabaseService.instance.getJournalEntries(limit: 5000);
+      if (entries.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No ticket history on this device yet.')),
+          );
+        }
+        return;
+      }
+      final json = const JsonEncoder.withIndent('  ').convert(entries);
+      final ts = DateFormat('yyyyMMdd_HHmm').format(DateTime.now());
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/laundry_tickets_$ts.json');
+      await file.writeAsString(json);
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path, mimeType: 'application/json')],
+          subject: 'Stratford laundry — ticket backup ($ts)',
+          text: '${entries.length} tickets exported from this device.',
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Export failed: $e')),
+        );
+      }
+    }
+  }
+
   // ── Header (matches Napkin Returns screen styling) ──
 
   Widget _buildHeader() {
@@ -542,6 +593,11 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
                             fontSize: AppTextStyles.captionSize)),
                   ],
                 ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.download_rounded, color: AppColors.white),
+                tooltip: 'Export ticket backup',
+                onPressed: _exportJournal,
               ),
               Icon(Icons.summarize_rounded,
                   color: AppColors.gold.withValues(alpha: 0.85),
@@ -658,14 +714,29 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
   }
 
   /// Item description for a ticket — napkin lines excluded (pool-tracked).
-  String _itemsDesc(String orderId) {
+  /// Bag-based tickets with no line items (e.g. guest/resident laundry) are
+  /// described by their bag count instead of an empty dash.
+  String _itemsDesc(Map<String, dynamic> order) {
+    final orderId = order['id'] as String;
     final items = (_itemsByOrder[orderId] ?? [])
         .where((i) => !_isNapkinLine(i))
         .toList();
-    if (items.isEmpty) return '—';
+    if (items.isEmpty) {
+      final bags = order['bag_count'] as int? ?? 0;
+      return bags > 0 ? '$bags bag${bags == 1 ? '' : 's'}' : '—';
+    }
     return items
         .map((i) => '${i['quantity_sent']}× ${i['item_name']}')
         .join(', ');
+  }
+
+  /// True when a ticket has no (non-napkin) line items but is a bag-based
+  /// order — i.e. guest/resident laundry counted in whole bags.
+  bool _isBagTicket(Map<String, dynamic> order) {
+    final orderId = order['id'] as String;
+    final hasItems =
+        (_itemsByOrder[orderId] ?? []).any((i) => !_isNapkinLine(i));
+    return !hasItems && (order['bag_count'] as int? ?? 0) > 0;
   }
 
   /// Non-napkin (sent, received) totals for a ticket.
@@ -690,6 +761,8 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       emptyMessage: 'Nothing received today.',
       children: _receivedToday.map((order) {
         final orderId = order['id'] as String;
+        final isBag = _isBagTicket(order);
+        final bags = order['bag_count'] as int? ?? 0;
         final (totalSent, totalReceived) = _nonNapkinTotals(orderId);
         return _reportRow(
           leading: _docketBadge('${order['docket_number']}'),
@@ -697,12 +770,15 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
               order['guest_name'] as String? ??
               '—',
           department: order['department_name'] as String? ?? '—',
-          detail: _itemsDesc(orderId),
+          detail: _itemsDesc(order),
           trailing: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('$totalReceived of $totalSent received',
+              Text(
+                  isBag
+                      ? '$bags bag${bags == 1 ? '' : 's'} received'
+                      : '$totalReceived of $totalSent received',
                   style: TextStyle(
                       fontFamily: 'Inter',
                       fontSize: AppTextStyles.captionSize,
@@ -778,15 +854,20 @@ class _DailyReportScreenState extends ConsumerState<DailyReportScreen> {
       emptyMessage: 'Nothing sent to the laundry today.',
       children: _sentToday.map((order) {
         final orderId = order['id'] as String;
+        final isBag = _isBagTicket(order);
+        final bags = order['bag_count'] as int? ?? 0;
         final (totalQty, _) = _nonNapkinTotals(orderId);
+        final qtyLabel = isBag
+            ? '$bags bag${bags == 1 ? '' : 's'}'
+            : '$totalQty item${totalQty == 1 ? '' : 's'}';
         return _reportRow(
           leading: _docketBadge('${order['docket_number']}'),
           name: order['staff_name'] as String? ??
               order['guest_name'] as String? ??
               '—',
           department: order['department_name'] as String? ?? '—',
-          detail: _itemsDesc(orderId),
-          trailing: Text('$totalQty item${totalQty == 1 ? '' : 's'}',
+          detail: _itemsDesc(order),
+          trailing: Text(qtyLabel,
               style: TextStyle(
                   fontFamily: 'Inter',
                   fontSize: AppTextStyles.labelSize,

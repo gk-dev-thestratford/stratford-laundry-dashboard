@@ -28,7 +28,18 @@ class SupabaseService {
 
   Future<void> pushOrder(Map<String, dynamic> order) async {
     if (!isInitialized) return;
-    await _client!.from('orders').upsert(order);
+    // Strip local-only / joined columns before upserting. The Supabase 'orders'
+    // table has none of these; sending them makes the upsert fail with an
+    // undefined-column error (which the push loop would then wrongly classify
+    // and abandon). 'department_name'/'department_code' leak in when the
+    // payload is built from getOrder() (e.g. partial-receipt follow-up tickets).
+    final clean = Map<String, dynamic>.from(order)
+      ..remove('locally_originated')
+      ..remove('synced_at')
+      ..remove('remote_id')
+      ..remove('department_name')
+      ..remove('department_code');
+    await _client!.from('orders').upsert(clean);
   }
 
   Future<void> pushOrderItems(List<Map<String, dynamic>> items) async {
@@ -161,5 +172,19 @@ class SupabaseService {
   Future<List<Map<String, dynamic>>> fetchLedgerEntries() async {
     if (!isInitialized) return [];
     return await _client!.from('linen_ledger').select().order('created_at', ascending: false);
+  }
+
+  // ── Sync-health heartbeat (cross-device discrepancy visibility) ──
+
+  /// Best-effort upsert of this device's sync status. Silently ignored if the
+  /// optional `device_sync_status` table is not provisioned yet, so it never
+  /// affects normal operation.
+  Future<void> upsertDeviceSyncStatus(Map<String, dynamic> row) async {
+    if (!isInitialized) return;
+    try {
+      await _client!.from('device_sync_status').upsert(row);
+    } catch (_) {
+      // Heartbeat is non-critical — table may not exist yet.
+    }
   }
 }

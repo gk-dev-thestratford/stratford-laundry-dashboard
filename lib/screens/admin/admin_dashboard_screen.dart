@@ -8,6 +8,7 @@ import 'package:uuid/uuid.dart';
 import '../../theme/app_theme.dart';
 import '../../config/constants.dart';
 import '../../providers/admin_provider.dart';
+import '../../services/connectivity_service.dart';
 import '../../services/database_service.dart';
 import '../../services/sync_service.dart';
 import '../../widgets/announcement_banner.dart';
@@ -36,6 +37,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   Map<String, String> _awaitingSummaries = {};
   String? _allTabDateFilter;
   String? _allTabTypeFilter;
+  /// Unsynced sync_queue items on THIS device — drives the discrepancy banner.
+  int _pendingSyncCount = 0;
   // Right-side "Today's Report" panel — refreshed after every relevant action.
   final GlobalKey<TodayReportPanelState> _panelKey =
       GlobalKey<TodayReportPanelState>();
@@ -48,29 +51,29 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   // swap automatically: _kSent (the Receive tab, status 'sent') = 2,
   // _kApproved (the Send tab, status 'approved') = 3.
   static const _kRejected = 0;
-  static const _kPending = 1;
-  static const _kSent = 2;      // "Receive" tab — status 'sent' tickets to receive
-  static const _kApproved = 3;  // "Send" tab — status 'approved' tickets to send
-  static const _kReceived = 4;
-  static const _kAll = 5;
-  static const _kNapkinReturns = 6;
+  static const _kPending = 1;        // Step 1 — status 'submitted'
+  static const _kApproved = 2;       // Step 2 — status 'approved'
+  static const _kSent = 3;           // Step 3 "To Be Received" — status 'sent'
+  static const _kNapkinReturns = 4;  // Step 4 — Napkins (navigates)
+  static const _kReceived = 5;       // Step 5 "For Collection" — status 'received'
+  static const _kAll = 6;
   static const _kReport = 7;
 
-  // Tab names are ACTIONS (what staff do there), not states: Receive =
-  // tickets at the laundry awaiting return; Send = approved tickets ready to
-  // go out; Collect = received tickets awaiting owner pick-up. Ticket chips
-  // still show the status names. Order matches the daily procedure
-  // (receive first, then send).
-  static const _tabs = ['Rejected', 'Pending', 'Receive', 'Send', 'Collect', 'All', 'Napkins', 'Report'];
+  // Tabs follow the daily WORKFLOW left-to-right, numbered Step 1–5:
+  // Pending(1) → Approved(2) → To Be Received(3, status 'sent') →
+  // Napkins(4) → For Collection(5, status 'received'). Rejected/All/Report are
+  // not part of the numbered flow. Labels show where each ticket IS; the action
+  // differs (the "To Be Received" tab is where staff mark items received).
+  static const _tabs = ['Rejected', 'Pending', 'Approved', 'To Be Received', 'Napkins', 'For Collection', 'All', 'Report'];
   static const _statusFilters = [
-    AppConstants.statusRejected,
-    AppConstants.statusSubmitted,
-    AppConstants.statusSent,      // Receive tab — receive these 'sent' tickets
-    AppConstants.statusApproved,  // Send tab — send these 'approved' tickets
-    AppConstants.statusReceived,
-    null, // All
-    null, // Napkin Returns — navigates to separate screen
-    null, // Daily Report — navigates to separate screen
+    AppConstants.statusRejected,   // 0 Rejected
+    AppConstants.statusSubmitted,  // 1 Pending
+    AppConstants.statusApproved,   // 2 Approved
+    AppConstants.statusSent,       // 3 To Be Received
+    null,                          // 4 Napkins — navigates to separate screen
+    AppConstants.statusReceived,   // 5 For Collection
+    null,                          // 6 All
+    null,                          // 7 Report — navigates to separate screen
   ];
 
   @override
@@ -118,9 +121,19 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     // periodically. They're now invoked once per hour by SyncService's
     // periodic cleanup, so loadData just reads.
     await Future.wait([_loadOrders(silent: silent), _loadCounts()]);
+    await _refreshPendingCount();
     // Keep the Today's Report panel in step (covers background sync and
     // returning from child screens — both funnel through here).
     _panelKey.currentState?.refresh();
+  }
+
+  /// Refresh the count of unsynced local changes that drives the discrepancy
+  /// banner. Cheap COUNT; called on load and on every sync-state change.
+  Future<void> _refreshPendingCount() async {
+    final n = await DatabaseService.instance.getPendingSyncCount();
+    if (mounted && n != _pendingSyncCount) {
+      setState(() => _pendingSyncCount = n);
+    }
   }
 
   Future<void> _loadCounts() async {
@@ -725,6 +738,84 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     _panelKey.currentState?.refresh();
   }
 
+  /// Small sync chip shown in the header next to the cloud icon — ONLY when this
+  /// device has unsynced changes or is offline. Tap for a short popup with the
+  /// detail + a "Sync now" action. Replaces the old full-width banner so the
+  /// alert is unobtrusive.
+  Widget _buildSyncBadge() {
+    final connectivity = ref.watch(connectivityProvider).valueOrNull;
+    final syncState = ref.watch(syncStateProvider).valueOrNull;
+    final offline = connectivity == ConnectivityStatus.offline ||
+        syncState == SyncState.offline;
+    final pending = _pendingSyncCount > 0 || syncState == SyncState.pending;
+    if (!offline && !pending) return const SizedBox.shrink();
+
+    final n = _pendingSyncCount;
+    final color = offline ? AppColors.error : Colors.orange.shade700;
+    return Padding(
+      padding: const EdgeInsets.only(right: AppSpacing.xs),
+      child: GestureDetector(
+        onTap: () => _showSyncDetails(offline, n),
+        child: Container(
+          padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: AppRadius.largeBR,
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                  offline
+                      ? Icons.cloud_off_rounded
+                      : Icons.cloud_upload_rounded,
+                  color: AppColors.white,
+                  size: 16),
+              if (n > 0) ...[
+                const SizedBox(width: 4),
+                Text('$n',
+                    style: TextStyle(
+                        fontFamily: 'Inter',
+                        color: AppColors.white,
+                        fontSize: AppTextStyles.captionSize,
+                        fontWeight: AppTextStyles.bold)),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Short popup describing the unsynced state, with a "Sync now" action.
+  void _showSyncDetails(bool offline, int n) {
+    final label = n == 1 ? '1 change' : '$n changes';
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(offline ? 'Offline' : 'Waiting to sync'),
+        content: Text(offline
+            ? '$label saved on this device. They sync automatically when you reconnect to the internet.'
+            : '$label waiting to upload to the cloud. Tap "Sync now" to retry.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              SyncService.instance.fullSync(force: true);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.navy),
+            child: const Text('Sync now'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final admin = ref.watch(adminProvider);
@@ -733,6 +824,11 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     // Narrow / portrait: the docked panel would crush the order list, so it
     // becomes a right-side overlay drawer instead (see _buildBodyArea).
     final isNarrow = width < 900;
+
+    // Keep the unsynced-count fresh as sync state changes (push/pull/offline).
+    ref.listen<AsyncValue<SyncState>>(syncStateProvider, (_, _) {
+      _refreshPendingCount();
+    });
 
     // Enforce auto-lock timeout
     if (!admin.isAuthenticated || admin.isTimedOut) {
@@ -792,6 +888,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                             ],
                           ),
                         ),
+                        _buildSyncBadge(),
                         SyncIndicator(onSynced: () => _loadData(silent: true)),
                         const SizedBox(width: AppSpacing.xs),
                         IconButton(
@@ -824,13 +921,35 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                           final isNapkinTabOrReport = isNapkinTab || isReportTab;
                           final count = isNapkinTabOrReport ? 0 : _getTabCount(label);
                           final isActive = !isNapkinTabOrReport && _tabController.index == idx;
+                          final step = _stepFor(label);
 
                           return Padding(
                             padding: EdgeInsets.only(
                               right: AppSpacing.sm,
                               left: isNapkinTab ? AppSpacing.lg : 0,
                             ),
-                            child: GestureDetector(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Workflow step label (Step 1–5) above the pill;
+                                // reserves the same height for non-step tabs so
+                                // every pill stays vertically aligned.
+                                SizedBox(
+                                  height: 15,
+                                  child: step == null
+                                      ? null
+                                      : Center(
+                                          child: Text('Step $step',
+                                              style: TextStyle(
+                                                  fontFamily: 'Inter',
+                                                  fontSize: 10,
+                                                  fontWeight: AppTextStyles.bold,
+                                                  letterSpacing: 0.5,
+                                                  color: AppColors.gold)),
+                                        ),
+                                ),
+                                const SizedBox(height: 3),
+                                GestureDetector(
                               onTap: () {
                                 if (isNapkinTab) {
                                   context.push('/admin/napkin-returns').then((_) {
@@ -905,6 +1024,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                                   ],
                                 ),
                               ),
+                            ),
+                              ],
                             ),
                           );
                         }).toList(),
@@ -999,9 +1120,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   IconData _tabIcon(String tab) {
     return switch (tab) {
       'Pending' => Icons.schedule_rounded,
-      'Send' => Icons.local_shipping_rounded,
-      'Receive' => Icons.move_to_inbox_rounded,
-      'Collect' => Icons.done_all_rounded,
+      'Approved' => Icons.local_shipping_rounded,
+      'To Be Received' => Icons.move_to_inbox_rounded,
+      'For Collection' => Icons.done_all_rounded,
       'All' => Icons.list_alt_rounded,
       'Rejected' => Icons.cancel_outlined,
       'Napkins' => Icons.dining,
@@ -1009,6 +1130,17 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
       _ => Icons.circle_outlined,
     };
   }
+
+  /// Workflow step number shown above the tab (Step 1–5), or null for tabs that
+  /// aren't part of the numbered daily flow (Rejected / All / Report).
+  int? _stepFor(String tab) => switch (tab) {
+        'Pending' => 1,
+        'Approved' => 2,
+        'To Be Received' => 3,
+        'Napkins' => 4,
+        'For Collection' => 5,
+        _ => null,
+      };
 
   List<Widget> _buildBodyContent(bool isLandscape) {
     return [
@@ -1086,28 +1218,33 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                 ),
               ),
             ),
-          // Bulk select bar — Receive tab (status 'sent'): Add (→ fully
-          // received); Send tab (status 'approved'): Add (→ sent to laundry).
-          // Same pattern, different verb under the hood.
+          // Bulk select bar.
+          //  • "Approved" tab (status 'approved'): select-all + "Send (N)" → mark sent.
+          //  • "Sent" tab (status 'sent'): NO select-all (prevents accidental
+          //    mass-receive); per-ticket selection only + "Receive (N)" → mark received.
           if ((_isApprovedTab || _isSentTab) && _orders.isNotEmpty && !_isLoading)
             Padding(
               padding: EdgeInsets.symmetric(horizontal: AppSpacing.base, vertical: AppSpacing.xs),
               child: Row(
                 children: [
-                  SizedBox(
-                    width: AppSizes.minTouchTarget, height: AppSizes.minTouchTarget,
-                    child: Checkbox(
-                      value: _selectedOrderIds.length == _orders.length && _orders.isNotEmpty,
-                      onChanged: (_) => _toggleSelectAll(),
-                      activeColor: AppColors.navy,
+                  // Select-all is intentionally OMITTED on the "Sent" tab so no one
+                  // can mark every ticket received in a single tap by mistake.
+                  if (_isApprovedTab) ...[
+                    SizedBox(
+                      width: AppSizes.minTouchTarget, height: AppSizes.minTouchTarget,
+                      child: Checkbox(
+                        value: _selectedOrderIds.length == _orders.length && _orders.isNotEmpty,
+                        onChanged: (_) => _toggleSelectAll(),
+                        activeColor: AppColors.navy,
+                      ),
                     ),
-                  ),
-                  SizedBox(width: AppSpacing.sm),
+                    SizedBox(width: AppSpacing.sm),
+                  ],
                   Text(
                     _selectedOrderIds.isEmpty
                         ? (_isApprovedTab
                             ? 'Select all to add to today\'s report'
-                            : 'Select all fully-returned tickets')
+                            : 'Select tickets to receive')
                         : '${_selectedOrderIds.length} selected',
                     style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium, color: AppColors.grey700),
                   ),
@@ -1116,7 +1253,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
                     ElevatedButton.icon(
                       onPressed: _isApprovedTab ? _bulkAddToSent : _bulkReceiveAll,
                       icon: Icon(Icons.playlist_add_rounded, size: AppSizes.iconSizeSm),
-                      label: Text('Add (${_selectedOrderIds.length})'),
+                      label: Text('${_isApprovedTab ? 'Send' : 'Received'} (${_selectedOrderIds.length})'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: _isApprovedTab
                             ? AppColors.statusSent
@@ -1259,9 +1396,9 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   int _getTabCount(String tab) {
     return switch (tab) {
       'Pending' => _counts[AppConstants.statusSubmitted] ?? 0,
-      'Send' => _counts[AppConstants.statusApproved] ?? 0,
-      'Receive' => _counts[AppConstants.statusSent] ?? 0,
-      'Collect' => _counts[AppConstants.statusReceived] ?? 0,
+      'Approved' => _counts[AppConstants.statusApproved] ?? 0,
+      'To Be Received' => _counts[AppConstants.statusSent] ?? 0,
+      'For Collection' => _counts[AppConstants.statusReceived] ?? 0,
       'Rejected' => _counts[AppConstants.statusRejected] ?? 0,
       _ => 0, // All + Napkins — no counter
     };
@@ -1551,7 +1688,7 @@ class _OrderCard extends StatelessWidget {
                   child: ElevatedButton.icon(
                     onPressed: onReceive,
                     icon: Icon(Icons.inventory_2_rounded, size: AppSizes.iconSizeSm),
-                    label: const Text('Receive'),
+                    label: const Text('Received'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.statusReceived,
                       foregroundColor: AppColors.white,

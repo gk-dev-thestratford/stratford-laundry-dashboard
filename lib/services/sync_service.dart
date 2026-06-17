@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' show PostgrestException;
 import 'database_service.dart';
 import 'supabase_service.dart';
 import 'connectivity_service.dart';
@@ -137,9 +138,6 @@ class SyncService {
 
     _updateState(SyncState.syncing);
 
-    // Clear any stuck queue items older than 1 hour before pushing
-    await _abandonStuckItems();
-
     await _pushPending();
     await _pullReferenceData(forceFullPull: forceFullPull);
 
@@ -148,22 +146,25 @@ class SyncService {
     _debugInfo = 'sync done: ${remaining.length} pending';
     debugPrint('[Sync] $_debugInfo');
     _updateState(remaining.isEmpty ? SyncState.synced : SyncState.pending);
+
+    // Best-effort cross-device sync-health heartbeat (non-blocking).
+    unawaited(_sendHeartbeat(remaining.length));
   }
 
-  /// Mark sync queue items older than 1 hour as abandoned — they'll never succeed.
-  Future<void> _abandonStuckItems() async {
-    final db = DatabaseService.instance;
-    final cutoff = DateTime.now().subtract(const Duration(hours: 1)).toIso8601String();
-    final dbInst = await db.database;
-    final abandoned = await dbInst.update(
-      'sync_queue',
-      {'synced': 1},
-      where: 'synced = 0 AND created_at < ?',
-      whereArgs: [cutoff],
-    );
-    if (abandoned > 0) {
-      debugPrint('[Sync] Abandoned $abandoned stuck queue items (older than 1h)');
-    }
+  /// Best-effort heartbeat so a dashboard/website can flag a device that has
+  /// unsynced work or has gone quiet. Never throws — failures are ignored, and
+  /// it no-ops cleanly if the device_sync_status table isn't provisioned.
+  Future<void> _sendHeartbeat(int pendingCount) async {
+    try {
+      if (!SupabaseService.instance.isInitialized) return;
+      final db = DatabaseService.instance;
+      await SupabaseService.instance.upsertDeviceSyncStatus({
+        'device_id': await db.getOrCreateDeviceId(),
+        'last_sync_at': DateTime.now().toUtc().toIso8601String(),
+        'pending_count': pendingCount,
+        'local_order_count': await db.getOrderCountTotal(),
+      });
+    } catch (_) {}
   }
 
   /// Periodic timer handler: only does work when needed.
@@ -195,6 +196,7 @@ class SyncService {
         await DatabaseService.instance.autoExpireReceivedOrders(days: 20);
         await DatabaseService.instance.purgeExpiredOrders(daysAfterExpiry: 30);
         await DatabaseService.instance.cleanSyncQueue(days: 7);
+        await DatabaseService.instance.pruneTicketJournal(days: 60);
       } catch (_) {
         // Non-critical — will retry next hour
       }
@@ -270,6 +272,16 @@ class SyncService {
     final shouldFullPull = forceFullPull || _lastFullPull == null ||
         DateTime.now().difference(_lastFullPull!) > _fullPullInterval;
 
+    // Orphan-deletion may only run when there are NO outstanding local order
+    // pushes. Otherwise a not-yet-pushed local order would look like a remote
+    // orphan and be deleted (compounding the 2026-06 data-loss incident).
+    // Combined with never abandoning queue items by age, the prune only ever
+    // runs when the server is the confirmed source of truth.
+    final pendingBeforePull = await db.getPendingSyncItems();
+    final hasPendingOrderPush =
+        pendingBeforePull.any((i) => i['table_name'] == 'orders');
+    final canDeleteOrphans = shouldFullPull && !hasPendingOrderPush;
+
     try {
       DateTime? since;
       if (!shouldFullPull) {
@@ -292,7 +304,7 @@ class SyncService {
       if (remoteOrders.isNotEmpty || shouldFullPull) {
         final synced = await db.syncOrders(
           remoteOrders,
-          deleteOrphans: shouldFullPull,
+          deleteOrphans: canDeleteOrphans,
         );
         debugPrint('[Sync] Synced $synced orders'
             '${shouldFullPull ? " (with orphan cleanup)" : ""}');
@@ -418,6 +430,11 @@ class SyncService {
           }
 
           await DatabaseService.instance.markSynced(item['id'] as int);
+          if (tableName == 'orders') {
+            // Confirmed on the server — clear the local-origin protection flag
+            // so a future legitimate remote deletion can prune it normally.
+            await DatabaseService.instance.markOrderPushed(data['id'] as String);
+          }
           debugPrint('[Push] Synced successfully');
         } catch (e) {
           final itemId = item['id'] as int;
@@ -425,10 +442,19 @@ class SyncService {
           _failCounts[itemId] = count;
           debugPrint('[Push] FAILED $operation $tableName (attempt $count/$_maxRetries): $e');
 
-          // Only abandon on known permanent data errors — NOT on transient failures
-          final isDataError = e.toString().contains('22P02') || // invalid UUID
-              e.toString().contains('23') || // integrity constraint
-              e.toString().contains('42');   // syntax/schema error
+          // Abandon ONLY on a genuine permanent data error — a payload that can
+          // never succeed no matter how often we retry. Match the Postgres
+          // SQLSTATE exactly: class 22 (data exception, e.g. 22P02 invalid UUID)
+          // and class 23 (integrity constraint). We deliberately do NOT abandon
+          // on class 42 (undefined table/column, or RLS denial 42501) or on
+          // transient network/HTTP errors — those are environment problems that
+          // must stay VISIBLY pending, never silently dropped. The old loose
+          // substring test (e.toString().contains('23')/('42')) matched
+          // transient errors like HTTP 423/429/502 and contributed to the
+          // 2026-06 data loss.
+          final code = e is PostgrestException ? e.code : null;
+          final isDataError = code != null &&
+              (code.startsWith('22') || code.startsWith('23'));
           if (isDataError) {
             await DatabaseService.instance.markSynced(itemId);
             _failCounts.remove(itemId);
