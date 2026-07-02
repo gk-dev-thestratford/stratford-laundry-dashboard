@@ -28,6 +28,7 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
   bool _isLoading = true;
   bool _canDelete = false;
   bool _canReject = false;
+  bool _canApprove = true; // default allowed (mirrors server column default true)
   final _reasonController = TextEditingController();
 
   // For received quantities
@@ -55,7 +56,14 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
     if (localAdmin?.canRejectOrders == true) {
       setState(() => _canReject = true);
     }
-    if (_canDelete && _canReject) return;
+    // Approve is allowed by default; only an explicit false revokes it.
+    if (localAdmin?.canApproveOrders == false) {
+      setState(() => _canApprove = false);
+    }
+    // Skip the Supabase re-check only when nothing more can change — delete and
+    // reject already granted locally AND approve already revoked. Otherwise fall
+    // through so a mid-session approve revoke is still picked up from the server.
+    if (_canDelete && _canReject && !_canApprove) return;
 
     // Try Supabase directly for fresh permissions
     try {
@@ -69,6 +77,9 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
         }
         if (match.first['can_reject_orders'] == true) {
           if (mounted) setState(() => _canReject = true);
+        }
+        if (match.first['can_approve_orders'] == false) {
+          if (mounted) setState(() => _canApprove = false);
         }
       }
       // Update local DB with fresh data
@@ -637,9 +648,11 @@ class _AdminOrderDetailScreenState extends ConsumerState<AdminOrderDetailScreen>
 
     switch (status) {
       case AppConstants.statusSubmitted:
-        actions.add(
-          _actionButton('Approve', Icons.check_circle, AppColors.success, () => _confirmAction('Approve', AppConstants.statusApproved)),
-        );
+        if (_canApprove) {
+          actions.add(
+            _actionButton('Approve', Icons.check_circle, AppColors.success, () => _confirmAction('Approve', AppConstants.statusApproved)),
+          );
+        }
         if (_canReject) {
           actions.addAll([
             SizedBox(width: AppSpacing.md),

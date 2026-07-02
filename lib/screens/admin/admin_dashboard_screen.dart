@@ -45,31 +45,33 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
   // Tab indices — use these constants instead of hardcoded numbers.
   // The daily flow is receive-first: staff record what came back from the
-  // laundry (Receive) BEFORE sending the day's approved items out (Send), so
-  // Receive sits at index 2 and Send at index 3. The constants are keyed by
-  // the STATUS each tab filters on, so all index-driven logic follows the
-  // swap automatically: _kSent (the Receive tab, status 'sent') = 2,
-  // _kApproved (the Send tab, status 'approved') = 3.
+  // laundry (the "To Be Received" tab, status 'sent') BEFORE sending the day's
+  // approved items out (the "Approved" tab, status 'approved'). So "To Be
+  // Received" sits at index 2 and "Approved" at index 3. The constants are keyed
+  // by the STATUS each tab filters on, so all index-driven logic follows this
+  // order automatically: _kSent (the To Be Received tab, status 'sent') = 2,
+  // _kApproved (the Approved tab, status 'approved') = 3.
   static const _kRejected = 0;
   static const _kPending = 1;        // Step 1 — status 'submitted'
-  static const _kApproved = 2;       // Step 2 — status 'approved'
-  static const _kSent = 3;           // Step 3 "To Be Received" — status 'sent'
+  static const _kSent = 2;           // Step 2 "To Be Received" — status 'sent'
+  static const _kApproved = 3;       // Step 3 "Approved" — status 'approved'
   static const _kNapkinReturns = 4;  // Step 4 — Napkins (navigates)
   static const _kReceived = 5;       // Step 5 "For Collection" — status 'received'
   static const _kAll = 6;
   static const _kReport = 7;
 
   // Tabs follow the daily WORKFLOW left-to-right, numbered Step 1–5:
-  // Pending(1) → Approved(2) → To Be Received(3, status 'sent') →
-  // Napkins(4) → For Collection(5, status 'received'). Rejected/All/Report are
-  // not part of the numbered flow. Labels show where each ticket IS; the action
-  // differs (the "To Be Received" tab is where staff mark items received).
-  static const _tabs = ['Rejected', 'Pending', 'Approved', 'To Be Received', 'Napkins', 'For Collection', 'All', 'Report'];
+  // Pending(1) → To Be Received(2, status 'sent') → Approved(3, status
+  // 'approved') → Napkins(4) → For Collection(5, status 'received'). Rejected/
+  // All/Report are not part of the numbered flow. Labels show where each ticket
+  // IS; the action differs (the "To Be Received" tab is where staff mark items
+  // received; the "Approved" tab is where staff send approved items out).
+  static const _tabs = ['Rejected', 'Pending', 'To Be Received', 'Approved', 'Napkins', 'For Collection', 'All', 'Report'];
   static const _statusFilters = [
     AppConstants.statusRejected,   // 0 Rejected
     AppConstants.statusSubmitted,  // 1 Pending
-    AppConstants.statusApproved,   // 2 Approved
-    AppConstants.statusSent,       // 3 To Be Received
+    AppConstants.statusSent,       // 2 To Be Received
+    AppConstants.statusApproved,   // 3 Approved
     null,                          // 4 Napkins — navigates to separate screen
     AppConstants.statusReceived,   // 5 For Collection
     null,                          // 6 All
@@ -1135,8 +1137,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   /// aren't part of the numbered daily flow (Rejected / All / Report).
   int? _stepFor(String tab) => switch (tab) {
         'Pending' => 1,
-        'Approved' => 2,
-        'To Be Received' => 3,
+        'To Be Received' => 2,
+        'Approved' => 3,
         'Napkins' => 4,
         'For Collection' => 5,
         _ => null,
@@ -1328,6 +1330,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
   Widget _buildOrderCard(int index) {
     final orderId = _orders[index]['id'] as String;
+    // Approve is gated per-admin (default allowed) — hide the button when off.
+    final canApprove = ref.read(adminProvider).currentAdmin?.canApproveOrders ?? true;
     int? daysUntilExpiry;
     if (_isReceivedTab) {
       final updatedAt = DateTime.tryParse(_orders[index]['updated_at'] as String? ?? '');
@@ -1367,10 +1371,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
           _loadData(silent: true);
         });
       },
-      onApprove: () {
-        ref.read(adminProvider.notifier).refreshActivity();
-        _quickAction(orderId, AppConstants.statusApproved);
-      },
+      onApprove: canApprove
+          ? () {
+              ref.read(adminProvider.notifier).refreshActivity();
+              _quickAction(orderId, AppConstants.statusApproved);
+            }
+          : null,
       onReject: ref.read(adminProvider).currentAdmin?.canRejectOrders == true
         ? () {
             ref.read(adminProvider.notifier).refreshActivity();
@@ -1422,7 +1428,8 @@ class _OrderCard extends StatelessWidget {
   final bool showReceiveAction;
   final bool showCollectedAction;
   final VoidCallback onTap;
-  final VoidCallback onApprove;
+  /// Null when the current admin lacks the approve permission — button hidden.
+  final VoidCallback? onApprove;
   final VoidCallback? onReject;
   final VoidCallback? onToggleSelect;
   final VoidCallback? onReturnToPending;
@@ -1443,7 +1450,7 @@ class _OrderCard extends StatelessWidget {
     this.showReceiveAction = false,
     this.showCollectedAction = false,
     required this.onTap,
-    required this.onApprove,
+    this.onApprove,
     this.onReject,
     this.onToggleSelect,
     this.onReturnToPending,
@@ -1630,21 +1637,24 @@ class _OrderCard extends StatelessWidget {
               SizedBox(width: AppSpacing.sm),
               // Pending tab: inline approve/reject buttons — otherwise status badge
               if (showActions) ...[
-                SizedBox(
-                  height: AppSizes.buttonHeightSm,
-                  child: ElevatedButton.icon(
-                    onPressed: onApprove,
-                    icon: Icon(Icons.check, size: AppSizes.iconSizeSm),
-                    label: const Text('Approve'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.success,
-                      foregroundColor: AppColors.white,
-                      padding: EdgeInsets.symmetric(horizontal: AppSpacing.base),
-                      textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
-                      shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
+                // Approve is hidden entirely for admins without the permission
+                // (onApprove is null); Reject already follows the same pattern.
+                if (onApprove != null)
+                  SizedBox(
+                    height: AppSizes.buttonHeightSm,
+                    child: ElevatedButton.icon(
+                      onPressed: onApprove,
+                      icon: Icon(Icons.check, size: AppSizes.iconSizeSm),
+                      label: const Text('Approve'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.success,
+                        foregroundColor: AppColors.white,
+                        padding: EdgeInsets.symmetric(horizontal: AppSpacing.base),
+                        textStyle: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium),
+                        shape: RoundedRectangleBorder(borderRadius: AppRadius.smallBR),
+                      ),
                     ),
                   ),
-                ),
                 if (onReject != null) ...[
                 SizedBox(width: AppSpacing.sm),
                 SizedBox(
