@@ -24,22 +24,20 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
-// Last-resort fallback only — the live list is the report_recipients table,
-// managed from the web dashboard.
-const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
-
+// Recipients are managed ENTIRELY from the web dashboard's Configuration page
+// (report_recipients table). There is deliberately NO hardcoded fallback: if
+// the list is empty the report is sent to no one (and the caller is told), so
+// an old address can never silently resurrect. See db/migrations for the table.
 async function fetchRecipients(): Promise<string[]> {
-  try {
-    const { data } = await supabase
-      .from("report_recipients")
-      .select("email")
-      .eq("is_active", true);
-    const emails = (data ?? []).map((r: any) => r.email).filter(Boolean);
-    if (emails.length > 0) return emails;
-  } catch (e) {
-    console.error("fetchRecipients failed, using fallback:", e);
+  const { data, error } = await supabase
+    .from("report_recipients")
+    .select("email")
+    .eq("is_active", true);
+  if (error) {
+    console.error("fetchRecipients failed:", error.message);
+    return [];
   }
-  return REPORT_EMAILS;
+  return (data ?? []).map((r: any) => r.email).filter(Boolean);
 }
 
 // Aging escalation for not-received tickets (normal turnaround is 1-2 days)
@@ -466,6 +464,21 @@ serve(async (req: Request) => {
     const recipients = (payload?.recipients && payload.recipients.length > 0)
       ? payload.recipients
       : await fetchRecipients();
+
+    // No hardcoded fallback: if nobody is configured on the Configuration page,
+    // send nothing and tell the caller — never silently email an old address.
+    if (recipients.length === 0) {
+      console.error("No report recipients configured — nothing sent. Add recipients on the dashboard Configuration page.");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "No report recipients configured. Add at least one on the Configuration page.",
+          emails: [],
+          mode: payload ? "manual" : "cron",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
     const reportHtml = buildDailyReport(receivedOrders, sentOrders, outstandingOrders, napkinReturns, payload?.senderName);
 

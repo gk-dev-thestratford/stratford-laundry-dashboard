@@ -12,9 +12,6 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 
-// Report emails — daily report at 2pm UK + express alerts after 2pm UK
-const REPORT_EMAILS = ["kunov.georgi@gmail.com", "georgi@thestratford.com", "set1000@hotmail.com"];
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 interface StatusLogPayload {
