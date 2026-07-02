@@ -35,6 +35,10 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
   Set<String> _partialOrderIds = {};
   Map<String, String> _sentDates = {};
   Map<String, String> _awaitingSummaries = {};
+  // Received tab: orders flagged with a laundry-vs-staff dispute (sent count !=
+  // laundry-acknowledged count) and/or an over-return (received > sent).
+  Set<String> _disputeOrderIds = {};
+  Set<String> _overOrderIds = {};
   String? _allTabDateFilter;
   String? _allTabTypeFilter;
   /// Unsynced sync_queue items on THIS device — drives the discrepancy banner.
@@ -200,9 +204,14 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     // Received tab: items still awaited (for the Discrepancy badge)
     Map<String, String> awaitingSummaries = {};
+    Set<String> disputeIds = {};
+    Set<String> overIds = {};
     if (tabIndex == _kReceived && orders.isNotEmpty) {
       awaitingSummaries =
           await DatabaseService.instance.getAwaitingSummaries(orderIds);
+      final flags = await DatabaseService.instance.getReceiptFlags(orderIds);
+      disputeIds = flags.dispute;
+      overIds = flags.over;
     }
 
     if (mounted) {
@@ -212,6 +221,8 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
         _partialOrderIds = partialIds;
         _sentDates = sentDates;
         _awaitingSummaries = awaitingSummaries;
+        _disputeOrderIds = disputeIds;
+        _overOrderIds = overIds;
         _isLoading = false;
       });
     }
@@ -632,7 +643,7 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 
     if (!mounted) return;
 
-    final result = await showDialog<Map<String, int>>(
+    final result = await showDialog<Map<String, ({int received, int? acknowledged})>>(
       context: context,
       builder: (ctx) => _ReceiveItemsDialog(items: items, controllers: controllers),
     );
@@ -648,17 +659,35 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final uuid = const Uuid();
     final now = DateTime.now().toIso8601String();
 
-    // Check for outstanding items (pure computation)
+    // Split the dialog result into received + acknowledged maps and classify
+    // the discrepancies:
+    //  • outstanding — laundry still owes back what it acknowledged but didn't
+    //    return: (acknowledged ?? sent) − received > 0  → follow-up ticket
+    //  • dispute — laundry acknowledged a different count than was sent (S ≠ A)
+    //  • over — more items came back than were sent (R > S)
+    final receivedMap = <String, int>{};
+    final acknowledgedMap = <String, int?>{};
     bool hasOutstanding = false;
+    bool hasDispute = false;
+    bool hasOver = false;
     int totalSent = 0;
     int totalReceived = 0;
     for (final item in items) {
       final id = item['id'] as String;
       final sent = item['quantity_sent'] as int;
-      final received = result[id] ?? 0;
+      final received = result[id]?.received ?? 0;
+      final acknowledged = result[id]?.acknowledged; // null when no discrepancy logged
+      receivedMap[id] = received;
+      if (acknowledged != null) acknowledgedMap[id] = acknowledged;
       totalSent += sent;
       totalReceived += received;
-      if (received < sent) hasOutstanding = true;
+      // Napkins are pool-tracked and excluded from the Dispute/Over badge
+      // queries (getReceiptFlags/getAwaitingSummaries), so exclude them here too
+      // — keeps the confirmation snackbar consistent with the persisted badges.
+      final isNapkin = (item['item_name'] as String? ?? '').toLowerCase().contains('napkin');
+      if ((acknowledged ?? sent) - received > 0) hasOutstanding = true;
+      if (!isNapkin && acknowledged != null && acknowledged != sent) hasDispute = true;
+      if (!isNapkin && received > sent) hasOver = true;
     }
 
     // Optimistic UI — capture order details before removing it from the list
@@ -677,20 +706,26 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     if (mounted) {
       ref.read(adminProvider.notifier).refreshActivity();
       _showStatusSnackBar(
-        hasOutstanding
-            ? 'Partial receipt — follow-up ticket created'
-            : 'All items received',
+        hasDispute
+            ? 'Received — laundry count mismatch flagged'
+            : hasOver
+                ? 'Received — extra items flagged'
+                : hasOutstanding
+                    ? 'Partial receipt — follow-up ticket created'
+                    : 'All items received',
       );
     }
 
     // Persist to local SQLite
-    await db.updateReceivedQuantities(orderId, result);
+    await db.updateReceivedQuantities(orderId, receivedMap,
+        acknowledged: acknowledgedMap.isEmpty ? null : acknowledgedMap);
 
     String? newOrderId;
     if (hasOutstanding) {
       newOrderId = await db.createOutstandingOrder(
         originalOrderId: orderId,
-        receivedQuantities: result,
+        receivedQuantities: receivedMap,
+        acknowledgedQuantities: acknowledgedMap.isEmpty ? null : acknowledgedMap,
       );
 
       await db.insertStatusLog({
@@ -1352,10 +1387,14 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
     final awaitingSummary = _awaitingSummaries[orderId];
     final hasDiscrepancy = _isReceivedTab &&
         (_partialOrderIds.contains(orderId) || awaitingSummary != null);
+    final hasDispute = _isReceivedTab && _disputeOrderIds.contains(orderId);
+    final hasOver = _isReceivedTab && _overOrderIds.contains(orderId);
     return _OrderCard(
       order: _orders[index],
       itemSummary: _itemSummaries[orderId],
       hasDiscrepancy: hasDiscrepancy,
+      hasDispute: hasDispute,
+      hasOver: hasOver,
       awaitingSummary: awaitingSummary,
       daysUntilExpiry: daysUntilExpiry,
       daysSinceSent: daysSinceSent,
@@ -1414,8 +1453,12 @@ class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> wit
 class _OrderCard extends StatelessWidget {
   final Map<String, dynamic> order;
   final String? itemSummary;
-  /// Received tab: child outstanding order exists OR items were short-received.
+  /// Received tab: child outstanding order exists OR items came back short.
   final bool hasDiscrepancy;
+  /// Received tab: laundry acknowledged a different count than was sent (S ≠ A).
+  final bool hasDispute;
+  /// Received tab: more items came back than were sent (R > S).
+  final bool hasOver;
   /// e.g. "awaiting 2× Chef Jacket" — what is still at the laundry.
   final String? awaitingSummary;
   final int? daysUntilExpiry;
@@ -1440,6 +1483,8 @@ class _OrderCard extends StatelessWidget {
     required this.order,
     this.itemSummary,
     this.hasDiscrepancy = false,
+    this.hasDispute = false,
+    this.hasOver = false,
     this.awaitingSummary,
     this.daysUntilExpiry,
     this.daysSinceSent,
@@ -1591,7 +1636,7 @@ class _OrderCard extends StatelessWidget {
                                   color: daysSinceSent! >= 7 ? AppColors.error : Colors.orange.shade800),
                             ),
                           ),
-                        // Received tab: short receipt or unreturned follow-up items
+                        // Received tab: fewer came back than the laundry owed
                         if (hasDiscrepancy)
                           Container(
                             padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
@@ -1600,8 +1645,34 @@ class _OrderCard extends StatelessWidget {
                               borderRadius: AppRadius.smallBR,
                             ),
                             child: Text(
-                              'Discrepancy',
+                              'Short',
                               style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold, color: AppColors.error),
+                            ),
+                          ),
+                        // Received tab: laundry's receipt count disagrees with what was sent
+                        if (hasDispute)
+                          Container(
+                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: AppColors.warning.withValues(alpha: 0.15),
+                              borderRadius: AppRadius.smallBR,
+                            ),
+                            child: Text(
+                              'Dispute',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold, color: Colors.orange.shade800),
+                            ),
+                          ),
+                        // Received tab: more items came back than were sent
+                        if (hasOver)
+                          Container(
+                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: AppColors.statusSent.withValues(alpha: 0.12),
+                              borderRadius: AppRadius.smallBR,
+                            ),
+                            child: Text(
+                              'Over',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: AppTextStyles.bold, color: AppColors.statusSent),
                             ),
                           ),
                       ],
@@ -1761,6 +1832,30 @@ class _ReceiveItemsDialog extends StatefulWidget {
 }
 
 class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
+  // Items with the discrepancy row expanded (a laundry-acknowledged count is
+  // being recorded). While expanded, the received input is uncapped so extras
+  // (received > sent) can be logged.
+  final Set<String> _expanded = {};
+  // "Laundry logged" controllers (from the yellow receipt); default = sent.
+  final Map<String, TextEditingController> _ackControllers = {};
+
+  @override
+  void initState() {
+    super.initState();
+    for (final item in widget.items) {
+      _ackControllers[item['id'] as String] =
+          TextEditingController(text: '${item['quantity_sent']}');
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in _ackControllers.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
   void _increment(String id, int max) {
     final c = widget.controllers[id]!;
     final current = int.tryParse(c.text) ?? 0;
@@ -1809,48 +1904,105 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
               final sent = item['quantity_sent'] as int;
               final controller = widget.controllers[id]!;
               final isNapkin = name.toLowerCase().contains('napkin');
+              final expanded = _expanded.contains(id);
 
               return Padding(
                 padding: EdgeInsets.symmetric(vertical: AppSpacing.sm),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(name, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium)),
-                          if (isNapkin)
-                            Text('Pool tracked — auto-filled', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.success, fontWeight: AppTextStyles.medium))
-                          else
-                            Text('Sent: $sent', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.grey600)),
-                        ],
-                      ),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(name, style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.labelSize, fontWeight: AppTextStyles.medium)),
+                              if (isNapkin)
+                                Text('Pool tracked — auto-filled', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.success, fontWeight: AppTextStyles.medium))
+                              else
+                                Text('Sent: $sent', style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.grey600)),
+                            ],
+                          ),
+                        ),
+                        // −/+/input controls (received). Uncapped while a
+                        // discrepancy is being recorded so extras can be logged.
+                        IconButton(
+                          icon: const Icon(Icons.remove_circle_outline, size: 28),
+                          color: AppColors.error,
+                          onPressed: () => _decrement(id),
+                        ),
+                        SizedBox(
+                          width: 50,
+                          height: AppSizes.buttonHeightSm,
+                          child: TextField(
+                            controller: controller,
+                            keyboardType: TextInputType.number,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.bold),
+                            decoration: InputDecoration(
+                              contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: AppSpacing.sm),
+                              border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.add_circle_outline, size: 28),
+                          color: AppColors.success,
+                          onPressed: () => _increment(id, expanded ? 999999 : sent),
+                        ),
+                      ],
                     ),
-                    // −/+/input controls
-                    IconButton(
-                      icon: const Icon(Icons.remove_circle_outline, size: 28),
-                      color: AppColors.error,
-                      onPressed: () => _decrement(id),
-                    ),
-                    SizedBox(
-                      width: 50,
-                      height: AppSizes.buttonHeightSm,
-                      child: TextField(
-                        controller: controller,
-                        keyboardType: TextInputType.number,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.bold),
-                        decoration: InputDecoration(
-                          contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: AppSpacing.sm),
-                          border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
+                    // Discrepancy toggle + laundry-acknowledged input (non-napkin).
+                    if (!isNapkin) ...[
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: () => setState(() {
+                            if (expanded) {
+                              _expanded.remove(id);
+                            } else {
+                              _expanded.add(id);
+                            }
+                          }),
+                          icon: Icon(expanded ? Icons.expand_less_rounded : Icons.report_problem_outlined,
+                              size: AppSizes.iconSizeSm, color: AppColors.warning),
+                          label: Text(expanded ? 'Hide discrepancy' : 'Add discrepancy',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.warning, fontWeight: AppTextStyles.medium)),
+                          style: TextButton.styleFrom(
+                            padding: EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+                            minimumSize: Size.zero,
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
                         ),
                       ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.add_circle_outline, size: 28),
-                      color: AppColors.success,
-                      onPressed: () => _increment(id, sent),
-                    ),
+                      if (expanded)
+                        Padding(
+                          padding: EdgeInsets.only(left: AppSpacing.xs, bottom: AppSpacing.xs, top: AppSpacing.xs),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Text('Laundry logged (yellow receipt)',
+                                    style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.captionSize, color: AppColors.grey700)),
+                              ),
+                              SizedBox(
+                                width: 56,
+                                height: AppSizes.buttonHeightSm,
+                                child: TextField(
+                                  controller: _ackControllers[id],
+                                  keyboardType: TextInputType.number,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(fontFamily: 'Inter', fontSize: AppTextStyles.bodySize, fontWeight: AppTextStyles.bold, color: AppColors.warning),
+                                  decoration: InputDecoration(
+                                    contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: AppSpacing.sm),
+                                    border: OutlineInputBorder(borderRadius: AppRadius.smallBR),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
                   ],
                 ),
               );
@@ -1862,13 +2014,17 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
         ElevatedButton(
           onPressed: () {
-            final result = <String, int>{};
+            final result = <String, ({int received, int? acknowledged})>{};
             int total = 0;
             for (final item in widget.items) {
               final id = item['id'] as String;
-              final qty = int.tryParse(widget.controllers[id]!.text) ?? 0;
-              result[id] = qty;
-              total += qty;
+              final received = int.tryParse(widget.controllers[id]!.text) ?? 0;
+              // Acknowledged is recorded only when the discrepancy row is open.
+              final acknowledged = _expanded.contains(id)
+                  ? (int.tryParse(_ackControllers[id]!.text) ?? (item['quantity_sent'] as int))
+                  : null;
+              result[id] = (received: received, acknowledged: acknowledged);
+              total += received;
             }
             if (total == 0) {
               ScaffoldMessenger.of(context).showSnackBar(
@@ -1887,11 +2043,10 @@ class _ReceiveItemsDialogState extends State<_ReceiveItemsDialog> {
         SizedBox(width: AppSpacing.xs),
         ElevatedButton.icon(
           onPressed: () {
-            final result = <String, int>{};
-            for (final item in widget.items) {
-              final id = item['id'] as String;
-              result[id] = item['quantity_sent'] as int;
-            }
+            final result = <String, ({int received, int? acknowledged})>{
+              for (final item in widget.items)
+                (item['id'] as String): (received: item['quantity_sent'] as int, acknowledged: null),
+            };
             Navigator.pop(context, result);
           },
           icon: Icon(Icons.done_all_rounded, size: AppSizes.iconSizeMd),

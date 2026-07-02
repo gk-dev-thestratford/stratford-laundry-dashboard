@@ -22,7 +22,7 @@ class DatabaseService {
     final path = join(await getDatabasesPath(), 'stratford_laundry.db');
     return openDatabase(
       path,
-      version: 13,
+      version: 14,
       onCreate: _createTables,
       onUpgrade: _upgradeTables,
     );
@@ -163,6 +163,12 @@ class DatabaseService {
       // Approve button for a specific tablet user.
       await db.execute('ALTER TABLE admin_users ADD COLUMN can_approve_orders INTEGER NOT NULL DEFAULT 1');
     }
+    if (oldVersion < 14) {
+      // Laundry company's own acknowledged count per item (from their yellow
+      // receipt) — nullable; only set when staff record a receiving discrepancy.
+      // Drives the Dispute (sent != acknowledged) badge at receive time.
+      await db.execute('ALTER TABLE order_items ADD COLUMN quantity_acknowledged INTEGER');
+    }
   }
 
   Future<void> _createTables(Database db, int version) async {
@@ -234,6 +240,7 @@ class DatabaseService {
         item_name TEXT NOT NULL,
         quantity_sent INTEGER NOT NULL,
         quantity_received INTEGER,
+        quantity_acknowledged INTEGER,
         price_at_time REAL,
         FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
       )
@@ -563,13 +570,24 @@ class DatabaseService {
     );
   }
 
-  Future<void> updateReceivedQuantities(String orderId, Map<String, int> received) async {
+  /// Records received quantities, and (optionally) the laundry company's
+  /// acknowledged count per item (from their yellow receipt) when staff logged
+  /// a discrepancy. A null entry in [acknowledged] leaves the column untouched.
+  Future<void> updateReceivedQuantities(
+    String orderId,
+    Map<String, int> received, {
+    Map<String, int?>? acknowledged,
+  }) async {
     final db = await database;
     final batch = db.batch();
     for (final entry in received.entries) {
+      final values = <String, Object?>{'quantity_received': entry.value};
+      if (acknowledged != null && acknowledged.containsKey(entry.key)) {
+        values['quantity_acknowledged'] = acknowledged[entry.key];
+      }
       batch.update(
         'order_items',
-        {'quantity_received': entry.value},
+        values,
         where: 'id = ? AND order_id = ?',
         whereArgs: [entry.key, orderId],
       );
@@ -580,9 +598,14 @@ class DatabaseService {
   /// Creates a new "outstanding" order from a partially received order.
   /// Clones the original order with remaining (sent - received) quantities.
   /// Returns the new order ID.
+  /// Creates the outstanding follow-up ticket for items the laundry still owes
+  /// back: (acknowledged ?? sent) − received. Items the laundry never
+  /// acknowledged (sent − acknowledged) are a DISPUTE, not outstanding, so they
+  /// are deliberately excluded here.
   Future<String> createOutstandingOrder({
     required String originalOrderId,
     required Map<String, int> receivedQuantities,
+    Map<String, int?>? acknowledgedQuantities,
   }) async {
     final db = await database;
     final original = await getOrder(originalOrderId);
@@ -617,7 +640,10 @@ class DatabaseService {
       final itemId = item['id'] as String;
       final sent = item['quantity_sent'] as int;
       final received = receivedQuantities[itemId] ?? 0;
-      final outstanding = sent - received;
+      // The laundry still owes back what it acknowledged but didn't return.
+      // Falls back to sent when no acknowledged count was recorded (default flow).
+      final acknowledged = acknowledgedQuantities?[itemId] ?? sent;
+      final outstanding = acknowledged - received;
 
       if (outstanding > 0) {
         batch.insert('order_items', {
@@ -911,6 +937,7 @@ class DatabaseService {
             'item_name': item['item_name'] ?? '',
             'quantity_sent': item['quantity_sent'] ?? 0,
             'quantity_received': item['quantity_received'],
+            'quantity_acknowledged': item['quantity_acknowledged'],
             'price_at_time': item['price_at_time'] != null
                 ? (item['price_at_time'] as num).toDouble()
                 : null,
@@ -1178,10 +1205,15 @@ class DatabaseService {
     final db = await database;
     final placeholders = List.filled(orderIds.length, '?').join(',');
     final rows = await db.rawQuery(
-      'SELECT order_id, item_name, quantity_sent - COALESCE(quantity_received, 0) AS awaited '
+      // "Awaiting" = what the laundry still owes back: acknowledged (or sent, if
+      // no discrepancy was recorded) minus received. Using acknowledged keeps a
+      // pure DISPUTE (sent > acknowledged, all acknowledged returned) from
+      // wrongly showing as awaiting — that gap is a dispute, not outstanding.
+      'SELECT order_id, item_name, '
+      'COALESCE(quantity_acknowledged, quantity_sent) - COALESCE(quantity_received, 0) AS awaited '
       'FROM order_items '
       "WHERE order_id IN ($placeholders) "
-      'AND quantity_sent > COALESCE(quantity_received, 0) '
+      'AND COALESCE(quantity_acknowledged, quantity_sent) > COALESCE(quantity_received, 0) '
       "AND LOWER(item_name) NOT LIKE '%napkin%'",
       orderIds,
     );
@@ -1193,6 +1225,34 @@ class DatabaseService {
     return {
       for (final e in parts.entries) e.key: 'awaiting ${e.value.join(', ')}',
     };
+  }
+
+  /// Which of [orderIds] carry a laundry-vs-staff DISPUTE (the laundry's
+  /// acknowledged count differs from what was sent) and/or an OVER-return
+  /// (more came back than was sent). Napkins are pool-tracked, so excluded.
+  Future<({Set<String> dispute, Set<String> over})> getReceiptFlags(
+      List<String> orderIds) async {
+    if (orderIds.isEmpty) return (dispute: <String>{}, over: <String>{});
+    final db = await database;
+    final placeholders = List.filled(orderIds.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT order_id, '
+      'MAX(CASE WHEN quantity_acknowledged IS NOT NULL '
+      '         AND quantity_acknowledged <> quantity_sent THEN 1 ELSE 0 END) AS is_dispute, '
+      'MAX(CASE WHEN COALESCE(quantity_received, 0) > quantity_sent THEN 1 ELSE 0 END) AS is_over '
+      'FROM order_items '
+      "WHERE order_id IN ($placeholders) AND LOWER(item_name) NOT LIKE '%napkin%' "
+      'GROUP BY order_id',
+      orderIds,
+    );
+    final dispute = <String>{};
+    final over = <String>{};
+    for (final r in rows) {
+      final id = r['order_id'] as String;
+      if ((r['is_dispute'] as int? ?? 0) == 1) dispute.add(id);
+      if ((r['is_over'] as int? ?? 0) == 1) over.add(id);
+    }
+    return (dispute: dispute, over: over);
   }
 
   // ── Data Cleanup ──
