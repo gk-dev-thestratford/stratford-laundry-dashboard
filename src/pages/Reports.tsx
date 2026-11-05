@@ -12,6 +12,7 @@ import type { Order, OrderType, OrderStatus } from '../types'
 import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
 import { computeOrderCost } from '../lib/orderCost'
+import { CHEF_ITEM_KEYS, CHEF_WEEKLY_MINIMUMS, CHEF_TOPUP_RATES, NAPKIN_WEEKLY_MINIMUM, NAPKIN_RATE, type ChefItemKey } from '../lib/minimums'
 
 const DEPT_COLORS = ['#1B2A4A', '#C9A84C', '#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6']
 
@@ -53,7 +54,7 @@ export default function Reports() {
     }
     const [allOrders, topUpRes, recRes] = await Promise.all([
       fetchAllOrders(),
-      supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at, reconciliation_id')
+      supabase.from('reconciliation_topups').select('category, topup_net, topup_gross, week_start, created_at, reconciliation_id, invoice_number, sent_qty, topup_qty, details')
         .gte('created_at', `${year}-01-01T00:00:00.000Z`)
         .lt('created_at', `${year + 1}-01-01T00:00:00.000Z`),
       supabase.from('reconciliations').select('id, invoice_period')
@@ -149,6 +150,42 @@ export default function Reports() {
         linenNapkinsNet: Number(napkinsNet.toFixed(2)),
       }
     })
+  }, [topUpData, recMonthMap])
+
+  // ── Minimum top-up history: pieces sent vs the weekly minimum, per item, per month ──
+  // Built from the weekly rows each saved reconciliation stores (staff weeks carry per-item
+  // `details`; napkin weeks carry sent_qty / topup_qty). "Short" = pieces paid for but not used.
+  const topUpItemHistory = useMemo(() => {
+    type Cell = { sent: number; short: number; weeks: number }
+    const months = Array.from({ length: 12 }, () => ({
+      chef: Object.fromEntries(CHEF_ITEM_KEYS.map(k => [k, { sent: 0, short: 0, weeks: 0 } as Cell])) as Record<ChefItemKey, Cell>,
+      napkins: { sent: 0, short: 0, weeks: 0 } as Cell,
+      uniformNet: 0, napkinNet: 0, invoices: new Set<string>(),
+    }))
+    for (const row of topUpData) {
+      const recMonth = row.reconciliation_id ? recMonthMap[row.reconciliation_id] : undefined
+      const m = recMonth ?? (row.week_start ? new Date(row.week_start) : new Date(row.created_at)).getMonth()
+      const bucket = months[m]
+      if (!bucket) continue
+      if (row.invoice_number) bucket.invoices.add(row.invoice_number)
+      if (row.category === 'Kitchen Uniforms') {
+        bucket.uniformNet += Number(row.topup_net) || 0
+        const details = (row.details ?? {}) as Partial<Record<ChefItemKey, { sent?: number; topUp?: number }>>
+        for (const k of CHEF_ITEM_KEYS) {
+          const d = details[k]
+          if (!d) continue
+          bucket.chef[k].sent += d.sent ?? 0
+          bucket.chef[k].short += d.topUp ?? 0
+          bucket.chef[k].weeks += 1
+        }
+      } else if (row.category === 'Linen Napkins') {
+        bucket.napkinNet += Number(row.topup_net) || 0
+        bucket.napkins.sent += Number(row.sent_qty) || 0
+        bucket.napkins.short += Number(row.topup_qty) || 0
+        bucket.napkins.weeks += 1
+      }
+    }
+    return months.map((b, m) => ({ month: MONTHS[m + 1] as string, ...b, hasData: b.invoices.size > 0 }))
   }, [topUpData, recMonthMap])
 
   const topUpYearTotal = useMemo(() => topUpMonthly.reduce((s, m) => s + m.kitchenUniforms + m.linenNapkins, 0), [topUpMonthly])
@@ -606,6 +643,117 @@ export default function Reports() {
           </div>
         )}
       </div>
+
+      {/* Minimum top-up history — pieces short of the weekly minimum, per item, per month */}
+      {topUpItemHistory.some(m => m.hasData) && (() => {
+        const rows = topUpItemHistory.filter(m => m.hasData)
+        const pct = (sent: number, min: number) => min > 0 ? Math.round(sent / min * 100) : null
+        const pctClass = (p: number | null) => p == null ? 'text-gray-300' : p < 50 ? 'text-red-600 font-semibold' : p < 80 ? 'text-amber-600 font-medium' : 'text-green-600'
+        const totals = {
+          chef: Object.fromEntries(CHEF_ITEM_KEYS.map(k => [k, rows.reduce((a, r) => ({ sent: a.sent + r.chef[k].sent, short: a.short + r.chef[k].short, weeks: a.weeks + r.chef[k].weeks }), { sent: 0, short: 0, weeks: 0 })])) as Record<ChefItemKey, { sent: number; short: number; weeks: number }>,
+          napkins: rows.reduce((a, r) => ({ sent: a.sent + r.napkins.sent, short: a.short + r.napkins.short, weeks: a.weeks + r.napkins.weeks }), { sent: 0, short: 0, weeks: 0 }),
+          uniformNet: rows.reduce((s, r) => s + r.uniformNet, 0),
+          napkinNet: rows.reduce((s, r) => s + r.napkinNet, 0),
+        }
+        // Which item wastes the most money year to date (short pieces x top-up rate)
+        const itemCosts = [
+          ...CHEF_ITEM_KEYS.map(k => ({ name: k, short: totals.chef[k].short, cost: totals.chef[k].short * CHEF_TOPUP_RATES[k] })),
+          { name: 'napkins', short: totals.napkins.short, cost: totals.napkins.short * NAPKIN_RATE },
+        ].sort((a, b) => b.cost - a.cost)
+        const th = 'px-2 py-2 text-right font-medium text-gray-500'
+        return (
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100 flex flex-wrap items-baseline justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900">Minimum top-up history ({year}) {'—'} pieces short of the weekly minimum</h3>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Weekly minimum: chef jacket {CHEF_WEEKLY_MINIMUMS['chef jacket']}, apron {CHEF_WEEKLY_MINIMUMS['apron']}, chef trouser {CHEF_WEEKLY_MINIMUMS['chef trouser']}, napkins {NAPKIN_WEEKLY_MINIMUM.toLocaleString()}.
+                  {' '}Short = paid for but not used. From saved reconciliations only {'—'} months not saved yet are blank.
+                </p>
+              </div>
+              {itemCosts[0]?.cost > 0 && (
+                <span className="text-xs text-amber-700 font-medium">
+                  Biggest overspend: {itemCosts[0].name} {'—'} {itemCosts[0].short.toLocaleString()} pcs short ({'£'}{itemCosts[0].cost.toFixed(2)} NET)
+                </span>
+              )}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    <th className="px-3 py-2 text-left font-medium text-gray-600" rowSpan={2}>Month</th>
+                    {CHEF_ITEM_KEYS.map(k => <th key={k} className="px-2 py-2 text-center font-medium text-gray-600 border-l border-gray-200 capitalize" colSpan={3}>{k}</th>)}
+                    <th className="px-2 py-2 text-right font-medium text-gray-600 border-l border-gray-200" rowSpan={2}>Uniform top-up<br />NET</th>
+                    <th className="px-2 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Napkins</th>
+                    <th className="px-2 py-2 text-right font-medium text-gray-600 border-l border-gray-200" rowSpan={2}>Napkin top-up<br />NET</th>
+                  </tr>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    {[...CHEF_ITEM_KEYS, 'napkins'].map(k => (
+                      <Fragment key={k}>
+                        <th className={`${th} border-l border-gray-200`}>Sent</th>
+                        <th className={th}>Short</th>
+                        <th className={th}>Used</th>
+                      </Fragment>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map(r => (
+                    <tr key={r.month} className="border-b border-gray-100">
+                      <td className="px-3 py-2 font-medium text-gray-700" title={[...r.invoices].join(', ')}>{r.month}</td>
+                      {CHEF_ITEM_KEYS.map(k => {
+                        const c = r.chef[k]
+                        const p = c.weeks ? pct(c.sent, CHEF_WEEKLY_MINIMUMS[k] * c.weeks) : null
+                        return (
+                          <Fragment key={k}>
+                            <td className="px-2 py-2 text-right border-l border-gray-200">{c.weeks ? c.sent : '—'}</td>
+                            <td className="px-2 py-2 text-right text-amber-700" title={c.weeks ? `£${(c.short * CHEF_TOPUP_RATES[k]).toFixed(2)} at £${CHEF_TOPUP_RATES[k].toFixed(2)}` : ''}>{c.weeks ? c.short : '—'}</td>
+                            <td className={`px-2 py-2 text-right ${pctClass(p)}`}>{p == null ? '—' : `${p}%`}</td>
+                          </Fragment>
+                        )
+                      })}
+                      <td className="px-2 py-2 text-right border-l border-gray-200 font-medium">{r.uniformNet ? `£${r.uniformNet.toFixed(2)}` : '—'}</td>
+                      {(() => {
+                        const n = r.napkins
+                        const p = n.weeks ? pct(n.sent, NAPKIN_WEEKLY_MINIMUM * n.weeks) : null
+                        return (<>
+                          <td className="px-2 py-2 text-right border-l border-gray-200">{n.weeks ? n.sent.toLocaleString() : '—'}</td>
+                          <td className="px-2 py-2 text-right text-amber-700">{n.weeks ? n.short.toLocaleString() : '—'}</td>
+                          <td className={`px-2 py-2 text-right ${pctClass(p)}`}>{p == null ? '—' : `${p}%`}</td>
+                        </>)
+                      })()}
+                      <td className="px-2 py-2 text-right border-l border-gray-200 font-medium">{r.napkinNet ? `£${r.napkinNet.toFixed(2)}` : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
+                    <td className="px-3 py-2">Total</td>
+                    {CHEF_ITEM_KEYS.map(k => {
+                      const c = totals.chef[k]
+                      const p = c.weeks ? pct(c.sent, CHEF_WEEKLY_MINIMUMS[k] * c.weeks) : null
+                      return (
+                        <Fragment key={k}>
+                          <td className="px-2 py-2 text-right border-l border-gray-200">{c.sent}</td>
+                          <td className="px-2 py-2 text-right text-amber-700">{c.short}</td>
+                          <td className={`px-2 py-2 text-right ${pctClass(p)}`}>{p == null ? '—' : `${p}%`}</td>
+                        </Fragment>
+                      )
+                    })}
+                    <td className="px-2 py-2 text-right border-l border-gray-200">{'£'}{totals.uniformNet.toFixed(2)}</td>
+                    <td className="px-2 py-2 text-right border-l border-gray-200">{totals.napkins.sent.toLocaleString()}</td>
+                    <td className="px-2 py-2 text-right text-amber-700">{totals.napkins.short.toLocaleString()}</td>
+                    <td className={`px-2 py-2 text-right ${pctClass(totals.napkins.weeks ? pct(totals.napkins.sent, NAPKIN_WEEKLY_MINIMUM * totals.napkins.weeks) : null)}`}>
+                      {totals.napkins.weeks ? `${pct(totals.napkins.sent, NAPKIN_WEEKLY_MINIMUM * totals.napkins.weeks)}%` : '—'}
+                    </td>
+                    <td className="px-2 py-2 text-right border-l border-gray-200">{'£'}{totals.napkinNet.toFixed(2)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Charts — department row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

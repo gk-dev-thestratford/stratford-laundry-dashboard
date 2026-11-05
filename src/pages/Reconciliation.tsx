@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef, Fragment } from 'react'
 import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale, StickyNote, Tag } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
@@ -9,6 +9,7 @@ import {
 } from '../lib/invoiceParser'
 import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals, type PdfChargeGroup } from '../lib/pdfReport'
 import { computeOrderCost } from '../lib/orderCost'
+import { CHEF_WEEKLY_MINIMUMS, CHEF_TOPUP_RATES, NAPKIN_WEEKLY_MINIMUM, NAPKIN_RATE } from '../lib/minimums'
 import {
   buildLineKeys, fetchLineNotes, upsertLineNote, deleteLineNote, fetchGroupFolios, upsertGroupFolio,
   fetchKnownGroupNames, chargeLabel, chargeBucket, CHARGE_TYPE_LABELS,
@@ -1249,8 +1250,8 @@ export default function Reconciliation() {
     const napkinSection = invoice.sections.find(s => s.type === 'napkins')
     if (!napkinSection || napkinSection.lines.length === 0) return null
 
-    const WEEKLY_MIN = 2500
-    const UNIT_RATE = 0.215
+    const WEEKLY_MIN = NAPKIN_WEEKLY_MINIMUM
+    const UNIT_RATE = NAPKIN_RATE
 
     // Helper: parse date string to Date (derive year from invoice period)
     function parseDate(dateStr: string): Date | null {
@@ -1448,8 +1449,8 @@ export default function Reconciliation() {
 
     const ITEM_KEYS = ['chef jacket', 'apron', 'chef trouser'] as const
     type ItemKey = typeof ITEM_KEYS[number]
-    const MINIMUMS: Record<ItemKey, number> = { 'chef jacket': 85, 'apron': 80, 'chef trouser': 80 }
-    const PRICES: Record<ItemKey, number> = { 'chef jacket': 1.41, 'apron': 0.99, 'chef trouser': 1.48 }
+    const MINIMUMS: Record<ItemKey, number> = CHEF_WEEKLY_MINIMUMS
+    const PRICES: Record<ItemKey, number> = CHEF_TOPUP_RATES
     const MAIN_KITCHEN_ID = '048478b5-976a-4522-8316-02a9456d8c91'
 
     function normaliseChefItem(name: string): ItemKey | null {
@@ -1889,15 +1890,27 @@ export default function Reconciliation() {
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
     const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, chargeDetailByDept)
-    const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
-      'Department': row.departmentName,
-      'Line': row.subDetail ? `${row.lineLabel} — ${row.subDetail}` : row.lineLabel,
-      'Orders': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : row.orderCount,
-      'Invoice NET (\u00a3)': +row.invoiceNet.toFixed(2),
-      'System NET (\u00a3)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.systemTotal.toFixed(2),
-      'Difference (\u00a3)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.difference.toFixed(2),
-      'Total inc VAT (\u00a3)': +row.totalGross.toFixed(2),
-    }))
+    const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.flatMap(row => {
+      const line: Record<string, string | number> = {
+        'Department': row.departmentName,
+        'Line': row.subDetail ? `${row.lineLabel} — ${row.subDetail}` : row.lineLabel,
+        'Orders': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : row.orderCount,
+        'Invoice NET (£)': +row.invoiceNet.toFixed(2),
+        'System NET (£)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.systemTotal.toFixed(2),
+        'Difference (£)': (row.isTopUp && row.lineLabel === 'Minimum TopUp') ? '' as any : +row.difference.toFixed(2),
+        'Total inc VAT (£)': +row.totalGross.toFixed(2),
+      }
+      if (!(row.isTopUp && row.lineLabel === 'Minimum TopUp')) return [line]
+      // Usage + top-up subtotal for the department (informational; the TOTAL row below
+      // is computed from the display rows only, so this is not double-counted)
+      const dRows = deptDisplayRows.filter(r => r.departmentName === row.departmentName)
+      const usage = dRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.invoiceNet, 0)
+      return [line, {
+        'Department': row.departmentName, 'Line': 'Total cost (usage + minimum top-up)', 'Orders': '',
+        'Invoice NET (£)': +(usage + row.invoiceNet).toFixed(2), 'System NET (£)': '', 'Difference (£)': '',
+        'Total inc VAT (£)': +dRows.reduce((s, r) => s + r.totalGross, 0).toFixed(2),
+      }]
+    })
     const totalDisplayOrders = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)
     const totalDisplayInvNet = deptDisplayRows.reduce((s, r) => s + r.invoiceNet, 0)
     const totalDisplaySysNet = deptDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.systemTotal, 0)
@@ -2738,8 +2751,14 @@ export default function Reconciliation() {
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Diff</th>
               <th className="px-4 py-2.5 text-right font-medium text-gray-600">Total inc VAT</th>
             </tr></thead>
-            <tbody>{departmentDisplayRows.map((row, i) => (
-              <tr key={i} className={`border-b border-gray-100 ${row.isTopUp ? 'bg-amber-50/20' : ''}`}>
+            <tbody>{departmentDisplayRows.map((row, i) => {
+              // After a department's Minimum TopUp line: usage + top-up = what that department
+              // really cost (display only — not part of the data the footer/Excel/PDF sum)
+              const deptRows = row.isTopUp && row.lineLabel === 'Minimum TopUp'
+                ? departmentDisplayRows.filter(r => r.departmentName === row.departmentName) : null
+              const usage = deptRows ? deptRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.invoiceNet, 0) : 0
+              return (<Fragment key={i}>
+              <tr className={`border-b border-gray-100 ${row.isTopUp ? 'bg-amber-50/20' : ''}`}>
                 <td className={`px-4 py-2.5 ${row.isTopUp ? 'pl-8 italic text-gray-500 text-xs' : 'font-medium'}`}>
                   {row.departmentName} {'\u2014'} {row.lineLabel}
                   {row.subDetail && <div className="text-[10px] text-gray-400 font-normal mt-0.5">{row.subDetail}</div>}
@@ -2752,7 +2771,20 @@ export default function Reconciliation() {
                 </td>
                 <td className="px-4 py-2.5 text-right font-semibold">{'\u00a3'}{row.totalGross.toFixed(2)}</td>
               </tr>
-            ))}</tbody>
+              {deptRows && (
+                <tr className="border-b border-gray-200 bg-gray-50/70">
+                  <td className="px-4 py-2 pl-8 text-xs font-semibold text-gray-800">
+                    {row.departmentName} {'\u2014'} Total cost (usage {'\u00a3'}{usage.toFixed(2)} + minimum top-up {'\u00a3'}{row.invoiceNet.toFixed(2)})
+                    {usage + row.invoiceNet > 0 && <span className="ml-1 font-normal text-gray-500">{'\u00b7'} top-up is {((row.invoiceNet / (usage + row.invoiceNet)) * 100).toFixed(0)}% of the total</span>}
+                  </td>
+                  <td className="px-4 py-2" />
+                  <td className="px-4 py-2 text-right text-xs font-semibold">{'\u00a3'}{(usage + row.invoiceNet).toFixed(2)}</td>
+                  <td className="px-4 py-2" colSpan={2} />
+                  <td className="px-4 py-2 text-right text-xs font-semibold">{'\u00a3'}{deptRows.reduce((s, r) => s + r.totalGross, 0).toFixed(2)}</td>
+                </tr>
+              )}
+              </Fragment>)
+            })}</tbody>
             <tfoot><tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
               <td className="px-4 py-3">Total</td>
               <td className="px-4 py-3 text-right">{departmentDisplayRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.orderCount, 0)}</td>
@@ -2791,6 +2823,7 @@ export default function Reconciliation() {
                 {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Received</th>}
                 {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Shrinkage</th>}
                 <th className="px-3 py-2.5 text-right font-medium text-gray-600">Min Used</th>
+                <th className="px-3 py-2.5 text-left font-medium text-gray-600" title="Invoice top-up vs minimum minus sent, and £ charged vs quantity x rate">Check</th>
               </tr></thead>
               <tbody>
                 {napkinSummary.weeks.map((w, i) => {
@@ -2827,6 +2860,22 @@ export default function Reconciliation() {
                           </span>
                         ) : <span className="text-gray-400">{'\u2014'}</span>}
                       </td>
+                      {(() => {
+                        const expectedQty = hasTopUp ? Math.max(0, napkinSummary.weeklyMinimum - w.invoiceSentQty) : 0
+                        const qtyOff = hasTopUp && w.topUpQty !== expectedQty
+                        const expectedNet = w.topUpQty * napkinSummary.unitRate
+                        const chargeOff = hasTopUp && Math.abs(expectedNet - w.topUpNet) > 0.05
+                        const detail = [
+                          ...(qtyOff ? [`invoice top-up ${w.topUpQty} vs ${napkinSummary.weeklyMinimum} min - ${w.invoiceSentQty} sent = ${expectedQty}`] : []),
+                          ...(chargeOff ? [`charged £${w.topUpNet.toFixed(2)} vs £${expectedNet.toFixed(2)} at £${napkinSummary.unitRate.toFixed(3)}`] : []),
+                        ]
+                        const splitWeek = i === 0 && qtyOff && !chargeOff && w.topUpQty < expectedQty
+                        return (
+                          <td className={`px-3 py-2 whitespace-nowrap text-xs ${!hasTopUp ? 'text-gray-300' : detail.length ? 'text-amber-700' : 'text-green-600'}`} title={detail.join('\n')}>
+                            {!hasTopUp ? '\u2014' : detail.length === 0 ? '\u2713' : splitWeek ? '\u26a0 week starts on previous invoice?' : `\u26a0 ${detail.length} difference${detail.length > 1 ? 's' : ''}`}
+                          </td>
+                        )
+                      })()}
                     </tr>
                   )
                 })}
@@ -2845,6 +2894,7 @@ export default function Reconciliation() {
                   <td className="px-3 py-3 text-right">{'\u00a3'}{napkinSummary.totalNet.toFixed(2)}</td>
                   {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right">{napkinSummary.totalReceived > 0 ? napkinSummary.totalReceived.toLocaleString() : '-'}</td>}
                   {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right text-red-600">{napkinSummary.totalReceived > 0 ? (napkinSummary.totalInvoiceSent - napkinSummary.totalReceived).toLocaleString() : '-'}</td>}
+                  <td className="px-3 py-3" />
                   <td className="px-3 py-3" />
                 </tr>
               </tfoot>
@@ -2935,11 +2985,12 @@ export default function Reconciliation() {
                 <th className="px-3 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Apron (min {uniformMinSummary.MINIMUMS['apron']})</th>
                 <th className="px-3 py-2 text-center font-medium text-gray-600 border-l border-gray-200" colSpan={3}>Chef Trouser (min {uniformMinSummary.MINIMUMS['chef trouser']})</th>
                 <th className="px-3 py-2 text-right font-medium text-gray-600 border-l border-gray-200" rowSpan={2}>TopUp NET</th>
+                <th className="px-3 py-2 text-left font-medium text-gray-600 border-l border-gray-200" rowSpan={2} title="Invoice top-up quantity vs minimum minus sent, and £ charged vs quantity x rate">Check</th>
               </tr><tr className="border-b border-gray-200 bg-gray-50">
                 {uniformMinSummary.ITEM_KEYS.map(k => (
-                  <><th key={`${k}-s`} className="px-2 py-1 text-right font-medium text-gray-500 border-l border-gray-200">Sent</th>
+                  <Fragment key={`${k}-s-f`}><th key={`${k}-s`} className="px-2 py-1 text-right font-medium text-gray-500 border-l border-gray-200">Sent</th>
                   <th key={`${k}-t`} className="px-2 py-1 text-right font-medium text-gray-500">TopUp</th>
-                  <th key={`${k}-p`} className="px-2 py-1 text-right font-medium text-gray-500">Used%</th></>
+                  <th key={`${k}-p`} className="px-2 py-1 text-right font-medium text-gray-500">Used%</th></Fragment>
                 ))}
               </tr></thead>
               <tbody>
@@ -2951,42 +3002,70 @@ export default function Reconciliation() {
                       const min = uniformMinSummary.MINIMUMS[k]
                       const pct = Math.round(sent / min * 100)
                       return (
-                        <><td key={`${k}-s-${i}`} className="px-2 py-2 text-right border-l border-gray-200">{sent}</td>
+                        <Fragment key={`${k}-s-${i}-f`}><td key={`${k}-s-${i}`} className="px-2 py-2 text-right border-l border-gray-200">{sent}</td>
                         <td key={`${k}-t-${i}`} className={`px-2 py-2 text-right ${w.topUp[k] > 0 ? 'text-amber-600 font-medium' : 'text-gray-300'}`}>
                           {w.topUp[k] > 0 ? w.topUp[k] : '-'}
                         </td>
                         <td key={`${k}-p-${i}`} className={`px-2 py-2 text-right font-medium ${pct < 60 ? 'text-red-600' : pct < 80 ? 'text-amber-600' : pct >= 100 ? 'text-green-600' : 'text-amber-500'}`}>
                           {pct}%
-                        </td></>
+                        </td></Fragment>
                       )
                     })}
                     <td className="px-3 py-2 text-right border-l border-gray-200 font-medium">{'\u00a3'}{w.topUpNet.toFixed(2)}</td>
+                    {(() => {
+                      // Does the invoice top-up equal minimum minus sent, and £ = qty x rate?
+                      const short = (k: typeof uniformMinSummary.ITEM_KEYS[number]) => Math.max(0, uniformMinSummary.MINIMUMS[k] - w.invoiceSent[k])
+                      const qtyIssues = uniformMinSummary.ITEM_KEYS.filter(k => w.topUp[k] !== short(k))
+                      const expectedNet = uniformMinSummary.ITEM_KEYS.reduce((s, k) => s + w.topUp[k] * uniformMinSummary.PRICES[k], 0)
+                      const chargeOff = w.topUpNet > 0 && Math.abs(expectedNet - w.topUpNet) > 0.05
+                      const detail = [
+                        ...qtyIssues.map(k => `${k}: invoice top-up ${w.topUp[k]} vs ${uniformMinSummary.MINIMUMS[k]} min - ${w.invoiceSent[k]} sent = ${short(k)}`),
+                        ...(chargeOff ? [`charged £${w.topUpNet.toFixed(2)} vs £${expectedNet.toFixed(2)} at the agreed rates`] : []),
+                      ]
+                      // First week of the month: the days before the 1st are on the previous invoice
+                      const splitWeek = i === 0 && qtyIssues.length > 0 && !chargeOff && qtyIssues.every(k => w.topUp[k] < short(k))
+                      return (
+                        <td className={`px-3 py-2 border-l border-gray-200 whitespace-nowrap ${detail.length ? 'text-amber-700' : 'text-green-600'}`} title={detail.join('\n') || 'Top-up matches minimum minus sent, and the charge matches the agreed rates'}>
+                          {detail.length === 0 ? '\u2713' : splitWeek ? '\u26a0 week starts on previous invoice?' : `\u26a0 ${detail.length} difference${detail.length > 1 ? 's' : ''}`}
+                        </td>
+                      )
+                    })()}
                   </tr>
                 ))}
               </tbody>
               <tfoot><tr className="bg-gray-50 font-semibold border-t-2 border-gray-300">
                 <td className="px-3 py-2.5">Total ({uniformMinSummary.weekCount} weeks)</td>
                 {uniformMinSummary.ITEM_KEYS.map(k => (
-                  <><td key={`${k}-ts`} className="px-2 py-2.5 text-right border-l border-gray-200">{uniformMinSummary.totalInvoiceSent[k]}</td>
+                  <Fragment key={`${k}-ts-f`}><td key={`${k}-ts`} className="px-2 py-2.5 text-right border-l border-gray-200">{uniformMinSummary.totalInvoiceSent[k]}</td>
                   <td key={`${k}-tt`} className="px-2 py-2.5 text-right text-amber-600">{uniformMinSummary.totalTopUp[k]}</td>
                   <td key={`${k}-tp`} className="px-2 py-2.5 text-right">
                     {Math.round(uniformMinSummary.totalInvoiceSent[k] / (uniformMinSummary.MINIMUMS[k] * uniformMinSummary.weekCount) * 100)}%
-                  </td></>
+                  </td></Fragment>
                 ))}
                 <td className="px-3 py-2.5 text-right border-l border-gray-200">{'\u00a3'}{uniformMinSummary.totalTopUpNet.toFixed(2)}</td>
+                <td className="px-3 py-2.5 border-l border-gray-200" />
               </tr></tfoot>
             </table>
           </div>
           <div className="px-5 py-3 bg-gray-50 border-t border-gray-200 text-xs text-gray-600 space-y-1">
             <div className="flex flex-wrap gap-4">
+              <span className="text-gray-500">Pieces short of the weekly minimum (paid for, not used):</span>
               {uniformMinSummary.ITEM_KEYS.map(k => (
                 <span key={k} className={uniformMinSummary.unusedCapacity[k] > 0 ? 'text-amber-700 font-medium' : 'text-green-600'}>
-                  {k.charAt(0).toUpperCase() + k.slice(1)}: {uniformMinSummary.unusedCapacity[k]} unused ({'\u00a3'}{(uniformMinSummary.unusedCapacity[k] * uniformMinSummary.PRICES[k]).toFixed(2)} waste)
+                  {k.charAt(0).toUpperCase() + k.slice(1)}: {uniformMinSummary.unusedCapacity[k]} pcs ({'\u00a3'}{(uniformMinSummary.unusedCapacity[k] * uniformMinSummary.PRICES[k]).toFixed(2)} @ {'\u00a3'}{uniformMinSummary.PRICES[k].toFixed(2)})
                 </span>
               ))}
             </div>
             <div className="text-amber-700 font-medium">
-              Total unused capacity cost: {'\u00a3'}{uniformMinSummary.unusedCost.toFixed(2)}
+              Total overspend on unused minimum: {'\u00a3'}{uniformMinSummary.unusedCost.toFixed(2)}
+              {(() => {
+                const cost = (k: typeof uniformMinSummary.ITEM_KEYS[number]) => uniformMinSummary.unusedCapacity[k] * uniformMinSummary.PRICES[k]
+                const worst = [...uniformMinSummary.ITEM_KEYS].sort((a, b) => cost(b) - cost(a))[0]
+                const used = Math.round(uniformMinSummary.totalInvoiceSent[worst] / (uniformMinSummary.MINIMUMS[worst] * Math.max(1, uniformMinSummary.weekCount)) * 100)
+                return uniformMinSummary.unusedCapacity[worst] > 0
+                  ? <span className="font-normal text-gray-600"> {'\u00b7'} biggest overspend: <strong>{worst}</strong> (only {used}% of the minimum used)</span>
+                  : null
+              })()}
             </div>
           </div>
           </>}
