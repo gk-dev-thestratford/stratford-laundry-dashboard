@@ -1,14 +1,19 @@
-import { useState, useMemo, useCallback, useEffect } from 'react'
-import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale, StickyNote } from 'lucide-react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale, StickyNote, Tag } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
   extractPdfLinesRaw, parseInvoiceFile, parseInvoicePeriod, derivePeriodFromLines,
-  sectionTypeToOrderType, canonicalDocket, guestNameMatches,
+  sectionTypeToOrderType, canonicalDocket, guestNameMatches, guestNameSimilar,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
   extractAndParseD140, type D140Report, type D140Transaction,
 } from '../lib/invoiceParser'
-import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals } from '../lib/pdfReport'
+import { downloadReconciliationPdf, generateReconciliationPdfBlob, type DepartmentDisplayRow, type FinancialTotals, type PdfChargeGroup } from '../lib/pdfReport'
 import { computeOrderCost } from '../lib/orderCost'
+import {
+  buildLineKeys, fetchLineNotes, upsertLineNote, deleteLineNote, fetchGroupFolios, upsertGroupFolio,
+  fetchKnownGroupNames, chargeLabel, chargeBucket, CHARGE_TYPE_LABELS,
+  type LineNote, type GroupFolio, type ChargeType,
+} from '../lib/lineNotes'
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
@@ -255,7 +260,10 @@ function isHskLinenRow(row: ReconciliationRow): boolean {
 
 function buildDepartmentDisplayRows(
   breakdown: DepartmentBreakdown[],
-  allRows: ReconciliationRow[]
+  allRows: ReconciliationRow[],
+  // Per-department small print for tagged / no-room lines ("Incl. Group: X £..."), so the
+  // breakdown shows group charges without adding rows that would double-count totals.
+  chargeDetail?: Map<string, string>
 ): DepartmentDisplayRow[] {
   const displayRows: DepartmentDisplayRow[] = []
   for (const dept of breakdown) {
@@ -296,7 +304,7 @@ function buildDepartmentDisplayRows(
     displayRows.push({
       departmentName: dept.departmentName,
       lineLabel: linenCount > 0 && uniformCount > 0 ? 'Staff Uniform' : label,
-      subDetail: linenDetail,
+      subDetail: [linenDetail, chargeDetail?.get(dept.departmentName)].filter(Boolean).join(' · ') || undefined,
       isTopUp: false,
       orderCount: dept.orderCount,
       invoiceNet: dept.invoiceNet,
@@ -333,6 +341,14 @@ function invoiceLineDay(date: string): number | null {
   return Math.floor(Date.UTC(yr, parseInt(m[2]) - 1, parseInt(m[1])) / DAY_MS)
 }
 
+/** Opera D140 date ("DD-MM-YY") → UTC day number, or null. */
+function d140Day(date: string): number | null {
+  const m = date?.match(/^(\d{2})-(\d{2})-(\d{2,4})$/)
+  if (!m) return null
+  let yr = +m[3]; if (yr < 100) yr += 2000
+  return Math.floor(Date.UTC(yr, +m[2] - 1, +m[1]) / DAY_MS)
+}
+
 function orderDay(o: Order): number {
   return Math.floor(new Date(o.created_at).getTime() / DAY_MS)
 }
@@ -355,7 +371,40 @@ function pickClosestGuestOrder(candidates: Order[], line: InvoiceLine): Order | 
     .sort((a, b) => a.r[0] - b.r[0] || a.r[1] - b.r[1] || a.r[2] - b.r[2])[0].o
 }
 
-function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null, strictPeriod?: { start: Date; end: Date } | null): ReconciliationResult {
+// Days either side of the invoice line date for name-only and room-override matching.
+const GUEST_MATCH_WINDOW_DAYS = 1
+
+/**
+ * Manual-link keys per invoice line, stamped as "[ref:...]" into the linked order's notes.
+ * Lines with a ticket use "[ref:<ticket>|<date>|<net>]". Lines with NO ticket (guest lines
+ * without a room) need an occurrence number, otherwise two no-room lines with the same date
+ * and amount share one key and linking the second silently unlinks the first. The first
+ * such line also accepts the legacy "[ref:|<date>|<net>]" form so existing links survive.
+ * First key = the one to write; the rest are also accepted when matching.
+ */
+function lineRefKeys(invoice: ParsedInvoice | null): Map<InvoiceLine, string[]> {
+  const out = new Map<InvoiceLine, string[]>()
+  if (!invoice) return out
+  const seen = new Map<string, number>()
+  for (const section of invoice.sections) {
+    for (const line of section.lines) {
+      if (line.isTopUp) continue
+      if (line.ticket) { out.set(line, [`[ref:${line.ticket}|${line.date}|${line.net}]`]); continue }
+      const base = `${line.date}|${line.net}`
+      const n = (seen.get(base) ?? 0) + 1
+      seen.set(base, n)
+      out.set(line, n === 1 ? [`[ref:#1|${base}]`, `[ref:|${base}]`] : [`[ref:#${n}|${base}]`])
+    }
+  }
+  return out
+}
+
+function reconcile(
+  invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null,
+  strictPeriod?: { start: Date; end: Date } | null,
+  // Line notes for this invoice: explicit order picks and "room missing" overrides
+  notesByLine?: Map<InvoiceLine, LineNote>,
+): ReconciliationResult {
   // Issue 2: Use array map to handle duplicate docket numbers.
   // Key by canonicalDocket so a reset-booklet ticket "6" matches a stored "0006", etc.
   const byDocket = new Map<string, Order[]>()
@@ -364,12 +413,16 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   // in order notes. They take PRIORITY over docket/room heuristics — a manual link must
   // never be overridden by a coincidental docket match. An order pinned to one of THIS
   // invoice's lines is kept OUT of the docket/room pools so another line can't steal it.
-  const wantedRefs = invoiceRefKeys(invoice)
+  // Orders explicitly picked in a line note ("who could it be") are pinned the same way.
+  const refKeys = lineRefKeys(invoice)
+  const wantedRefs = new Set([...refKeys.values()].flat())
+  const pickedIds = new Set<string>()
+  for (const n of notesByLine?.values() ?? []) if (n.order_id) pickedIds.add(n.order_id)
   const byRef = new Map<string, Order[]>()
   const guestPool: Order[] = [] // unpinned guest orders, for the name-only fallback
   for (const o of orders) {
     const refs = o.notes?.match(/\[ref:[^\]]+\]/g) ?? []
-    let pinned = false
+    let pinned = pickedIds.has(o.id)
     for (const r of refs) {
       if (!wantedRefs.has(r)) continue
       pinned = true
@@ -396,8 +449,14 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     for (const line of section.lines) {
       if (line.isTopUp) { topUpCharges.push(line); continue }
       // 1) Explicit manual link (ref-key) wins over everything
-      const refKey = `[ref:${line.ticket}|${line.date}|${line.net}]`
-      let order = (byRef.get(refKey) ?? []).find(o => !matchedOrderIds.has(o.id)) ?? null
+      let order: Order | null = null
+      for (const k of refKeys.get(line) ?? []) {
+        order = (byRef.get(k) ?? []).find(o => !matchedOrderIds.has(o.id)) ?? null
+        if (order) break
+      }
+      // 1b) Order explicitly picked for this line in its note
+      const pickedId = notesByLine?.get(line)?.order_id
+      if (!order && pickedId) order = orders.find(o => o.id === pickedId && !matchedOrderIds.has(o.id)) ?? null
       // 2) Issue 2: Pick first unclaimed order with this docket (canonicalised both sides).
       // Guest dockets are ROOM numbers; staff/napkin tickets are booklet numbers — the
       // same digits mean different things, so a docket match must stay within the right
@@ -422,13 +481,29 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
 
   // 4) Guest lines the invoice prints with no room (e.g. "OVER GT EX MOHAMMED", "EX SHAFIQ"):
   // after every room/docket match has claimed its order, try the guest name against the
-  // remaining guest orders created within 3 days of the line date.
+  // remaining guest orders created within ±1 day of the line date.
+  const inWindow = (o: Order, line: InvoiceLine) => {
+    const lineDay = invoiceLineDay(line.date)
+    return lineDay == null || Math.abs(orderDay(o) - lineDay) <= GUEST_MATCH_WINDOW_DAYS
+  }
   for (const p of pending) {
     if (p.order || p.sectionType !== 'guest' || p.line.ticket || !p.line.guestInfo) continue
-    const lineDay = invoiceLineDay(p.line.date)
+    if (notesByLine?.get(p.line)?.charge_type === 'room_missing') continue // pass 5 uses the typed room
     const candidates = guestPool.filter(o =>
-      !matchedOrderIds.has(o.id) && guestNameMatches(p.line.guestInfo, o.guest_name) &&
-      (lineDay == null || Math.abs(orderDay(o) - lineDay) <= 3))
+      !matchedOrderIds.has(o.id) && guestNameMatches(p.line.guestInfo, o.guest_name) && inWindow(o, p.line))
+    p.order = pickClosestGuestOrder(candidates, p.line)
+    if (p.order) matchedOrderIds.add(p.order.id)
+  }
+
+  // 5) "Room missing on invoice" lines with a room typed in: matched LAST, so the override
+  // can never take an order that a genuine room line on the invoice should get.
+  for (const p of pending) {
+    const room = notesByLine?.get(p.line)?.charge_type === 'room_missing' ? notesByLine.get(p.line)?.room_override : null
+    if (p.order || p.sectionType !== 'guest' || !room) continue
+    const key = canonicalDocket(room)
+    const candidates = guestPool.filter(o =>
+      !matchedOrderIds.has(o.id) && inWindow(o, p.line) &&
+      (o.room_number === room || canonicalDocket(o.docket_number) === key))
     p.order = pickClosestGuestOrder(candidates, p.line)
     if (p.order) matchedOrderIds.add(p.order.id)
   }
@@ -478,16 +553,21 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
 // without this merge a link to an order from another month silently disappears on
 // refetch and on every re-upload.
 function invoiceRefKeys(invoice: ParsedInvoice): Set<string> {
-  const keys = new Set<string>()
-  for (const section of invoice.sections) {
-    for (const line of section.lines) {
-      if (!line.isTopUp) keys.add(`[ref:${line.ticket}|${line.date}|${line.net}]`)
-    }
-  }
-  return keys
+  return new Set([...lineRefKeys(invoice).values()].flat())
 }
 
-async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { start: Date; end: Date } | null, broaderSearch: boolean): Promise<Order[]> {
+function pickedOrderIds(notes: Record<string, LineNote>): string[] {
+  return Object.values(notes).map(n => n.order_id).filter((id): id is string => !!id)
+}
+
+/** Line notes keyed by the invoice line they belong to (via the stable line keys). */
+function notesMapFor(invoice: ParsedInvoice | null, notes: Record<string, LineNote>): Map<InvoiceLine, LineNote> {
+  const m = new Map<InvoiceLine, LineNote>()
+  for (const [line, key] of buildLineKeys(invoice)) if (notes[key]) m.set(line, notes[key])
+  return m
+}
+
+async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { start: Date; end: Date } | null, broaderSearch: boolean, pickedOrderIds: string[] = []): Promise<Order[]> {
   let fetched: Order[] = []
   if (period) {
     let fetchStart = period.start
@@ -517,10 +597,16 @@ async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { st
       if (refs?.some(r => wanted.has(r))) fetched.push(o)
     }
   }
+  // Orders explicitly picked in line notes may sit just outside the period (±1 day)
+  const missingPicked = pickedOrderIds.filter(id => !fetched.some(o => o.id === id))
+  if (missingPicked.length) {
+    const { data: picked } = await supabase.from('orders').select('*, department:departments(*), order_items(*)').in('id', missingPicked)
+    fetched.push(...((picked as Order[] | null) ?? []))
+  }
   return fetched
 }
 
-type FilterTab = 'all' | 'matched' | 'mismatch' | 'not_found' | 'missing'
+type FilterTab = 'all' | 'matched' | 'mismatch' | 'not_found' | 'missing' | 'group'
 
 // ── Component ──
 
@@ -560,6 +646,25 @@ export default function Reconciliation() {
   const [lineNotes, setLineNotes] = useState<Record<string, string>>({})
   // created_at of the saved reconciliation whose per-line work was restored (banner)
   const [restoredFrom, setRestoredFrom] = useState<string | null>(null)
+
+  // "Charge to" tags + notes per invoice line (reconciliation_line_notes, autosaved), keyed by
+  // the stable line key. The ref mirrors state so reconcile() always sees the latest notes.
+  const [noteRows, setNoteRows] = useState<Record<string, LineNote>>({})
+  const noteRowsRef = useRef<Record<string, LineNote>>({})
+  const [notesAvailable, setNotesAvailable] = useState(true) // false until the migration is run
+  const [groupFolios, setGroupFolios] = useState<Record<string, GroupFolio>>({})
+  const groupFoliosRef = useRef<Record<string, GroupFolio>>({})
+  const folioSaveQueue = useRef<Promise<unknown>>(Promise.resolve())
+  const applyGroupFolios = (rows: Record<string, GroupFolio>) => { groupFoliosRef.current = rows; setGroupFolios(rows) }
+  const [knownGroups, setKnownGroups] = useState<string[]>([])
+  const [noteModal, setNoteModal] = useState<ReconciliationRow | null>(null)
+  const [noteForm, setNoteForm] = useState<{ type: ChargeType; room: string; group: string; note: string; orderId: string | null }>({ type: 'note', room: '', group: '', note: '', orderId: null })
+  const [noteSaving, setNoteSaving] = useState(false)
+  const [noteError, setNoteError] = useState('')
+  const [noteCandidates, setNoteCandidates] = useState<Order[]>([])
+  const [noteCandidateSearch, setNoteCandidateSearch] = useState('')
+  // D140 VAT basis is unconfirmed: margins are labelled until the accounts team confirms
+  const [d140IncludesVat, setD140IncludesVat] = useState(false)
   const [showChallengePanel, setShowChallengePanel] = useState(false)
   const [challengeEmail, setChallengeEmail] = useState('')
 
@@ -653,11 +758,14 @@ export default function Reconciliation() {
     if (!invoice) return
     const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
     setParsedPeriod(period)
-    const fetchedOrders = await fetchOrdersForReconciliation(invoice, period, broaderSearch)
+    const notes = noteRowsRef.current
+    const fetchedOrders = await fetchOrdersForReconciliation(invoice, period, broaderSearch, pickedOrderIds(notes))
     setOrders(fetchedOrders)
     // Pass original period as strictPeriod so broader-search orders don't appear in "In System Only"
-    setResult(reconcile(invoice, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
+    setResult(reconcile(invoice, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period, notesMapFor(invoice, notes)))
   }, [invoice, broaderSearch])
+
+  const applyNoteRows = (rows: Record<string, LineNote>) => { noteRowsRef.current = rows; setNoteRows(rows) }
 
   async function handleFile(f: File) {
     if (!f.type.includes('pdf')) { setError('Please upload a PDF file'); return }
@@ -665,6 +773,7 @@ export default function Reconciliation() {
     setInvoice(null); setResult(null); setSaved(false); setShowHistory(false)
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
     setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
+    applyNoteRows({}); applyGroupFolios({}); setNotesAvailable(true)
     try {
       // Handles both Goldstar layouts (legacy text lines and the 2026-09 column table)
       const parsed = await parseInvoiceFile(f)
@@ -675,9 +784,18 @@ export default function Reconciliation() {
       setInvoice(parsed)
       const period = parseInvoicePeriod(parsed.invoicePeriod) || derivePeriodFromLines(parsed)
       setParsedPeriod(period)
-      const fetchedOrders = await fetchOrdersForReconciliation(parsed, period, broaderSearch)
+      // Line notes first: their order picks / room overrides feed the matcher
+      let notes: Record<string, LineNote> = {}
+      if (parsed.invoiceNumber) {
+        const [{ notes: list, available }, folios] = await Promise.all([fetchLineNotes(parsed.invoiceNumber), fetchGroupFolios(parsed.invoiceNumber)])
+        setNotesAvailable(available)
+        notes = Object.fromEntries(list.map(n => [n.line_key, n]))
+        applyGroupFolios(Object.fromEntries(folios.map(g => [g.group_name, g])))
+      }
+      applyNoteRows(notes)
+      const fetchedOrders = await fetchOrdersForReconciliation(parsed, period, broaderSearch, pickedOrderIds(notes))
       setOrders(fetchedOrders)
-      setResult(reconcile(parsed, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period))
+      setResult(reconcile(parsed, fetchedOrders, broaderSearch && period ? { start: new Date(new Date(period.start).setUTCMonth(period.start.getUTCMonth() - 1)), end: period.end } : period, period, notesMapFor(parsed, notes)))
 
       // Restore previously saved per-line work (resolutions, challenges, notes) for this
       // invoice so re-uploading doesn't lose decisions already made.
@@ -714,7 +832,113 @@ export default function Reconciliation() {
     setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
     setD140Report(null); setShowD140Prompt(false); setLastSavedRecId(null); setD140Saved(false)
+    applyNoteRows({}); applyGroupFolios({}); setNoteModal(null)
   }
+
+  // ── Line notes ("Charge to") ──
+  const lineKeys = useMemo(() => buildLineKeys(invoice), [invoice])
+  const refKeyMap = useMemo(() => lineRefKeys(invoice), [invoice])
+  const noteFor = useCallback((line: InvoiceLine): LineNote | undefined => {
+    const key = lineKeys.get(line)
+    return key ? noteRows[key] : undefined
+  }, [lineKeys, noteRows])
+  // Notes whose line no longer appears (corrected / re-issued invoice) — never silently lost
+  const unattachedNotes = useMemo(() => {
+    const live = new Set(lineKeys.values())
+    return Object.values(noteRows).filter(n => !live.has(n.line_key))
+  }, [lineKeys, noteRows])
+
+  function openNoteModal(row: ReconciliationRow) {
+    const n = noteFor(row.invoiceLine)
+    const noRoomGuest = !row.invoiceLine.ticket && row.sectionType === 'guest_laundry'
+    setNoteForm({
+      type: n?.charge_type ?? (noRoomGuest ? 'room_missing' : 'note'),
+      room: n?.room_override ?? '', group: n?.group_name ?? '', note: n?.note ?? '', orderId: n?.order_id ?? null,
+    })
+    setNoteError(''); setNoteCandidateSearch(''); setNoteCandidates([])
+    setNoteModal(row)
+    fetchKnownGroupNames().then(setKnownGroups)
+    // "Who could it be": guest orders from the invoice month ±1 day
+    if (row.sectionType === 'guest_laundry' && parsedPeriod) {
+      const from = new Date(parsedPeriod.start.getTime() - DAY_MS).toISOString()
+      const to = new Date(parsedPeriod.end.getTime() + DAY_MS).toISOString()
+      supabase.from('orders').select('*, department:departments(*), order_items(*)')
+        .eq('order_type', 'guest_laundry').gte('created_at', from).lte('created_at', to)
+        .order('created_at', { ascending: true }).limit(500)
+        .then(({ data }) => setNoteCandidates((data as Order[] | null) ?? []))
+    }
+  }
+
+  const saveLineNote = useCallback(async (remove = false) => {
+    if (!noteModal || !invoice) return
+    const line = noteModal.invoiceLine
+    const key = lineKeys.get(line)
+    if (!key) return
+    if (!invoice.invoiceNumber) { setNoteError('This invoice has no invoice number, so notes cannot be saved against it.'); return }
+    if (!notesAvailable) { setNoteError('The line-notes table does not exist yet. Run db/migrations/2026-11-05_reconciliation_line_notes.sql in Supabase first.'); return }
+    const f = noteForm
+    const room = f.room.trim().toUpperCase()
+    const group = f.group.trim()
+    if (!remove) {
+      if (f.type === 'room_missing' && !room && !f.orderId) { setNoteError('Type the room number, or pick the guest order below.'); return }
+      if (f.type === 'group' && !group) { setNoteError('Enter the group name.'); return }
+    }
+    setNoteSaving(true); setNoteError('')
+    const isEmpty = f.type === 'note' && !f.note.trim()
+    let err: string | null
+    const next = { ...noteRowsRef.current }
+    if (remove || isEmpty) {
+      err = await deleteLineNote(invoice.invoiceNumber, key)
+      if (!err) delete next[key]
+    } else {
+      const { data: { user } } = await supabase.auth.getUser()
+      const n: LineNote = {
+        invoice_number: invoice.invoiceNumber, line_key: key,
+        line_date: line.date, ticket: line.ticket || null, guest_label: line.guestInfo ?? null,
+        description: line.description || null, net: line.net,
+        charge_type: f.type,
+        room_override: f.type === 'room_missing' ? (room || null) : null,
+        group_name: f.type === 'group' || f.type === 'house' || f.type === 'other' ? (group || null) : null,
+        note: f.note.trim() || null,
+        order_id: f.type === 'room_missing' ? f.orderId : null,
+        updated_by: user?.email ?? null,
+      }
+      err = await upsertLineNote(n)
+      if (!err) next[key] = { ...n, updated_at: new Date().toISOString() }
+    }
+    setNoteSaving(false)
+    if (err) { setNoteError(`Could not save: ${err}`); return }
+    applyNoteRows(next)
+    // Re-match with the new tag before closing, so the row's result is visible on close
+    setNoteSaving(true)
+    await refetchAndReconcile()
+    setNoteSaving(false)
+    setNoteModal(null)
+  }, [noteModal, invoice, lineKeys, notesAvailable, noteForm, refetchAndReconcile])
+
+  const removeUnattachedNote = useCallback(async (n: LineNote) => {
+    const err = await deleteLineNote(n.invoice_number, n.line_key)
+    if (err) { setPriceUpdateError(`Could not remove note: ${err}`); return }
+    const next = { ...noteRowsRef.current }; delete next[n.line_key]
+    applyNoteRows(next)
+  }, [])
+
+  // Each folio field saves on blur. Merge every patch into the LATEST values (ref, updated
+  // optimistically) and run the upserts one after another, so quick successive edits can't
+  // overwrite each other with a stale copy of the record.
+  const saveGroupFolio = useCallback((groupName: string, patch: Partial<GroupFolio>) => {
+    if (!invoice?.invoiceNumber || !notesAvailable) return
+    const invoiceNumber = invoice.invoiceNumber
+    const base: GroupFolio = groupFoliosRef.current[groupName] ?? { invoice_number: invoiceNumber, group_name: groupName, master_room: null, revenue_posted: null, folio_ref: null, note: null, updated_by: null }
+    applyGroupFolios({ ...groupFoliosRef.current, [groupName]: { ...base, ...patch } })
+    folioSaveQueue.current = folioSaveQueue.current.then(async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      const latest = groupFoliosRef.current[groupName]
+      if (!latest) return
+      const err = await upsertGroupFolio({ ...latest, updated_by: user?.email ?? null })
+      if (err) setPriceUpdateError(`Could not save group details: ${err}`)
+    })
+  }, [invoice, notesAvailable])
 
   const isGuestInvoice = invoice?.sections.some(s => s.type === 'guest') ?? false
 
@@ -736,45 +960,89 @@ export default function Reconciliation() {
   const guestMarginData = useMemo(() => {
     if (!result || !d140Report || !isGuestInvoice) return null
     const guestRows = result.rows.filter(r => r.sectionType === 'guest_laundry' || r.invoiceLine.sectionType === 'guest')
+    // VAT basis of D140 amounts is unconfirmed — margin uses the net-equivalent revenue
+    const vatDiv = d140IncludesVat ? 1.2 : 1
+    // D140 postings on a group's master folio room are that group's revenue, not a line's
+    const masterRoomGroup = new Map<string, string>()
+    for (const f of Object.values(groupFolios)) if (f.master_room) masterRoomGroup.set(canonicalDocket(f.master_room), f.group_name)
+    const groupRevenueD140 = new Map<string, number>()
     // Index D140 transactions by room number
     const d140ByRoom = new Map<string, D140Transaction[]>()
     for (const t of d140Report.transactions) {
       if (t.isCredit) continue // skip corrections/refunds
+      const grp = masterRoomGroup.get(canonicalDocket(t.roomNumber))
+      if (grp) { groupRevenueD140.set(grp, (groupRevenueD140.get(grp) ?? 0) + t.amount); continue }
       if (!d140ByRoom.has(t.roomNumber)) d140ByRoom.set(t.roomNumber, [])
       d140ByRoom.get(t.roomNumber)!.push(t)
     }
 
-    const matched: { invoiceLine: typeof guestRows[0]; d140: D140Transaction; margin: number; marginPct: number }[] = []
+    const matched: { invoiceLine: typeof guestRows[0]; d140: D140Transaction; room: string; margin: number; marginPct: number }[] = []
     const invoiceOnly: typeof guestRows[0][] = []
     const d140Only: D140Transaction[] = []
     const usedD140 = new Set<D140Transaction>()
+    const groupRows = new Map<string, typeof guestRows>()
 
+    // Closest-date posting for the room, then closest amount
+    const takeD140 = (room: string, row: typeof guestRows[0]) => {
+      const lineDay = invoiceLineDay(row.invoiceLine.date)
+      const cands = (d140ByRoom.get(room) ?? []).filter(t => !usedD140.has(t))
+      cands.sort((a, b) => {
+        const da = lineDay == null ? 0 : Math.abs((d140Day(a.date) ?? lineDay) - lineDay)
+        const db = lineDay == null ? 0 : Math.abs((d140Day(b.date) ?? lineDay) - lineDay)
+        return da - db || Math.abs(a.amount - row.invoiceLine.gross) - Math.abs(b.amount - row.invoiceLine.gross)
+      })
+      const d140 = cands[0]
+      if (!d140) return false
+      usedD140.add(d140)
+      const revenueNet = d140.amount / vatDiv
+      const margin = revenueNet - row.invoiceLine.net
+      const marginPct = revenueNet > 0 ? (margin / revenueNet) * 100 : 0
+      matched.push({ invoiceLine: row, d140, room, margin: +margin.toFixed(2), marginPct: +marginPct.toFixed(1) })
+      return true
+    }
+
+    // Pass A: lines with the room printed on the invoice. Pass B: "room missing" lines with a
+    // room typed in — matched after, so they can't take a genuine line's posting.
+    const overrideRows: typeof guestRows = []
     for (const row of guestRows) {
-      const room = row.invoiceLine.ticket
-      const candidates = d140ByRoom.get(room) ?? []
-      const d140 = candidates.find(t => !usedD140.has(t))
-      if (d140) {
-        usedD140.add(d140)
-        const margin = d140.amount - row.invoiceLine.net
-        const marginPct = d140.amount > 0 ? (margin / d140.amount) * 100 : 0
-        matched.push({ invoiceLine: row, d140, margin: +margin.toFixed(2), marginPct: +marginPct.toFixed(1) })
-      } else {
-        invoiceOnly.push(row)
+      const n = noteFor(row.invoiceLine)
+      if (n && (n.charge_type === 'group' || n.charge_type === 'house' || n.charge_type === 'other')) {
+        const name = chargeBucket(n, row.invoiceLine) ?? 'Other'
+        if (!groupRows.has(name)) groupRows.set(name, [])
+        groupRows.get(name)!.push(row)
+        continue
       }
+      if (n?.charge_type === 'room_missing' && n.room_override) { overrideRows.push(row); continue }
+      if (!row.invoiceLine.ticket || !takeD140(row.invoiceLine.ticket, row)) invoiceOnly.push(row)
+    }
+    for (const row of overrideRows) {
+      if (!takeD140(noteFor(row.invoiceLine)!.room_override!, row)) invoiceOnly.push(row)
     }
 
     // Find D140 entries not matched to any invoice line
     for (const t of d140Report.transactions) {
-      if (!t.isCredit && !usedD140.has(t)) d140Only.push(t)
+      if (!t.isCredit && !usedD140.has(t) && !masterRoomGroup.has(canonicalDocket(t.roomNumber))) d140Only.push(t)
     }
 
-    const totalCost = matched.reduce((s, m) => s + m.invoiceLine.invoiceLine.net, 0)
-    const totalRevenue = matched.reduce((s, m) => s + m.d140.amount, 0)
-    const totalMargin = totalRevenue - totalCost
-    const avgMarginPct = totalRevenue > 0 ? (totalMargin / totalRevenue) * 100 : 0
+    // Per group: D140 postings on the master room, else the manually entered revenue
+    const groups = [...groupRows.entries()].map(([bucket, rows]) => {
+      const groupName = bucket.startsWith('Group: ') ? bucket.slice(7) : null
+      const folio = groupName ? groupFolios[groupName] : undefined
+      const auto = groupName ? groupRevenueD140.get(groupName) : undefined
+      const revenue = auto ?? folio?.revenue_posted ?? null
+      const cost = rows.reduce((s, r) => s + r.invoiceLine.net, 0)
+      const margin = revenue != null ? +(revenue / vatDiv - cost).toFixed(2) : null
+      return { bucket, groupName, rows, cost: +cost.toFixed(2), revenue, revenueSource: auto != null ? 'D140 master room' : revenue != null ? 'Entered manually' : null, masterRoom: folio?.master_room ?? null, folioRef: folio?.folio_ref ?? null, margin }
+    })
 
-    return { matched, invoiceOnly, d140Only, totalCost, totalRevenue, totalMargin, avgMarginPct }
-  }, [result, d140Report, isGuestInvoice])
+    const groupsWithRevenue = groups.filter(g => g.revenue != null)
+    const totalCost = matched.reduce((s, m) => s + m.invoiceLine.invoiceLine.net, 0) + groupsWithRevenue.reduce((s, g) => s + g.cost, 0)
+    const totalRevenue = matched.reduce((s, m) => s + m.d140.amount, 0) + groupsWithRevenue.reduce((s, g) => s + (g.revenue ?? 0), 0)
+    const totalMargin = totalRevenue / vatDiv - totalCost
+    const avgMarginPct = totalRevenue > 0 ? (totalMargin / (totalRevenue / vatDiv)) * 100 : 0
+
+    return { matched, invoiceOnly, d140Only, groups, totalCost, totalRevenue, totalMargin, avgMarginPct }
+  }, [result, d140Report, isGuestInvoice, noteFor, groupFolios, d140IncludesVat])
 
   const handleSaveD140 = useCallback(async () => {
     if (!guestMarginData || !lastSavedRecId || !d140Report) return
@@ -807,6 +1075,12 @@ export default function Reconciliation() {
         invoiceOnlyCount: guestMarginData.invoiceOnly.length,
         d140OnlyCount: guestMarginData.d140Only.length,
       },
+      groups: guestMarginData.groups.map(g => ({
+        group: g.bucket, lines: g.rows.length, cost: g.cost, revenue: g.revenue,
+        revenueSource: g.revenueSource, masterRoom: g.masterRoom, folioRef: g.folioRef, margin: g.margin,
+      })),
+      d140AmountsIncludeVat: d140IncludesVat,
+      vatBasisConfirmed: false,
       d140Period: d140Report.period,
       d140TransactionCount: d140Report.transactions.length,
       d140GrandTotal: d140Report.grandTotal,
@@ -821,7 +1095,7 @@ export default function Reconciliation() {
     if (error) console.error('Failed to save D140 analysis:', error)
     else setD140Saved(true)
     setD140Saving(false)
-  }, [guestMarginData, lastSavedRecId, d140Report])
+  }, [guestMarginData, lastSavedRecId, d140Report, d140IncludesVat])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
@@ -829,12 +1103,15 @@ export default function Reconciliation() {
     if (filter === 'matched') rows = rows.filter(r => r.status === 'matched')
     else if (filter === 'mismatch') rows = rows.filter(r => r.status === 'price_mismatch')
     else if (filter === 'not_found') rows = rows.filter(r => r.status === 'not_found')
+    else if (filter === 'group') rows = rows.filter(r => chargeBucket(noteFor(r.invoiceLine), r.invoiceLine) != null)
     if (searchTerm) {
       const s = searchTerm.toLowerCase()
       rows = rows.filter(r =>
         r.invoiceLine.description?.toLowerCase().includes(s) ||
         r.invoiceLine.ticket?.toLowerCase().includes(s) ||
         r.invoiceLine.guestInfo?.toLowerCase().includes(s) ||
+        noteFor(r.invoiceLine)?.group_name?.toLowerCase().includes(s) ||
+        noteFor(r.invoiceLine)?.note?.toLowerCase().includes(s) ||
         r.order?.department?.name?.toLowerCase().includes(s) ||
         r.order?.staff_name?.toLowerCase().includes(s) ||
         r.order?.guest_name?.toLowerCase().includes(s) ||
@@ -843,7 +1120,7 @@ export default function Reconciliation() {
       )
     }
     return rows
-  }, [result, filter, searchTerm])
+  }, [result, filter, searchTerm, noteFor])
 
   const filteredMissing = useMemo(() => {
     if (!result || !searchTerm) return result?.missingFromInvoice ?? []
@@ -858,10 +1135,62 @@ export default function Reconciliation() {
     )
   }, [result, searchTerm])
 
+  // ── Group & No-room charges: tagged lines + guest lines printed without a room ──
+  const chargeGroups = useMemo(() => {
+    if (!result) return []
+    const map = new Map<string, { bucket: string; groupName: string | null; rows: ReconciliationRow[]; net: number; vat: number; gross: number }>()
+    for (const r of result.rows) {
+      const bucket = chargeBucket(noteFor(r.invoiceLine), r.invoiceLine)
+      if (!bucket) continue
+      if (!map.has(bucket)) map.set(bucket, { bucket, groupName: bucket.startsWith('Group: ') ? bucket.slice(7) : null, rows: [], net: 0, vat: 0, gross: 0 })
+      const g = map.get(bucket)!
+      g.rows.push(r); g.net += r.invoiceLine.net; g.vat += r.invoiceLine.vat; g.gross += r.invoiceLine.gross
+    }
+    // Groups first (A–Z), then house / other / room-added, "not yet assigned" last
+    const rank = (b: string) => b.startsWith('Group: ') ? 0 : b.startsWith('No room') ? 3 : b.startsWith('Room missing') ? 2 : 1
+    return [...map.values()].sort((a, b) => rank(a.bucket) - rank(b.bucket) || a.bucket.localeCompare(b.bucket))
+  }, [result, noteFor])
+
+  // Same groups, flattened for the PDF section and the Excel "Group Charges" sheet
+  const pdfChargeGroups = useMemo<PdfChargeGroup[]>(() => chargeGroups.map(g => {
+    const folio = g.groupName ? groupFolios[g.groupName] : undefined
+    return {
+      bucket: g.bucket, net: +g.net.toFixed(2), vat: +g.vat.toFixed(2), gross: +g.gross.toFixed(2),
+      masterRoom: folio?.master_room ?? null, revenuePosted: folio?.revenue_posted ?? null, folioRef: folio?.folio_ref ?? null,
+      lines: g.rows.map(r => {
+        const n = noteFor(r.invoiceLine)
+        return {
+          date: r.invoiceLine.date,
+          ticket: r.invoiceLine.ticket || (n?.room_override ? `${n.room_override}*` : ''),
+          guest: [r.invoiceLine.guestInfo, r.invoiceLine.serviceNote].filter(Boolean).join(' '),
+          description: r.invoiceLine.description,
+          net: r.invoiceLine.net, vat: r.invoiceLine.vat, gross: r.invoiceLine.gross,
+          note: n?.note ?? '',
+        }
+      }),
+    }
+  }), [chargeGroups, groupFolios, noteFor])
+
+  // Small print per department ("Incl. Group: X £120.00 · No room — not yet assigned £41.70")
+  const chargeDetailByDept = useMemo(() => {
+    const perDept = new Map<string, Map<string, number>>()
+    for (const g of chargeGroups) {
+      for (const r of g.rows) {
+        const dept = r.order?.department?.name || 'Unallocated'
+        if (!perDept.has(dept)) perDept.set(dept, new Map())
+        const m = perDept.get(dept)!
+        m.set(g.bucket, (m.get(g.bucket) ?? 0) + r.invoiceLine.net)
+      }
+    }
+    const out = new Map<string, string>()
+    for (const [dept, m] of perDept) out.set(dept, 'Incl. ' + [...m.entries()].map(([b, v]) => `${b} £${v.toFixed(2)}`).join(' · '))
+    return out
+  }, [chargeGroups])
+
   const departmentDisplayRows = useMemo<DepartmentDisplayRow[]>(() => {
     if (!result) return []
-    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
-  }, [result])
+    return buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, chargeDetailByDept)
+  }, [result, chargeDetailByDept])
 
   // ── Price-discrepancy pattern detector ──
   // Reconciliation should ideally have NO discrepancies. When it does, look for a
@@ -1033,21 +1362,24 @@ export default function Reconciliation() {
       }
 
       // Calculate department breakdown with cost allocation
-      // TopUp only allocated to eligible napkin departments
-      const NAPKIN_TOPUP_DEPTS = ['Kitchen E20 Front', 'Lounge', 'Events']
-      const eligibleSent = Array.from(deptMap.values())
-        .filter(d => NAPKIN_TOPUP_DEPTS.includes(d.name))
-        .reduce((s, d) => s + d.qty, 0)
+      // TopUp uses the fixed NAPKIN_TOPUP_SPLIT — a split department with no orders
+      // this week still gets a (zero-sent) row carrying its share.
+      const topUpShares = splitNapkinTopUp(week.topUpNet)
+      if (week.topUpNet > 0) {
+        const presentNames = new Set(Array.from(deptMap.values()).map(d => d.name))
+        for (const [name] of NAPKIN_TOPUP_SPLIT) {
+          if (!presentNames.has(name)) deptMap.set(`_split:${name}`, { name, qty: 0 })
+        }
+      }
       week.deptBreakdown = Array.from(deptMap.entries()).map(([id, d]) => {
-        const isEligible = NAPKIN_TOPUP_DEPTS.includes(d.name)
-        const pctShare = isEligible && eligibleSent > 0 ? d.qty / eligibleSent * 100 : 0
+        const splitPct = NAPKIN_TOPUP_SPLIT.find(([name]) => name === d.name)?.[1] ?? 0
         const actualCost = +(d.qty * UNIT_RATE).toFixed(2)
-        const topUpAlloc = isEligible ? +(pctShare / 100 * week.topUpNet).toFixed(2) : 0
+        const topUpAlloc = topUpShares.get(d.name) ?? 0
         return {
-          deptId: id === '_none' ? null : id,
+          deptId: id === '_none' || id.startsWith('_split:') ? null : id,
           deptName: d.name,
           sentQty: d.qty,
-          pctShare: Math.round(pctShare * 10) / 10,
+          pctShare: splitPct * 100,
           actualCost,
           topUpAlloc,
           totalCost: +(actualCost + topUpAlloc).toFixed(2),
@@ -1065,20 +1397,22 @@ export default function Reconciliation() {
     }
 
     // Monthly department totals (aggregate across all weeks)
-    const deptTotalMap = new Map<string, { name: string; sent: number; topUp: number; actual: number }>()
+    // Keyed by name: a split department can appear with a null id in weeks it sent nothing
+    const deptTotalMap = new Map<string, { id: string | null; name: string; sent: number; topUp: number; actual: number }>()
     for (const week of weeks) {
       for (const d of week.deptBreakdown) {
-        const key = d.deptId || '_none'
-        if (!deptTotalMap.has(key)) deptTotalMap.set(key, { name: d.deptName, sent: 0, topUp: 0, actual: 0 })
+        const key = d.deptName
+        if (!deptTotalMap.has(key)) deptTotalMap.set(key, { id: d.deptId, name: d.deptName, sent: 0, topUp: 0, actual: 0 })
         const t = deptTotalMap.get(key)!
+        if (!t.id) t.id = d.deptId
         t.sent += d.sentQty
         t.topUp += d.topUpAlloc
         t.actual += d.actualCost
       }
     }
     const totalSentAll = Array.from(deptTotalMap.values()).reduce((s, d) => s + d.sent, 0)
-    const deptTotals = Array.from(deptTotalMap.entries()).map(([id, d]) => ({
-      deptId: id === '_none' ? null : id,
+    const deptTotals = Array.from(deptTotalMap.values()).map(d => ({
+      deptId: d.id,
       deptName: d.name,
       totalSent: d.sent,
       pctShare: totalSentAll > 0 ? Math.round(d.sent / totalSentAll * 1000) / 10 : 0,
@@ -1272,7 +1606,7 @@ export default function Reconciliation() {
 
     let reportPath: string | null = null
     try {
-      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+      const deptRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, chargeDetailByDept)
       const uniformMinWeeksForPdf = uniformMinSummary?.weeks.map(w => ({
         dateRange: w.dateRange,
         items: uniformMinSummary.ITEM_KEYS.map(k => ({
@@ -1303,7 +1637,7 @@ export default function Reconciliation() {
         invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : saveGrandNet * 1.2).toFixed(2),
         systemNet: +result.systemTotal.toFixed(2),
       }
-      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, saveFinancials, reconciliationNote.trim() || undefined)
+      const reportBlob = generateReconciliationPdfBlob(invoice, result, deptRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, saveFinancials, reconciliationNote.trim() || undefined, pdfChargeGroups)
       const rptName = `reports/${ts}-reconciliation-${invoice.invoiceNumber || 'report'}.pdf`
       const { error: rptErr } = await supabase.storage.from('reconciliations').upload(rptName, reportBlob, { contentType: 'application/pdf' })
       if (!rptErr) reportPath = rptName
@@ -1327,7 +1661,9 @@ export default function Reconciliation() {
         notFound: notFoundResolutions,
         missing: missingResolutions,
         challenged: Array.from(challengedItems),
-        lineNotes,
+        // Line notes now live in reconciliation_line_notes; the jsonb copy is kept only
+        // until that table exists (migration not run yet).
+        lineNotes: notesAvailable ? {} : lineNotes,
       } satisfies LineResolutionsSnapshot,
       department_breakdown: result.departmentBreakdown.map(d => ({
         departmentName: d.departmentName, orderCount: d.orderCount,
@@ -1349,6 +1685,44 @@ export default function Reconciliation() {
         .update({ reconciliation_id: savedRec.id })
         .in('id', result.matchedOrderIds)
       if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
+    }
+
+    if (savedRec && notesAvailable && invoice.invoiceNumber) {
+      // Older per-line notes saved in the jsonb snapshot (keyed by notFoundKey) move into
+      // the line-notes table once, so there is a single source of truth from now on.
+      const migrated = { ...noteRowsRef.current }
+      for (const row of result.rows) {
+        const legacy = lineNotes[notFoundKey(row)]
+        const key = lineKeys.get(row.invoiceLine)
+        if (!legacy || !key || migrated[key]) continue
+        const n: LineNote = {
+          invoice_number: invoice.invoiceNumber, line_key: key, line_date: row.invoiceLine.date,
+          ticket: row.invoiceLine.ticket || null, guest_label: row.invoiceLine.guestInfo ?? null,
+          description: row.invoiceLine.description || null, net: row.invoiceLine.net,
+          charge_type: 'note', room_override: null, group_name: null, note: legacy, order_id: null,
+          updated_by: user?.email ?? null,
+        }
+        if (!(await upsertLineNote(n))) migrated[key] = n
+      }
+
+      // Copy each tag onto its matched order as ONE plain line (no internal keys or guest
+      // names — order notes appear in staff status emails and on the tablet). Done on Save
+      // only; the authoritative link stays in reconciliation_line_notes.
+      const prefix = `Reconciliation ${invoice.invoiceNumber}:`
+      for (const row of result.rows) {
+        const key = lineKeys.get(row.invoiceLine)
+        const n = key ? migrated[key] : undefined
+        if (!n || !row.order) continue
+        const text = `${prefix} ${chargeLabel(n)}${n.note ? ` — ${n.note}` : ''}`
+        const kept = (row.order.notes ?? '').split('\n').filter(l => !l.startsWith(prefix))
+        const newNotes = [...kept, text].filter(l => l.trim()).join('\n')
+        if (newNotes === (row.order.notes ?? '')) continue
+        const { error: noteErr } = await supabase.from('orders').update({ notes: newNotes }).eq('id', row.order.id)
+        if (noteErr) { console.error('Failed to copy line note to order:', noteErr); continue }
+        await supabase.from('reconciliation_line_notes').update({ mirrored_to_order_at: new Date().toISOString() })
+          .eq('invoice_number', invoice.invoiceNumber).eq('line_key', n.line_key)
+      }
+      applyNoteRows(migrated)
     }
 
     if (savedRec) {
@@ -1404,7 +1778,7 @@ export default function Reconciliation() {
     setSaving(false); setSaved(true); loadHistory()
     // Prompt for D140 upload after saving a guest invoice
     if (invoice.sections.some(s => s.type === 'guest')) setShowD140Prompt(true)
-  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote, notFoundResolutions, missingResolutions, challengedItems, lineNotes])
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote, notFoundResolutions, missingResolutions, challengedItems, lineNotes, notesAvailable, lineKeys, chargeDetailByDept, pdfChargeGroups])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1514,7 +1888,7 @@ export default function Reconciliation() {
     summarySheet['!cols'] = [{ wch: 25 }, { wch: 15 }, { wch: 12 }, { wch: 15 }]
     utils.book_append_sheet(wb, summarySheet, 'Summary')
 
-    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows)
+    const deptDisplayRows = buildDepartmentDisplayRows(result.departmentBreakdown, result.rows, chargeDetailByDept)
     const deptExcelRows: Record<string, string | number>[] = deptDisplayRows.map(row => ({
       'Department': row.departmentName,
       'Line': row.subDetail ? `${row.lineLabel} — ${row.subDetail}` : row.lineLabel,
@@ -1552,7 +1926,29 @@ export default function Reconciliation() {
       'Difference (\u00a3)': r.order ? +r.difference.toFixed(2) : '',
       'Resolution': r.status === 'not_found' ? (notFoundResolutions[notFoundKey(r)]?.type || '') : '',
       'Staff/Guest': r.order?.staff_name || r.order?.guest_name || '',
+      'Invoice Guest': [r.invoiceLine.guestInfo?.replace(/[()]/g, ''), r.invoiceLine.serviceNote].filter(Boolean).join(' '),
+      'Charge to': (() => { const n = noteFor(r.invoiceLine); return n && n.charge_type !== 'note' ? chargeLabel(n) : (!r.invoiceLine.ticket && r.sectionType === 'guest_laundry' ? 'No room — not yet assigned' : '') })(),
+      'Line note': noteFor(r.invoiceLine)?.note || lineNotes[notFoundKey(r)] || '',
     }))), 'Detailed Items')
+
+    // Group & No-room charges — per-group subtotals with the revenue posted to Opera, so
+    // accounts can check the group master folio against what Goldstar charged.
+    if (pdfChargeGroups.length > 0) {
+      const gRows: Record<string, string | number>[] = []
+      for (const g of pdfChargeGroups) {
+        for (const l of g.lines) gRows.push({
+          'Charge to': g.bucket, 'Date': l.date, 'Room': l.ticket, 'Invoice Guest': l.guest,
+          'Description': l.description, 'NET (£)': +l.net.toFixed(2), 'VAT (£)': +l.vat.toFixed(2), 'GROSS (£)': +l.gross.toFixed(2),
+          'Line note': l.note, 'Master room': '', 'Revenue posted (£)': '', 'Folio ref': '',
+        })
+        gRows.push({
+          'Charge to': `SUBTOTAL — ${g.bucket}`, 'Date': '', 'Room': '', 'Invoice Guest': `${g.lines.length} line(s)`,
+          'Description': '', 'NET (£)': g.net, 'VAT (£)': g.vat, 'GROSS (£)': g.gross, 'Line note': '',
+          'Master room': g.masterRoom ?? '', 'Revenue posted (£)': g.revenuePosted ?? '', 'Folio ref': g.folioRef ?? '',
+        })
+      }
+      utils.book_append_sheet(wb, utils.json_to_sheet(gRows), 'Group Charges')
+    }
 
     if (result.topUpCharges.length > 0) {
       const topUpRows = result.topUpCharges.map(l => ({
@@ -1569,6 +1965,7 @@ export default function Reconciliation() {
       'Issue': 'Price Discrepancy', 'Docket': r.invoiceLine.ticket, 'Department': r.order?.department?.name || '',
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': +r.systemTotal.toFixed(2),
       'Difference (\u00a3)': +r.difference.toFixed(2), 'Description': r.invoiceLine.description,
+      'Line note': noteFor(r.invoiceLine)?.note || lineNotes[notFoundKey(r)] || '',
       'Recommended Action': 'Verify pricing with Goldstar / update system prices',
     }))
     result.rows.filter(r => r.status === 'not_found').forEach(r => discRows.push({
@@ -1576,6 +1973,8 @@ export default function Reconciliation() {
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': 0,
       'Difference (\u00a3)': +r.invoiceLine.net.toFixed(2), 'Description': r.invoiceLine.description,
       'Resolution': notFoundResolutions[notFoundKey(r)]?.type || 'Unresolved',
+      'Charge to': (() => { const n = noteFor(r.invoiceLine); return n && n.charge_type !== 'note' ? chargeLabel(n) : '' })(),
+      'Line note': noteFor(r.invoiceLine)?.note || lineNotes[notFoundKey(r)] || '',
       'Recommended Action': 'Add to system / accept charge / challenge with supplier',
     }))
     result.missingFromInvoice.forEach(o => discRows.push({
@@ -1589,7 +1988,7 @@ export default function Reconciliation() {
     if (discRows.length > 0) utils.book_append_sheet(wb, utils.json_to_sheet(discRows), 'Discrepancies & Actions')
 
     writeFile(wb, `accounting-report-${invoice.invoiceNumber || 'reconciliation'}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`)
-  }, [result, invoice, notFoundResolutions, missingResolutions, reconciliationNote])
+  }, [result, invoice, notFoundResolutions, missingResolutions, reconciliationNote, noteFor, lineNotes, pdfChargeGroups, chargeDetailByDept])
 
   const statusIcon = (s: ReconciliationRow['status'], minor = false) => {
     if (s === 'matched') return <CheckCircle className="w-4 h-4 text-green-500" />
@@ -1742,7 +2141,7 @@ export default function Reconciliation() {
         room_number: orderType === 'guest_laundry' ? row.invoiceLine.ticket : null,
         status: 'received',
         total_price: +row.invoiceLine.net.toFixed(2),
-        notes: `Added from invoice reconciliation — ${invoice.invoiceNumber} [ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`,
+        notes: `Added from invoice reconciliation — ${invoice.invoiceNumber} ${refKeyMap.get(row.invoiceLine)?.[0] ?? `[ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`}`,
         created_at: createdAt,
       }).select().single()
 
@@ -1800,7 +2199,7 @@ export default function Reconciliation() {
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile])
+  }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile, refKeyMap])
 
   // ── Action: Link this invoice line to an EXISTING order ──
   // Used when the order is already in the system but wasn't matched (wrong/changed ticket
@@ -1814,7 +2213,7 @@ export default function Reconciliation() {
     try {
       const target = orders.find(o => o.id === addModalLinkOrderId) ?? addModalLinkDbResults.find(o => o.id === addModalLinkOrderId)
       if (!target) throw new Error('Selected order not found')
-      const refKey = `[ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`
+      const refKey = refKeyMap.get(row.invoiceLine)?.[0] ?? `[ref:${row.invoiceLine.ticket}|${row.invoiceLine.date}|${row.invoiceLine.net}]`
 
       // Re-linking: remove this line's ref-key from any OTHER order that carries it,
       // so the old link can't shadow the new one on the next matching pass.
@@ -1883,7 +2282,7 @@ export default function Reconciliation() {
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, addModalLinkDept, orders, addModalLinkDbResults, refetchAndReconcile])
+  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, addModalLinkDept, orders, addModalLinkDbResults, refetchAndReconcile, refKeyMap])
 
   // ── Open the Add/Link modal for ANY row (not-found, mismatch, or matched) ──
   // Lets the user link/relink a line to the right order (by docket, room, name…) and add
@@ -2041,8 +2440,8 @@ export default function Reconciliation() {
       invoiceGross: +(invoice.totals.gross > 0 ? invoice.totals.gross : pdfGrandNet * 1.2).toFixed(2),
       systemNet: +result.systemTotal.toFixed(2),
     }
-    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, pdfFinancials, reconciliationNote.trim() || undefined)
-  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary, reconciliationNote])
+    downloadReconciliationPdf(invoice, result, departmentDisplayRows, napkinSummary?.deptTotals, uniformMinWeeksForPdf, napkinWeeksForPdf, pdfFinancials, reconciliationNote.trim() || undefined, pdfChargeGroups)
+  }, [result, invoice, departmentDisplayRows, napkinSummary, uniformMinSummary, reconciliationNote, pdfChargeGroups])
 
   // ── Resolution badge helper ──
   function resolutionBadge(type: ResolutionType) {
@@ -2508,6 +2907,9 @@ export default function Reconciliation() {
                   </tr></tfoot>
                 </table>
               </div>
+              <div className="px-5 py-2 text-xs text-gray-500 border-t border-gray-100">
+                % Share = share of napkins sent. TopUp (unused minimum) split fixed: {NAPKIN_TOPUP_SPLIT.map(([name, pct]) => `${name} ${Math.round(pct * 100)}%`).join(' · ')}
+              </div>
             </div>
           )}
         </div>
@@ -2602,6 +3004,80 @@ export default function Reconciliation() {
         </div>
       )}
 
+      {/* Group & No-room charges — lines without a room, and lines tagged as group / house / other */}
+      {(chargeGroups.length > 0 || unattachedNotes.length > 0) && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="px-5 py-3 border-b border-gray-200 flex items-center gap-2">
+            <Tag className="w-4 h-4 text-indigo-600" />
+            <h3 className="text-sm font-semibold text-gray-900">Group & No-room Charges</h3>
+            <span className="text-xs text-gray-500">{'—'} for accounts to cross-check against the group master folio / room charges in Opera</span>
+          </div>
+          {!notesAvailable && (
+            <div className="px-5 py-2.5 bg-amber-50 text-xs text-amber-800 border-b border-amber-100">
+              Tags can{'’'}t be saved yet: run <span className="font-mono">db/migrations/2026-11-05_reconciliation_line_notes.sql</span> in the Supabase SQL Editor.
+            </div>
+          )}
+          {chargeGroups.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-gray-200 bg-gray-50 text-xs">
+                  <th className="px-4 py-2 text-left font-medium text-gray-600">Charge to</th>
+                  <th className="px-3 py-2 text-right font-medium text-gray-600">Lines</th>
+                  <th className="px-3 py-2 text-right font-medium text-gray-600">NET</th>
+                  <th className="px-3 py-2 text-right font-medium text-gray-600">VAT</th>
+                  <th className="px-3 py-2 text-right font-medium text-gray-600">GROSS</th>
+                  <th className="px-3 py-2 text-left font-medium text-gray-600" title="Opera group master folio room number — D140 postings on it are matched to this group">Master room</th>
+                  <th className="px-3 py-2 text-left font-medium text-gray-600" title="Revenue posted to Opera for this group (used when there is no D140 master-room match)">Revenue posted {'£'}</th>
+                  <th className="px-3 py-2 text-left font-medium text-gray-600">Folio ref</th>
+                </tr></thead>
+                <tbody>
+                  {chargeGroups.map(g => {
+                    const folio = g.groupName ? groupFolios[g.groupName] : undefined
+                    const cell = 'w-full px-2 py-1 text-xs border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-navy/30 disabled:bg-gray-50'
+                    return (
+                      <tr key={g.bucket} className={`border-b border-gray-100 ${g.bucket.startsWith('No room') ? 'bg-amber-50/50' : ''}`}>
+                        <td className="px-4 py-2">
+                          <button onClick={() => setFilter('group')} className="font-medium text-gray-800 hover:text-navy text-left">{g.bucket}</button>
+                        </td>
+                        <td className="px-3 py-2 text-right">{g.rows.length}</td>
+                        <td className="px-3 py-2 text-right font-medium">{'£'}{g.net.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right">{'£'}{g.vat.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right">{'£'}{g.gross.toFixed(2)}</td>
+                        {g.groupName ? (<>
+                          <td className="px-3 py-1.5 w-28"><input key={`mr-${g.groupName}-${folio?.master_room ?? ''}`} defaultValue={folio?.master_room ?? ''} disabled={!notesAvailable} placeholder="e.g. 9001"
+                            onBlur={e => { const v = e.target.value.trim().toUpperCase() || null; if (v !== (folio?.master_room ?? null)) saveGroupFolio(g.groupName!, { master_room: v }) }} className={cell} /></td>
+                          <td className="px-3 py-1.5 w-32"><input key={`rv-${g.groupName}-${folio?.revenue_posted ?? ''}`} defaultValue={folio?.revenue_posted ?? ''} disabled={!notesAvailable} inputMode="decimal" placeholder="0.00"
+                            onBlur={e => { const raw = e.target.value.replace(/[£,\s]/g, ''); const v = raw ? Number(raw) : null; if (v != null && isNaN(v)) return; if (v !== (folio?.revenue_posted ?? null)) saveGroupFolio(g.groupName!, { revenue_posted: v }) }} className={cell} /></td>
+                          <td className="px-3 py-1.5 w-36"><input key={`fr-${g.groupName}-${folio?.folio_ref ?? ''}`} defaultValue={folio?.folio_ref ?? ''} disabled={!notesAvailable} placeholder="Opera folio"
+                            onBlur={e => { const v = e.target.value.trim() || null; if (v !== (folio?.folio_ref ?? null)) saveGroupFolio(g.groupName!, { folio_ref: v }) }} className={cell} /></td>
+                        </>) : (
+                          <td colSpan={3} className="px-3 py-2 text-xs text-gray-400">
+                            {g.bucket.startsWith('No room') ? 'Use “Assign room / group” on each line' : '—'}
+                          </td>
+                        )}
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {unattachedNotes.length > 0 && (
+            <div className="px-5 py-3 border-t border-gray-200 bg-gray-50/60">
+              <p className="text-xs font-medium text-gray-700 mb-1.5">Notes whose invoice line no longer appears ({unattachedNotes.length}) {'—'} e.g. a corrected invoice changed the date or amount</p>
+              <div className="space-y-1">
+                {unattachedNotes.map(n => (
+                  <div key={n.line_key} className="flex items-center justify-between gap-3 text-xs text-gray-600">
+                    <span>{n.line_date} {n.ticket || ''} {n.guest_label || ''} {'£'}{(n.net ?? 0).toFixed(2)} {'—'} <span className="font-medium">{chargeLabel(n)}</span>{n.note ? `: ${n.note}` : ''}</span>
+                    <button onClick={() => removeUnattachedNote(n)} className="text-red-500 hover:text-red-700">Remove</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Search + Filter tabs */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="relative">
@@ -2622,7 +3098,8 @@ export default function Reconciliation() {
       <div className="flex gap-1.5 bg-gray-100 rounded-lg p-1 w-fit">
         {([['all', 'All', result.rows.length], ['matched', 'Matched', result.stats.matched],
           ['mismatch', 'Price Discrepancy', result.stats.priceMismatch], ['not_found', 'On Invoice Only', result.stats.notFound],
-          ['missing', 'In System Only', result.stats.missing]] as [FilterTab, string, number][]).map(([key, label, count]) => (
+          ['missing', 'In System Only', result.stats.missing],
+          ...(chargeGroups.length > 0 ? [['group', 'Group / No-room', chargeGroups.reduce((s, g) => s + g.rows.length, 0)]] : [])] as [FilterTab, string, number][]).map(([key, label, count]) => (
           <button key={key} onClick={() => setFilter(key)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${filter === key ? 'bg-white text-navy shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}
           >{label} ({count})</button>
@@ -2659,7 +3136,10 @@ export default function Reconciliation() {
                     : false
                 // Note attached to this line (this session, a restored save, or stamped on
                 // the linked order's notes) — flagged so it resurfaces on re-reconciliation.
-                const rowNote = lineNotes[nfKey]
+                const tag = noteFor(row.invoiceLine)
+                const noRoomGuest = !row.invoiceLine.ticket && row.sectionType === 'guest_laundry'
+                const rowNote = tag?.note
+                  || lineNotes[nfKey]
                   || nfRes?.note
                   || row.order?.notes?.match(/Note:\s*([^[]+)/)?.[1]?.trim()
                 return (
@@ -2682,6 +3162,26 @@ export default function Reconciliation() {
                         <StickyNote className="w-3.5 h-3.5 text-amber-500" />
                       </span>
                     )}
+                    <div className="mt-1 flex items-center gap-1 flex-wrap font-sans">
+                      {tag && tag.charge_type !== 'note' && (
+                        <button onClick={() => openNoteModal(row)} title={tag.note || 'Edit charge-to tag'}
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${tag.charge_type === 'group' ? 'bg-indigo-50 text-indigo-700' : tag.charge_type === 'room_missing' ? 'bg-sky-50 text-sky-700' : 'bg-gray-100 text-gray-700'}`}>
+                          {chargeLabel(tag)}
+                        </button>
+                      )}
+                      {noRoomGuest && !tag ? (
+                        <button onClick={() => openNoteModal(row)}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-800 hover:bg-amber-200"
+                          title="No room on the invoice: add the room, pick the guest, or tag it as a group / house charge">
+                          Assign room / group
+                        </button>
+                      ) : (!tag || tag.charge_type === 'note') && (
+                        <button onClick={() => openNoteModal(row)} className="p-0.5 rounded text-gray-300 hover:text-navy hover:bg-gray-100"
+                          title={tag ? 'Edit note' : 'Add a note / charge-to tag to this line'}>
+                          <Tag className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   </td>
                   <td className="px-3 py-2.5 text-gray-600">{row.order?.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-700 max-w-[220px] truncate" title={row.invoiceLine.description}>{row.invoiceLine.description}</td>
@@ -2915,9 +3415,12 @@ export default function Reconciliation() {
 
       {/* Grand totals */}
       <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-6">
+        <div className="grid grid-cols-2 sm:grid-cols-6 gap-6">
           <div><p className="text-xs text-gray-500 mb-1">Invoice Total (NET)</p>
             <p className="text-lg font-bold text-gray-900">{'\u00a3'}{invoice.totals.net > 0 ? invoice.totals.net.toFixed(2) : grandInvoiceNet.toFixed(2)}</p></div>
+          <div><p className="text-xs text-gray-500 mb-1">Invoice VAT</p>
+            <p className="text-lg font-bold text-gray-900">{'\u00a3'}{invoice.totals.vat > 0 ? invoice.totals.vat.toFixed(2) : ((invoice.totals.net > 0 ? invoice.totals.net : grandInvoiceNet) * 0.2).toFixed(2)}</p>
+            {!(invoice.totals.vat > 0) && <p className="text-xs text-gray-400 mt-0.5">estimated at 20%</p>}</div>
           <div><p className="text-xs text-gray-500 mb-1">Invoice Total (GROSS)</p>
             <p className="text-lg font-bold text-gray-900">{'\u00a3'}{invoice.totals.gross > 0 ? invoice.totals.gross.toFixed(2) : (grandInvoiceNet * 1.2).toFixed(2)}</p></div>
           <div><p className="text-xs text-gray-500 mb-1">System Total (NET)</p>
@@ -3054,6 +3557,148 @@ export default function Reconciliation() {
         </div>
       )}
 
+      {/* ── Line note / "Charge to" modal ── */}
+      {noteModal && (() => {
+        const line = noteModal.invoiceLine
+        const f = noteForm
+        const existing = noteFor(line)
+        const lineDay = invoiceLineDay(line.date)
+        // Which invoice line each order is currently matched to (to warn before re-using it)
+        const matchedTo = new Map<string, ReconciliationRow>()
+        for (const r of result?.rows ?? []) if (r.order && r.invoiceLine !== line) matchedTo.set(r.order.id, r)
+        const term = noteCandidateSearch.trim().toLowerCase()
+        const candidates = noteCandidates
+          .filter(o => !term || [o.guest_name, o.room_number, o.docket_number].some(v => v?.toLowerCase().includes(term)))
+          .map(o => ({ o, nameHit: guestNameSimilar(line.guestInfo, o.guest_name), free: !matchedTo.has(o.id), days: lineDay == null ? 0 : Math.abs(orderDay(o) - lineDay), cost: computeOrderCost(o) }))
+          // Similar name → not already matched to another line → closest date → closest amount
+          .sort((a, b) => Number(b.nameHit) - Number(a.nameHit) || Number(b.free) - Number(a.free) || a.days - b.days || Math.abs(a.cost - line.net) - Math.abs(b.cost - line.net))
+          .slice(0, 12)
+        // Opera D140 postings from the invoice month ±1 day (only when a D140 has been loaded)
+        const pStart = parsedPeriod ? Math.floor(parsedPeriod.start.getTime() / DAY_MS) - 1 : null
+        const pEnd = parsedPeriod ? Math.floor(parsedPeriod.end.getTime() / DAY_MS) + 1 : null
+        const d140Cands = (d140Report?.transactions ?? [])
+          .filter(t => { if (t.isCredit) return false; const d = d140Day(t.date); return d == null || pStart == null || pEnd == null || (d >= pStart && d <= pEnd) })
+          .filter(t => !term || t.guestName.toLowerCase().includes(term) || t.roomNumber.includes(term))
+          .map(t => ({ t, nameHit: guestNameSimilar(line.guestInfo, t.guestName), days: lineDay == null ? 0 : Math.abs((d140Day(t.date) ?? lineDay) - lineDay) }))
+          .sort((a, b) => Number(b.nameHit) - Number(a.nameHit) || a.days - b.days || Math.abs(a.t.amount - line.gross) - Math.abs(b.t.amount - line.gross))
+          .slice(0, 6)
+        const types: ChargeType[] = noteModal.sectionType === 'guest_laundry' ? ['room_missing', 'group', 'house', 'other', 'note'] : ['note', 'other']
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !noteSaving && setNoteModal(null)}>
+            <div className="bg-white rounded-xl shadow-xl max-w-2xl w-full mx-4 max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+              <div className="p-5 border-b border-gray-200 flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold text-gray-900">Charge to / note</h3>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {line.date} {'·'} <span className="font-mono">{line.ticket || 'no room'}</span> {line.guestInfo} {line.serviceNote && <span className="px-1 rounded bg-amber-50 text-amber-700">{line.serviceNote}</span>} {'·'} {'£'}{line.net.toFixed(2)} net
+                  </p>
+                  <p className="text-xs text-gray-400 mt-0.5 truncate max-w-[34rem]" title={line.description}>{line.description}</p>
+                </div>
+                <button onClick={() => setNoteModal(null)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
+              </div>
+              <div className="flex-1 overflow-auto p-5 space-y-4">
+                <div className="flex flex-wrap gap-1.5">
+                  {types.map(t => (
+                    <button key={t} onClick={() => setNoteForm(prev => ({ ...prev, type: t }))}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border ${f.type === t ? 'bg-navy text-white border-navy' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}`}>
+                      {CHARGE_TYPE_LABELS[t]}
+                    </button>
+                  ))}
+                </div>
+
+                {f.type === 'room_missing' && (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Room number (Goldstar left it off the invoice)</label>
+                      <input value={f.room} onChange={e => setNoteForm(prev => ({ ...prev, room: e.target.value, orderId: null }))} placeholder="e.g. 515"
+                        className="w-40 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                      {f.orderId && <span className="ml-2 text-xs text-green-700">Linked to the selected guest order</span>}
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="text-xs font-medium text-gray-700">Who could it be? Guest orders from the invoice month {'±'}1 day</label>
+                        <input value={noteCandidateSearch} onChange={e => setNoteCandidateSearch(e.target.value)} placeholder="Filter name / room"
+                          className="px-2 py-1 text-xs border border-gray-300 rounded w-40 focus:outline-none focus:ring-1 focus:ring-navy/30" />
+                      </div>
+                      <div className="border border-gray-200 rounded-lg divide-y divide-gray-100 max-h-56 overflow-auto">
+                        {candidates.length === 0 && <p className="px-3 py-3 text-xs text-gray-400">No guest orders found{term ? ' for this filter' : ''}.</p>}
+                        {candidates.map(({ o, nameHit, days, cost }) => {
+                          const other = matchedTo.get(o.id)
+                          const selected = f.orderId === o.id
+                          return (
+                            <button key={o.id} onClick={() => setNoteForm(prev => ({ ...prev, orderId: o.id, room: o.room_number || o.docket_number || '' }))}
+                              className={`w-full text-left px-3 py-2 text-xs flex items-center gap-3 hover:bg-gray-50 ${selected ? 'bg-sky-50' : ''}`}>
+                              <span className="w-16 text-gray-500">{format(new Date(o.created_at), 'dd/MM/yy')}</span>
+                              <span className="w-12 font-mono font-medium text-navy">{o.room_number || o.docket_number}</span>
+                              <span className={`flex-1 truncate ${nameHit ? 'font-semibold text-gray-900' : 'text-gray-700'}`}>{o.guest_name || '—'}</span>
+                              <span className="w-16 text-right">{'£'}{cost.toFixed(2)}</span>
+                              <span className={`w-28 text-right ${other ? 'text-amber-700' : 'text-gray-400'}`}>
+                                {other ? `matched to ${other.invoiceLine.date}` : days === 0 ? 'same day' : `${days}d away`}
+                              </span>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    {d140Cands.length > 0 && (
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1.5">Opera D140 charges (invoice month {'±'}1 day) {'—'} click to use the room</label>
+                        <div className="border border-gray-200 rounded-lg divide-y divide-gray-100">
+                          {d140Cands.map(({ t, nameHit }, i) => (
+                            <button key={i} onClick={() => setNoteForm(prev => ({ ...prev, room: t.roomNumber, orderId: null }))}
+                              className="w-full text-left px-3 py-2 text-xs flex items-center gap-3 hover:bg-gray-50">
+                              <span className="w-16 text-gray-500">{t.date}</span>
+                              <span className="w-12 font-mono font-medium text-navy">{t.roomNumber}</span>
+                              <span className={`flex-1 truncate ${nameHit ? 'font-semibold text-gray-900' : 'text-gray-700'}`}>{t.guestName}</span>
+                              <span className="w-16 text-right">{'£'}{t.amount.toFixed(2)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(f.type === 'group' || f.type === 'house' || f.type === 'other') && (
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">
+                      {f.type === 'group' ? 'Group name' : 'Account / label (optional)'}
+                    </label>
+                    <input value={f.group} onChange={e => setNoteForm(prev => ({ ...prev, group: e.target.value }))} list="known-groups"
+                      placeholder={f.type === 'group' ? 'e.g. Arsenal WFC' : 'e.g. Spa, Front office'}
+                      className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                    <datalist id="known-groups">{knownGroups.map(g => <option key={g} value={g} />)}</datalist>
+                    {f.type === 'group' && <p className="text-[11px] text-gray-400 mt-1">Use the same spelling each time {'—'} lines are totalled per group name. Set the group{'’'}s Opera master room in the Group & No-room panel.</p>}
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Note {f.type !== 'note' && <span className="text-gray-400 font-normal">(optional)</span>}</label>
+                  <textarea value={f.note} onChange={e => setNoteForm(prev => ({ ...prev, note: e.target.value }))} rows={2}
+                    placeholder="Shown on this line, in the Excel / PDF, and copied to the matched order when you Save"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                </div>
+                {noteError && <p className="text-xs text-red-600">{noteError}</p>}
+              </div>
+              <div className="p-4 border-t border-gray-200 flex items-center justify-between gap-2">
+                <div>
+                  {existing && (
+                    <button onClick={() => saveLineNote(true)} disabled={noteSaving} className="px-3 py-2 text-sm text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-50">Remove tag</button>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setNoteModal(null)} disabled={noteSaving} className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">Cancel</button>
+                  <button onClick={() => saveLineNote(false)} disabled={noteSaving}
+                    className="px-4 py-2 text-sm font-medium text-white bg-navy rounded-lg hover:bg-navy-light disabled:opacity-50">
+                    {noteSaving ? 'Saving…' : 'Save'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* ── D140 Opera Report Modal (post-save for guest invoices) ── */}
       {showD140Prompt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowD140Prompt(false)}>
@@ -3084,6 +3729,13 @@ export default function Reconciliation() {
                 </div>
               ) : guestMarginData && (
                 <div className="overflow-x-auto">
+                  <div className="px-4 py-2 bg-amber-50 border-b border-amber-100 flex items-center justify-between gap-3 text-xs text-amber-800">
+                    <span>Margin VAT basis <strong>unconfirmed</strong> {'—'} check with accounts whether D140 amounts include VAT.</span>
+                    <label className="flex items-center gap-1.5 whitespace-nowrap cursor-pointer">
+                      <input type="checkbox" checked={d140IncludesVat} onChange={e => setD140IncludesVat(e.target.checked)} />
+                      D140 amounts include VAT
+                    </label>
+                  </div>
                   <table className="w-full text-sm">
                     <thead><tr className="border-b border-gray-200 bg-gray-50">
                       <th className="px-3 py-2.5 text-left font-medium text-gray-600">Room</th>
@@ -3097,7 +3749,7 @@ export default function Reconciliation() {
                     <tbody>
                       {guestMarginData.matched.map((m, i) => (
                         <tr key={i} className="border-b border-gray-100">
-                          <td className="px-3 py-2 font-mono font-medium text-navy">{m.invoiceLine.invoiceLine.ticket}</td>
+                          <td className="px-3 py-2 font-mono font-medium text-navy">{m.room}{!m.invoiceLine.invoiceLine.ticket && <span className="text-sky-600" title="Room added in the reconciliation (missing on the invoice)">*</span>}</td>
                           <td className="px-3 py-2 text-gray-700">{m.d140.guestName}</td>
                           <td className="px-3 py-2 text-gray-500">{m.invoiceLine.invoiceLine.date}</td>
                           <td className="px-3 py-2 text-right">{'\u00a3'}{m.invoiceLine.invoiceLine.net.toFixed(2)}</td>
@@ -3106,6 +3758,22 @@ export default function Reconciliation() {
                           <td className={`px-3 py-2 text-right font-medium ${m.marginPct < 35 ? 'text-red-600' : m.marginPct < 40 ? 'text-amber-600' : 'text-green-600'}`}>
                             {m.marginPct.toFixed(1)}%
                           </td>
+                        </tr>
+                      ))}
+                      {guestMarginData.groups.map(g => (
+                        <tr key={`grp-${g.bucket}`} className="border-b border-gray-100 bg-indigo-50/40">
+                          <td className="px-3 py-2 font-mono text-indigo-700">{g.masterRoom || '—'}</td>
+                          <td className="px-3 py-2 text-gray-800 font-medium" colSpan={2}>
+                            {g.bucket} <span className="text-xs font-normal text-gray-500">{'·'} {g.rows.length} line{g.rows.length !== 1 ? 's' : ''}{g.folioRef ? ` · folio ${g.folioRef}` : ''}{g.revenueSource ? ` · ${g.revenueSource}` : ''}</span>
+                          </td>
+                          <td className="px-3 py-2 text-right">{'£'}{g.cost.toFixed(2)}</td>
+                          {g.revenue != null ? (<>
+                            <td className="px-3 py-2 text-right font-medium">{'£'}{g.revenue.toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-green-600 font-medium">{'£'}{(g.margin ?? 0).toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-gray-500">{g.revenue > 0 ? `${(((g.margin ?? 0) / (g.revenue / (d140IncludesVat ? 1.2 : 1))) * 100).toFixed(1)}%` : '—'}</td>
+                          </>) : (
+                            <td className="px-3 py-2 text-right text-indigo-700 text-xs" colSpan={3}>Set the master room or revenue posted in the Group & No-room panel</td>
+                          )}
                         </tr>
                       ))}
                       {guestMarginData.invoiceOnly.map((row, i) => (

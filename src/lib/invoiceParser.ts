@@ -878,6 +878,33 @@ export function guestNameMatches(guestInfo: string | null | undefined, storedNam
   return keys.some(k => words.some(w => w.startsWith(k) || k.startsWith(w)))
 }
 
+/**
+ * Looser "could be the same person" test for ranking suggestions only (never auto-match):
+ * guestNameMatches, or the letters-only names within 2 edits of each other, so Goldstar's
+ * garbled spellings ("M HOMMED", "MOBA MMED", "MUHAMED") still rank "Mohammed" first.
+ */
+export function guestNameSimilar(guestInfo: string | null | undefined, storedName: string | null | undefined): boolean {
+  if (guestNameMatches(guestInfo, storedName)) return true
+  // Letters only, keeping 1-2 letter fragments of a wrapped name ("M HOMMED" → "mhommed")
+  const a = String(guestInfo ?? '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/)
+    .filter(t => t && !NAME_NOISE.has(t) && !['ex', 'gt'].includes(t)).join('')
+  const words = String(storedName ?? '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(w => w.length >= 3)
+  if (a.length < 4) return false
+  const allowed = a.length >= 7 ? 3 : Math.floor(a.length / 3) // 4-5 letters: 1 edit, 6: 2
+  return words.some(w => w.length >= 4 && editDistance(a, w) <= allowed)
+}
+
+function editDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 3) return 4
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    prev = cur
+  }
+  return prev[b.length]
+}
+
 // ── Period parsing ──
 
 export function parseInvoicePeriod(period: string): { start: Date; end: Date } | null {

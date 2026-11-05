@@ -72,6 +72,18 @@ export interface NapkinWeekSummary {
   deptBreakdown: { deptName: string; sentQty: number; topUpAlloc: number; totalCost: number }[]
 }
 
+/** "Group & No-room Charges" section: tagged lines grouped for the accounts cross-check. */
+export interface PdfChargeGroup {
+  bucket: string
+  lines: { date: string; ticket: string; guest: string; description: string; net: number; vat: number; gross: number; note: string }[]
+  net: number
+  vat: number
+  gross: number
+  masterRoom?: string | null
+  revenuePosted?: number | null
+  folioRef?: string | null
+}
+
 export interface FinancialTotals {
   lineItemsNet: number
   topUpNet: number
@@ -89,7 +101,8 @@ export function generateReconciliationPdf(
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
   financials?: FinancialTotals,
-  notes?: string
+  notes?: string,
+  chargeGroups?: PdfChargeGroup[]
 ): jsPDF {
   const doc = new jsPDF()
   const pageWidth = doc.internal.pageSize.getWidth()
@@ -432,6 +445,44 @@ export function generateReconciliationPdf(
     }
   }
 
+  // ── Group & No-room Charges (lines tagged in the reconciliation) ──
+  if (chargeGroups && chargeGroups.length > 0) {
+    y = Math.max(y, (doc as any).lastAutoTable?.finalY ?? y)
+    if (y > doc.internal.pageSize.getHeight() - 60) { doc.addPage(); y = 20 }
+    y += 8
+    doc.setTextColor(NAVY)
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.text('Group & No-room Charges', 14, y)
+    y += 2
+    const body: (string | { content: string; colSpan?: number; styles?: Record<string, unknown> })[][] = []
+    for (const g of chargeGroups) {
+      const folio = [
+        g.masterRoom ? `Master room ${g.masterRoom}` : '',
+        g.revenuePosted != null ? `Revenue posted £${g.revenuePosted.toFixed(2)}` : '',
+        g.folioRef ? `Folio ${g.folioRef}` : '',
+      ].filter(Boolean).join(' · ')
+      body.push([
+        { content: `${g.bucket} — ${g.lines.length} line${g.lines.length !== 1 ? 's' : ''}${folio ? `  (${folio})` : ''}`, colSpan: 4, styles: { fontStyle: 'bold', fillColor: LIGHT_GRAY } },
+        { content: `£${g.net.toFixed(2)}`, styles: { fontStyle: 'bold', fillColor: LIGHT_GRAY, halign: 'right' } },
+        { content: `£${g.vat.toFixed(2)}`, styles: { fontStyle: 'bold', fillColor: LIGHT_GRAY, halign: 'right' } },
+        { content: `£${g.gross.toFixed(2)}`, styles: { fontStyle: 'bold', fillColor: LIGHT_GRAY, halign: 'right' } },
+      ])
+      for (const l of g.lines) {
+        body.push([l.date, [l.ticket, l.guest].filter(Boolean).join(' '), l.description, l.note || '—', `£${l.net.toFixed(2)}`, `£${l.vat.toFixed(2)}`, `£${l.gross.toFixed(2)}`])
+      }
+    }
+    autoTable(doc, {
+      startY: y + 3,
+      head: [['Date', 'Room / Guest', 'Description', 'Note', 'NET (£)', 'VAT (£)', 'GROSS (£)']],
+      body,
+      styles: { fontSize: 7, cellPadding: 1.5, overflow: 'linebreak' },
+      headStyles: { fillColor: NAVY, textColor: '#FFFFFF', fontStyle: 'bold' },
+      columnStyles: { 0: { cellWidth: 16 }, 1: { cellWidth: 30 }, 2: { cellWidth: 54 }, 3: { cellWidth: 36 }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' } },
+      margin: { left: 14, right: 14 },
+    })
+  }
+
   // ── Footer on every page ──
   const pageCount = doc.getNumberOfPages()
   for (let i = 1; i <= pageCount; i++) {
@@ -458,9 +509,10 @@ export function downloadReconciliationPdf(
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
   financials?: FinancialTotals,
-  notes?: string
+  notes?: string,
+  chargeGroups?: PdfChargeGroup[]
 ): void {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes, chargeGroups)
   doc.save(`reconciliation-report-${invoice.invoiceNumber || 'report'}.pdf`)
 }
 
@@ -473,8 +525,9 @@ export function generateReconciliationPdfBlob(
   uniformMinWeeks?: UniformMinWeek[],
   napkinWeeks?: NapkinWeekSummary[],
   financials?: FinancialTotals,
-  notes?: string
+  notes?: string,
+  chargeGroups?: PdfChargeGroup[]
 ): Blob {
-  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes)
+  const doc = generateReconciliationPdf(invoice, result, displayRows, napkinDeptAllocation, uniformMinWeeks, napkinWeeks, financials, notes, chargeGroups)
   return doc.output('blob')
 }
