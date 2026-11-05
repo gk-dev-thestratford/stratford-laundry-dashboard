@@ -426,6 +426,18 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
+  // Fallback: the amount can sit a point lower than its label and land on the NEXT text
+  // line ("... VAT (20%)" then "£492.17"). Only used when the label line has no amount.
+  for (let li = 0; li + 1 < lines.length; li++) {
+    const amtM = lines[li + 1].match(/^£\s*([\d,]+\.\d{2})$/)
+    if (!amtM) continue
+    const amt = parseFloat(amtM[1].replace(',', ''))
+    const label = lines[li]
+    if (!totalNet && /\bNet(?:\s+Total)?\s*:?$/i.test(label)) totalNet = amt
+    else if (!totalVat && /\bVAT\s*(?:\(\s*\d+(?:\.\d+)?\s*%\s*\)|@\s*\d+(?:\.\d+)?\s*%)?\s*:?$/i.test(label)) totalVat = amt
+    else if (!totalGross && /\bTotal(?:\s+(?:Due|Payable|Amount|Gross))?\s*:?$/i.test(label)) totalGross = amt
+  }
+
   // Fallback: the 2026-09 template also prints the gross in the header box ("AMOUNT DUE £x")
   if (!totalGross) {
     for (const line of lines) {
@@ -467,7 +479,8 @@ interface Column { key: ColKey; x: number; center: number }
 
 const HEADER_LABELS: [RegExp, ColKey][] = [
   [/^DATES?$/, 'date'],
-  [/^(GUEST|GUEST NAME|NAME|CUSTOMER|CLIENT)$/, 'guest'],
+  // "GUEST / ROOM" is one combined column ("SEAN/417") — split per cell in recordToLine
+  [/^(GUEST|GUEST NAME|NAME|CUSTOMER|CLIENT|GUEST ROOM|GUEST NAME ROOM|NAME ROOM)$/, 'guest'],
   [/^(ROOM|ROOM NO|ROOM NUMBER|RM|RM NO)$/, 'room'],
   [/^(TICKET|TICKET NO|TICKET NUMBER|DOCKET|DOCKET NO|DOCKET NUMBER|REF|REFERENCE)$/, 'ticket'],
   [/^(DEPARTMENT|DEPT)$/, 'department'],
@@ -612,8 +625,11 @@ function splitGuestLabel(raw: string): { name: string; note?: string } {
   const notes: string[] = []
   const paren = name.match(new RegExp(String.raw`\(\s*(${SERVICE})\s*\)`, 'i'))
   if (paren) { notes.push(paren[1].trim()); name = name.replace(paren[0], ' ') }
-  const lead = name.match(new RegExp(String.raw`^(${SERVICE})(?=[\s\-–:]|$)[\s\-–:]*`, 'i'))
+  const lead = name.match(new RegExp(String.raw`^(${SERVICE})(?=[\s\-–:/]|$)[\s\-–:/]*`, 'i'))
   if (lead) { notes.push(lead[1].trim()); name = name.slice(lead[0].length) }
+  // Tag after the name: "CHAITH/OVER NGT EX", "CHAITH - EXPRESS"
+  const trail = name.match(new RegExp(String.raw`[\s\-–:/]+(${SERVICE})$`, 'i'))
+  if (trail && trail.index! > 0) { notes.push(trail[1].trim()); name = name.slice(0, trail.index) }
   name = name.replace(/^[\s\-–:]+|[\s\-–:]+$/g, '').replace(/\s+/g, ' ')
   return { name, note: notes.length ? notes.join(' ') : undefined }
 }
@@ -629,10 +645,13 @@ function recordToLine(rec: TabRecord, lastDate: string): InvoiceLine | null {
   let guest = (c.guest ?? '').trim()
   let ticket = (c.ticket ?? '').trim()
   let guestInfo: string | undefined
-  // Name and room merged into one cell by the PDF generator ("SEAN 417" / "417 SEAN")
+  // Name and room in one cell: "SEAN/417" (GUEST / ROOM column), "OVER GT EX - 615",
+  // "SEAN 417", or room first "417/SEAN"
   if (!room && guest) {
-    const m = guest.match(/^(.*\S)\s+(\d{3,4}[A-Z]?)$/)
+    const m = guest.match(/^(.*?\S)\s*[/\-–]?\s+(\d{3,4}[A-Z]?)$/) || guest.match(/^(.*?\S)\s*[/\-–]\s*(\d{3,4}[A-Z]?)$/)
+    const r = guest.match(/^(\d{3,4}[A-Z]?)\s*\/\s*(.+)$/)
     if (m) { guest = m[1]; room = m[2] }
+    else if (r) { room = r[1]; guest = r[2] }
   }
   if (room && !/^\S+$/.test(room)) {
     const m = room.match(/^(\d{3,4}[A-Z]?)\s+(.+)$/)
