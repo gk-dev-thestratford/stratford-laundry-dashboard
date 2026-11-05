@@ -22,6 +22,8 @@ export interface InvoiceLine {
   gross: number
   isTopUp: boolean
   sectionType?: InvoiceSectionType
+  /** Service tag printed in the guest-name cell (e.g. "OVER GT EX"), kept verbatim. */
+  serviceNote?: string
 }
 
 export type InvoiceSectionType = 'staff' | 'guest' | 'napkins' | 'table_cloths' | 'bathrobes' | 'hsk'
@@ -38,6 +40,8 @@ export interface ParsedInvoice {
   invoicePeriod: string
   sections: InvoiceSection[]
   totals: { net: number; vat: number; gross: number }
+  /** Which parser produced this result: 'legacy' text-line parser or column-aware 'tabular'. */
+  layout?: 'legacy' | 'tabular'
 }
 
 /**
@@ -91,54 +95,80 @@ function mergeSplitLines(lines: string[]): string[] {
   return result
 }
 
-export async function extractPdfLines(file: File): Promise<string[]> {
+export interface PdfTextItem { x: number; y: number; w: number; h: number; str: string }
+
+/** Every non-blank text item of every page, with its position (PDF units, y grows upward). */
+export async function extractPositionedPages(file: File): Promise<PdfTextItem[][]> {
   const arrayBuffer = await file.arrayBuffer()
   const pdf = await getDocument({ data: new Uint8Array(arrayBuffer) }).promise
-  const allLines: string[] = []
-
+  const pages: PdfTextItem[][] = []
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p)
     const content = await page.getTextContent()
-
-    // Collect all text items with positions
-    const textItems: { x: number; y: number; str: string }[] = []
+    const textItems: PdfTextItem[] = []
     for (const item of content.items) {
       if (!('str' in item) || !(item as any).str?.trim()) continue
       textItems.push({
         x: (item as any).transform[4] as number,
         y: (item as any).transform[5] as number,
+        w: ((item as any).width as number) || 0,
+        h: ((item as any).height as number) || 0,
         str: (item as any).str,
       })
     }
+    pages.push(textItems)
+  }
+  return pages
+}
 
-    // Sort by Y descending (top to bottom of page)
-    textItems.sort((a, b) => b.y - a.y)
-
-    // Cluster items into lines using Y-proximity (tolerance of 3 units)
-    // This handles cases where text items on the same visual line have
-    // slightly different Y positions (e.g. currency symbol vs number)
-    const LINE_TOLERANCE = 3
-    const lineGroups: { x: number; str: string }[][] = []
-    let currentY = -Infinity
-
-    for (const item of textItems) {
-      if (Math.abs(item.y - currentY) > LINE_TOLERANCE || lineGroups.length === 0) {
-        lineGroups.push([])
-        currentY = item.y
-      }
-      lineGroups[lineGroups.length - 1].push({ x: item.x, str: item.str })
+/**
+ * Cluster a page's items into visual rows, top to bottom, each row sorted left to right.
+ * Y-proximity tolerance of 3 units handles items on the same visual line having slightly
+ * different Y positions (e.g. currency symbol vs number).
+ */
+function clusterRows(pageItems: PdfTextItem[]): PdfTextItem[][] {
+  const textItems = [...pageItems].sort((a, b) => b.y - a.y)
+  const LINE_TOLERANCE = 3
+  const rows: PdfTextItem[][] = []
+  let currentY = -Infinity
+  for (const item of textItems) {
+    if (Math.abs(item.y - currentY) > LINE_TOLERANCE || rows.length === 0) {
+      rows.push([])
+      currentY = item.y
     }
+    rows[rows.length - 1].push(item)
+  }
+  for (const row of rows) row.sort((a, b) => a.x - b.x)
+  return rows
+}
 
-    // Sort items within each line left-to-right and join
-    for (const group of lineGroups) {
-      group.sort((a, b) => a.x - b.x)
-      const text = group.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim()
+function pagesToLines(pages: PdfTextItem[][]): string[] {
+  const allLines: string[] = []
+  for (const page of pages) {
+    for (const row of clusterRows(page)) {
+      const text = row.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim()
       if (text) allLines.push(text)
     }
   }
-
   // Post-process: merge lines where description and prices got split
   return mergeSplitLines(allLines)
+}
+
+export async function extractPdfLines(file: File): Promise<string[]> {
+  return pagesToLines(await extractPositionedPages(file))
+}
+
+/**
+ * Parse an invoice PDF, whichever Goldstar layout it uses. Runs the legacy text-line parser
+ * and, when the page has a recognisable column header (DATE | GUEST | ROOM | DESCRIPTION |
+ * NET | VAT | GROSS and permutations), the column-aware parser too — then keeps the result
+ * that identified more lines (ticket/room/guest), preferring the column-aware one on a tie.
+ */
+export async function parseInvoiceFile(file: File): Promise<ParsedInvoice> {
+  const pages = await extractPositionedPages(file)
+  const legacy: ParsedInvoice = { ...parseInvoice(pagesToLines(pages)), layout: 'legacy' }
+  const tabular = parseTabularInvoice(pages, legacy)
+  return pickBetterParse(legacy, tabular)
 }
 
 /** Extract raw PDF lines for diagnostics (unmerged) */
@@ -171,7 +201,8 @@ export async function extractPdfLinesRaw(file: File): Promise<string[]> {
 
 function parseDescriptionItems(desc: string): InvoiceItem[] {
   const items: InvoiceItem[] = []
-  const regex = /(\d+)x\s+([^,]+)/g
+  // "4x T-Shirt" (all layouts so far); also tolerate "4 x T-Shirt" / "4× T-Shirt"
+  const regex = /(\d+)\s?[x×]\s+([^,]+)/g
   let m
   while ((m = regex.exec(desc)) !== null) {
     items.push({
@@ -309,16 +340,20 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   //   '20 International Wy, 31.01.2026'
   //   'London Invoice Period:'
   //   'E20 1FD 01.01.26- 31.01.26'
-  // Strategy: scan each line for labels, then look for the value on the same or next line
+  // Strategy: scan each line for labels, then look for the value on the same or next line.
+  // Labels may or may not carry a colon: the 2026-09 template prints "INVOICE NUMBER
+  // GSSHGM011026" / "INVOICE DATE 30.09.2026" / "INVOICE PERIOD 01.09.26 – 30.09.26".
+  const DATE_TOKEN = String.raw`\d{1,2}[./-]\d{1,2}[./-]\d{2,4}`
+  const PERIOD_RE = new RegExp(String.raw`(${DATE_TOKEN}\s*(?:[-–—]|to)\s*${DATE_TOKEN})`, 'i')
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const nextLine = i + 1 < lines.length ? lines[i + 1] : ''
 
     // Invoice Number
-    if (!invoiceNumber && /Invoice\s*Number\s*:/i.test(line)) {
-      // Try same line first: value after the colon
-      const sameM = line.match(/Invoice\s*Number\s*:\s*([A-Z0-9]+)/i)
+    if (!invoiceNumber && /Invoice\s*(?:Number|No\b\.?|#)/i.test(line)) {
+      // Try same line first: value after the label (code must contain letters AND digits)
+      const sameM = line.match(/Invoice\s*(?:Number|No\b\.?|#)\s*:?\s*([A-Z]{2,}[A-Z0-9-]*\d[A-Z0-9-]*)/i)
       if (sameM) { invoiceNumber = sameM[1]; continue }
       // Value is on next line — find alphanumeric code pattern (e.g. GSSHSM017)
       const nextM = nextLine.match(/([A-Z]{2,}[A-Z0-9]*\d+)/i)
@@ -326,31 +361,26 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
 
     // Invoice Date
-    if (!invoiceDate && /Invoice\s*Date\s*:/i.test(line)) {
-      const sameM = line.match(/Invoice\s*Date\s*:\s*(\d{2}[\./]\d{2}[\./]\d{2,4})/i)
+    if (!invoiceDate && /Invoice\s*Date/i.test(line)) {
+      const sameM = line.match(new RegExp(String.raw`Invoice\s*Date\s*:?\s*(${DATE_TOKEN})`, 'i'))
       if (sameM) { invoiceDate = sameM[1]; continue }
-      const nextM = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      const nextM = nextLine.match(new RegExp(`(${DATE_TOKEN})`))
       if (nextM) invoiceDate = nextM[1]
     }
 
     // Invoice Period
     if (!invoicePeriod && /Invoice\s*Perio/i.test(line)) {
       // Try same line: full period
-      const sameM = line.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      const sameM = line.match(PERIOD_RE)
       if (sameM) { invoicePeriod = sameM[1]; continue }
       // Try next line for the full period
-      const nextFull = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
+      const nextFull = nextLine.match(PERIOD_RE)
       if (nextFull) { invoicePeriod = nextFull[1]; continue }
       // Try start on same line, end on next
-      const startM = line.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–])/)
+      const startM = line.match(new RegExp(String.raw`(${DATE_TOKEN}\s*(?:[-–—]|to))`, 'i'))
       if (startM) {
-        const endM = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4})/)
+        const endM = nextLine.match(new RegExp(`(${DATE_TOKEN})`))
         if (endM) invoicePeriod = startM[1] + ' ' + endM[1]
-      }
-      // Try start on next line (label at end of current line, period on next)
-      if (!invoicePeriod) {
-        const nextPeriod = nextLine.match(/(\d{2}[\./]\d{2}[\./]\d{2,4}\s*[-–]\s*\d{2}[\./]\d{2}[\./]\d{2,4})/)
-        if (nextPeriod) invoicePeriod = nextPeriod[1]
       }
     }
   }
@@ -358,14 +388,15 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]
 
-    // Grand totals — match anywhere in line (footer layout varies across PDFs)
-    const netM = line.match(/\bNet\s+£\s*([\d,]+\.\d{2})/i)
+    // Grand totals — match anywhere in line (footer layout varies across PDFs).
+    // Accepts "Net £x" / "Net Total £x", "VAT £x" / "VAT (20%) £x", "Total £x" / "Total Due £x".
+    const netM = line.match(/\bNet(?:\s+Total)?\s*:?\s+£\s*([\d,]+\.\d{2})/i)
     if (netM && !line.match(/Invoice\s*NET|System\s*NET|Items?\s*NET/i)) totalNet = parseFloat(netM[1].replace(',', ''))
 
-    const vatM = line.match(/\bVAT\s+£\s*([\d,]+\.\d{2})/i)
+    const vatM = line.match(/\bVAT\s*(?:\(\s*\d+(?:\.\d+)?\s*%\s*\)|@\s*\d+(?:\.\d+)?\s*%)?\s*:?\s+£\s*([\d,]+\.\d{2})/i)
     if (vatM && !line.match(/\d{2}\/\d{2}/)) totalVat = parseFloat(vatM[1].replace(',', ''))
 
-    const grossM = line.match(/\bTotal\s+£\s*([\d,]+\.\d{2})$/i)
+    const grossM = line.match(/\bTotal(?:\s+(?:Due|Payable|Amount|Gross))?\s*:?\s+£\s*([\d,]+\.\d{2})$/i)
     if (grossM) totalGross = parseFloat(grossM[1].replace(',', ''))
 
     // Section header
@@ -395,6 +426,14 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
     }
   }
 
+  // Fallback: the 2026-09 template also prints the gross in the header box ("AMOUNT DUE £x")
+  if (!totalGross) {
+    for (const line of lines) {
+      const dueM = line.match(/\bAmount\s+Due\s*:?\s*£\s*([\d,]+\.\d{2})/i)
+      if (dueM) { totalGross = parseFloat(dueM[1].replace(',', '')); break }
+    }
+  }
+
   // NOTE: We deliberately do NOT rescale per-line NETs to hit a section subtotal.
   // The previous implementation scaled every docket line proportionally so they summed
   // to "Total MM/YY", but that subtotal can legitimately differ from the sum of lines —
@@ -411,19 +450,425 @@ export function parseInvoice(lines: string[]): ParsedInvoice {
   }
 }
 
+// ── Column-aware (tabular) parser ──
+//
+// The 2026-09 Goldstar template is a real table: DATE | GUEST | ROOM | DESCRIPTION | NET |
+// VAT | GROSS, with long descriptions and guest names wrapping onto a second visual row
+// that carries no date and no prices. Text-line parsing glues those wrapped rows onto the
+// NEXT record, so this parser works from item X positions instead: the header row fixes
+// the column positions, a row with a date (or prices) starts a record, and wrapped rows are
+// appended to the record above, column by column. Column order and the label wording are
+// flexible (GUEST/NAME, ROOM/ROOM NO, TICKET/DOCKET, AMOUNT/TOTAL...), and a page without
+// its own header reuses the previous page's columns.
+
+type ColKey = 'date' | 'guest' | 'room' | 'ticket' | 'department' | 'description' | 'qty' | 'net' | 'vat' | 'gross'
+type MoneyKey = 'net' | 'vat' | 'gross'
+interface Column { key: ColKey; x: number; center: number }
+
+const HEADER_LABELS: [RegExp, ColKey][] = [
+  [/^DATES?$/, 'date'],
+  [/^(GUEST|GUEST NAME|NAME|CUSTOMER|CLIENT)$/, 'guest'],
+  [/^(ROOM|ROOM NO|ROOM NUMBER|RM|RM NO)$/, 'room'],
+  [/^(TICKET|TICKET NO|TICKET NUMBER|DOCKET|DOCKET NO|DOCKET NUMBER|REF|REFERENCE)$/, 'ticket'],
+  [/^(DEPARTMENT|DEPT)$/, 'department'],
+  [/^(DESCRIPTION|ITEMS?|DETAILS|ITEM DESCRIPTION)$/, 'description'],
+  [/^(QTY|QUANTITY)$/, 'qty'],
+  [/^(NET|NET AMOUNT|AMOUNT|SUBTOTAL)$/, 'net'],
+  [/^(VAT|TAX|VAT AMOUNT)$/, 'vat'],
+  [/^(GROSS|TOTAL|GROSS AMOUNT)$/, 'gross'],
+]
+const MONEY_KEYS: MoneyKey[] = ['net', 'vat', 'gross']
+const MONEY_RE = /^\(?-?£?\s*-?[\d,]+\.\d{2}\)?$/
+const CELL_DATE_RE = /(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})|(\d{1,2})[\s-]+([A-Za-z]{3,9})[\s-]+(\d{2,4})/
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const SUMMARY_ROW_RE = /^(sub\s*-?\s*total|total|net\b|vat\b|amount\s+due|balance|carried|brought)/i
+const END_OF_TABLE_RE = /payment\s+details|bank\s+plc|account\s*(no|name)|sort\s*code|thank\s+you|registration\s+no|please\s+quote/i
+
+function normLabel(s: string): string {
+  return s.toUpperCase().replace(/[^A-Z ]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function labelKey(s: string): ColKey | null {
+  const n = normLabel(s)
+  for (const [re, key] of HEADER_LABELS) if (re.test(n)) return key
+  return null
+}
+
+/**
+ * Cut one text item into pieces at the given character offsets. pdf.js only gives the
+ * item's start X and total width, so piece positions are estimated proportionally.
+ */
+function splitItemAt(it: PdfTextItem, cuts: number[]): PdfTextItem[] {
+  const cw = it.str.length ? it.w / it.str.length : 0
+  const bounds = [0, ...cuts.filter(c => c > 0 && c < it.str.length).sort((a, b) => a - b), it.str.length]
+  const out: PdfTextItem[] = []
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const raw = it.str.slice(bounds[i], bounds[i + 1])
+    const lead = raw.length - raw.trimStart().length
+    const str = raw.trim()
+    if (str) out.push({ ...it, x: it.x + (bounds[i] + lead) * cw, w: str.length * cw, str })
+  }
+  return out
+}
+
+/**
+ * A header item holding several labels merged by pdf.js ("Room No. Guest Name") →
+ * one entry per label, or null unless every word belongs to a label.
+ */
+function splitHeaderItem(it: PdfTextItem): { key: ColKey; x: number; right: number }[] | null {
+  const words = [...it.str.matchAll(/[A-Za-z]+/g)].map(m => ({ w: m[0], i: m.index ?? 0 }))
+  const cw = it.str.length ? it.w / it.str.length : 0
+  const out: { key: ColKey; x: number; right: number }[] = []
+  for (let i = 0; i < words.length;) {
+    let used = 0
+    for (let j = words.length; j > i; j--) {
+      const key = labelKey(words.slice(i, j).map(x => x.w).join(' '))
+      if (key) {
+        out.push({ key, x: it.x + words[i].i * cw, right: it.x + (words[j - 1].i + words[j - 1].w.length) * cw })
+        used = j - i
+        break
+      }
+    }
+    if (!used) return null
+    i += used
+  }
+  return out.length >= 2 ? out : null
+}
+
+/** Recognise a table header row → column positions, or null if this row isn't one. */
+function detectHeaderColumns(row: PdfTextItem[]): Column[] | null {
+  const cols: Column[] = []
+  let unknown = 0
+  const addCol = (key: ColKey, x: number, right: number) => {
+    if (cols.some(c => c.key === key)) return false
+    cols.push({ key, x, center: (x + right) / 2 })
+    return true
+  }
+  for (let i = 0; i < row.length; i++) {
+    let key = labelKey(row[i].str)
+    let right = row[i].x + row[i].w
+    // A multi-word label may arrive as separate items ("ROOM" "NO")
+    if (!key && i + 1 < row.length && row[i + 1].x - right < 6) {
+      key = labelKey(row[i].str + ' ' + row[i + 1].str)
+      if (key) { right = row[i + 1].x + row[i + 1].w; i++ }
+    }
+    if (!key) {
+      // Old template's combined "TICKET/ ROOM" header belongs to the legacy parser
+      if (/TICKET/.test(normLabel(row[i].str)) && /ROOM/.test(normLabel(row[i].str))) return null
+      const parts = splitHeaderItem(row[i])
+      if (parts) {
+        for (const p of parts) if (!addCol(p.key, p.x, p.right)) return null
+        continue
+      }
+      unknown++; continue
+    }
+    if (!addCol(key, row[i].x, right)) return null
+  }
+  const has = (k: ColKey) => cols.some(c => c.key === k)
+  if (unknown > 1 || !has('date') || !has('description') || !(has('net') || has('gross'))) return null
+  if (!(has('guest') || has('room') || has('ticket') || has('department'))) return null
+  return cols.sort((a, b) => a.x - b.x)
+}
+
+function parseMoney(s: string): number {
+  const neg = /^\(.*\)$/.test(s.trim()) || s.includes('-')
+  const v = parseFloat(s.replace(/[^\d.]/g, ''))
+  return neg ? -v : v
+}
+
+/** Normalise a date cell to DD/MM/YY (slash form used throughout the reconciliation). */
+function normaliseCellDate(text: string): string {
+  const m = text.match(CELL_DATE_RE)
+  if (!m) return ''
+  if (m[1]) return `${m[1].padStart(2, '0')}/${m[2].padStart(2, '0')}/${m[3].slice(-2)}`
+  const mon = MONTHS.indexOf(m[5].slice(0, 3).toLowerCase())
+  if (mon < 0) return ''
+  return `${m[4].padStart(2, '0')}/${String(mon + 1).padStart(2, '0')}/${m[6].slice(-2)}`
+}
+
+interface TabRecord {
+  cells: Partial<Record<ColKey, string>>
+  money: Partial<Record<MoneyKey, number>>
+  section: InvoiceSection
+}
+
+function appendCell(rec: TabRecord, key: ColKey, text: string) {
+  const prev = rec.cells[key]
+  if (!prev) { rec.cells[key] = text; return }
+  // A word hyphenated across the wrap ("T-" + "Shirt") joins without a space
+  rec.cells[key] = /-$/.test(prev) && /^[A-Za-z]/.test(text) ? prev + text : prev + ' ' + text
+}
+
+/**
+ * Split a guest-name cell into the name and any service tag printed with it, e.g.
+ *   "OVER GT EX -MUHAMED" → { name: "MUHAMED", note: "OVER GT EX" }
+ *   "CHAITH (OVER NGT EX)" → { name: "CHAITH", note: "OVER NGT EX" }
+ *   "EX- SHAING" → { name: "SHAING", note: "EX" }
+ * The tag is kept verbatim (shown next to the name); only the name is used for matching.
+ */
+function splitGuestLabel(raw: string): { name: string; note?: string } {
+  const SERVICE = String.raw`(?:OVER\s*N?I?GH?T\s*EX(?:PRESS)?|O\/N\s*EX(?:PRESS)?|EXPRESS|EX)`
+  let name = raw.replace(/\s+/g, ' ').trim()
+  const notes: string[] = []
+  const paren = name.match(new RegExp(String.raw`\(\s*(${SERVICE})\s*\)`, 'i'))
+  if (paren) { notes.push(paren[1].trim()); name = name.replace(paren[0], ' ') }
+  const lead = name.match(new RegExp(String.raw`^(${SERVICE})(?=[\s\-–:]|$)[\s\-–:]*`, 'i'))
+  if (lead) { notes.push(lead[1].trim()); name = name.slice(lead[0].length) }
+  name = name.replace(/^[\s\-–:]+|[\s\-–:]+$/g, '').replace(/\s+/g, ' ')
+  return { name, note: notes.length ? notes.join(' ') : undefined }
+}
+
+function recordToLine(rec: TabRecord, lastDate: string): InvoiceLine | null {
+  const c = rec.cells
+  const net = rec.money.net ?? (rec.money.gross != null && rec.money.vat != null ? +(rec.money.gross - rec.money.vat).toFixed(2) : rec.money.gross)
+  if (net == null || isNaN(net)) return null
+  const vat = rec.money.vat ?? (rec.money.gross != null ? +(rec.money.gross - net).toFixed(2) : 0)
+  const gross = rec.money.gross ?? +(net + vat).toFixed(2)
+
+  let room = (c.room ?? '').trim()
+  let guest = (c.guest ?? '').trim()
+  let ticket = (c.ticket ?? '').trim()
+  let guestInfo: string | undefined
+  // Name and room merged into one cell by the PDF generator ("SEAN 417" / "417 SEAN")
+  if (!room && guest) {
+    const m = guest.match(/^(.*\S)\s+(\d{3,4}[A-Z]?)$/)
+    if (m) { guest = m[1]; room = m[2] }
+  }
+  if (room && !/^\S+$/.test(room)) {
+    const m = room.match(/^(\d{3,4}[A-Z]?)\s+(.+)$/)
+    if (m) { room = m[1]; guest = (guest + ' ' + m[2]).trim() }
+  }
+  // Legacy-style "623 (Curtis)" inside a ticket column
+  const tg = ticket.match(/^(\S+)\s*\(([^)]+)\)$/)
+  if (tg) { ticket = tg[1]; guest = guest || tg[2] }
+
+  const { name, note } = splitGuestLabel(guest)
+  if (name) guestInfo = `(${name})`
+  const description = (c.description ?? '').replace(/\s+/g, ' ').trim()
+  const isTopUp = /minimum\s+top\s*-?\s*up/i.test(`${ticket} ${guest} ${description}`)
+
+  return {
+    date: normaliseCellDate(c.date ?? '') || lastDate,
+    ticket: isTopUp ? 'Minimum TopUp' : (room || ticket),
+    guestInfo,
+    serviceNote: note,
+    description,
+    items: parseDescriptionItems(description),
+    net, vat, gross,
+    isTopUp,
+    sectionType: rec.section.type,
+  }
+}
+
+function sectionFromContext(invoiceNumber: string, contextText: string, cols: Column[]): InvoiceSectionType {
+  // Same invoice-number codes as the legacy parser (GSSH-GM = guest, -SM staff, ...)
+  if (/GM/i.test(invoiceNumber)) return 'guest'
+  if (/HH/i.test(invoiceNumber)) return 'bathrobes'
+  if (/NM/i.test(invoiceNumber)) return 'napkins'
+  if (/HM/i.test(invoiceNumber)) return 'hsk'
+  if (/SM/i.test(invoiceNumber)) return 'staff'
+  const t = contextText.toLowerCase()
+  if (/\bguest\b/.test(t)) return 'guest'
+  if (/\bnapkin/.test(t)) return 'napkins'
+  if (/\btable\s*cloth/.test(t)) return 'table_cloths'
+  if (/\bbathrobe/.test(t)) return 'bathrobes'
+  if (/\bhsk\b/.test(t)) return 'hsk'
+  if (/\bstaff\b|\buniform/.test(t)) return 'staff'
+  if (cols.some(col => col.key === 'guest' || col.key === 'room')) return 'guest'
+  return 'staff'
+}
+
+/**
+ * Column-aware parse. Returns null when no page has a recognisable column header — the
+ * caller then keeps the legacy result. Metadata and totals are taken from the legacy parse
+ * (those regexes already cope with both templates).
+ */
+export function parseTabularInvoice(pages: PdfTextItem[][], meta: ParsedInvoice): ParsedInvoice | null {
+  let cols: Column[] | null = null
+  let contextText = ''
+  const sections: InvoiceSection[] = []
+  let currentSection: InvoiceSection | null = null
+  let current: TabRecord | null = null
+  let lastDate = ''
+  const lines: InvoiceLine[] = []
+
+  const flush = () => {
+    if (!current) return
+    const line = recordToLine(current, lastDate)
+    if (line) { current.section.lines.push(line); lines.push(line); lastDate = line.date }
+    current = null
+  }
+
+  for (const page of pages) {
+    const rows = clusterRows(page)
+    // Find this page's header; a page without one reuses the previous page's columns
+    let start = 0
+    for (let r = 0; r < rows.length; r++) {
+      const found = detectHeaderColumns(rows[r])
+      if (found) { cols = found; start = r + 1; break }
+      if (!cols) contextText += ' ' + rows[r].map(i => i.str).join(' ')
+    }
+    if (!cols) continue
+    const columns: Column[] = cols
+    const moneyCols = columns.filter(c => MONEY_KEYS.includes(c.key as MoneyKey))
+    const firstMoneyX = Math.min(...moneyCols.map(c => c.x))
+    const textCols = columns.filter(c => !MONEY_KEYS.includes(c.key as MoneyKey))
+    const tableLeft = columns[0].x - 4
+
+    // pdf.js sometimes merges neighbouring cells into one item ("50.00£", "SEAN 4x Shirt").
+    // Split amounts out of mixed items, and cut text that straddles a column start at the
+    // word boundary nearest to it.
+    const explode = (row: PdfTextItem[]): PdfTextItem[] => row.flatMap(it => {
+      const s = it.str
+      const moneyCuts: number[] = []
+      if (!MONEY_RE.test(s.trim())) {
+        for (const m of s.matchAll(/£\s*-?[\d,]+\.\d{2}|(?<![\d.])-?\d[\d,]*\.\d{2}(?![\d.])|£/g)) moneyCuts.push(m.index ?? 0, (m.index ?? 0) + m[0].length)
+      }
+      return splitItemAt(it, moneyCuts).flatMap(piece => {
+        if (MONEY_RE.test(piece.str) || piece.str === '£') return [piece]
+        const cw = piece.str.length ? piece.w / piece.str.length : 0
+        const cuts: number[] = []
+        for (const tc of textCols) {
+          if (!(piece.x < tc.x - 2 && piece.x + piece.w > tc.x + 2) || !cw) continue
+          const target = Math.round((tc.x - piece.x) / cw)
+          let best = -1
+          for (let d = 0; d <= 6 && best < 0; d++) {
+            if (piece.str[target - d] === ' ') best = target - d
+            else if (piece.str[target + d] === ' ') best = target + d
+          }
+          if (best > 0) cuts.push(best)
+        }
+        return cuts.length ? splitItemAt(piece, cuts) : [piece]
+      })
+    })
+
+    // Classify each row after the header
+    interface RowInfo { y: number; cells: Partial<Record<ColKey, string>>; money: Partial<Record<MoneyKey, number>>; date: string; outside: boolean; firstX: number; text: string }
+    const infos: RowInfo[] = []
+    for (let r = start; r < rows.length; r++) {
+      const row = explode(rows[r])
+      const cells: Partial<Record<ColKey, string>> = {}
+      const money: Partial<Record<MoneyKey, number>> = {}
+      let outside = false
+      for (let i = 0; i < row.length; i++) {
+        const it = row[i]
+        let str = it.str.trim()
+        let right = it.x + it.w
+        // "£" printed as its own item before the number (old template style)
+        if (/^-?£$/.test(str) && i + 1 < row.length && /^[\d,]+\.\d{2}$/.test(row[i + 1].str.trim())) {
+          str = str + row[i + 1].str.trim(); right = row[i + 1].x + row[i + 1].w; i++
+        }
+        if (MONEY_RE.test(str) && right > firstMoneyX - 15) {
+          const center = (it.x + right) / 2
+          const col = moneyCols.reduce((a, b) => Math.abs(b.center - center) < Math.abs(a.center - center) ? b : a)
+          money[col.key as MoneyKey] = parseMoney(str)
+          continue
+        }
+        if (it.x < tableLeft) { outside = true; continue }
+        let col = textCols[0]
+        for (const tc of textCols) if (tc.x <= it.x + 3) col = tc
+        cells[col.key] = cells[col.key] ? `${cells[col.key]} ${str}` : str
+      }
+      const text = row.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim()
+      infos.push({ y: row[0].y, cells, money, date: normaliseCellDate(cells.date ?? ''), outside, firstX: row[0].x, text })
+    }
+
+    // Wrapped rows sit closer to their record than records sit to each other
+    const isStart = (ri: RowInfo) => !!ri.date || Object.keys(ri.money).length >= Math.min(2, moneyCols.length)
+    const starts = infos.filter(isStart).map(ri => ri.y)
+    const gaps = starts.slice(1).map((y, i) => starts[i] - y).filter(g => g > 0).sort((a, b) => a - b)
+    const typicalRowH = page.find(i => i.h > 0)?.h ?? 8
+    const contLimit = gaps.length ? gaps[Math.floor(gaps.length / 2)] * 0.9 : typicalRowH * 1.8
+
+    let prevY = Infinity
+    for (const ri of infos) {
+      const firstText = Object.values(ri.cells).find(Boolean) ?? ''
+      if (END_OF_TABLE_RE.test(ri.text)) { flush(); break }
+      if (SUMMARY_ROW_RE.test(firstText) && !ri.date) { flush(); prevY = ri.y; continue }
+
+      if (isStart(ri)) {
+        const hasMoney = Object.keys(ri.money).length > 0
+        // Prices printed one row below a dated record whose own row had none
+        if (!ri.date && current && Object.keys(current.money).length === 0 && hasMoney && prevY - ri.y <= contLimit) {
+          current.money = ri.money
+          for (const [k, v] of Object.entries(ri.cells)) if (v) appendCell(current, k as ColKey, v)
+          prevY = ri.y; continue
+        }
+        flush()
+        if (!currentSection) {
+          const type = sectionFromContext(meta.invoiceNumber, contextText, columns)
+          currentSection = { name: type, type, lines: [] }
+          sections.push(currentSection)
+        }
+        current = { cells: { ...ri.cells }, money: { ...ri.money }, section: currentSection }
+        prevY = ri.y; continue
+      }
+
+      // In-table section heading ("Napkins", "Table Cloths"...) starts in the first column
+      const secType = !ri.outside && ri.firstX < (columns[1]?.x ?? Infinity) - 3 ? detectSection(ri.text) : null
+      if (secType) {
+        flush()
+        currentSection = { name: ri.text, type: secType, lines: [] }
+        sections.push(currentSection)
+        prevY = ri.y; continue
+      }
+
+      // Wrapped continuation of the record above
+      if (current && !ri.outside && prevY - ri.y <= contLimit) {
+        for (const [k, v] of Object.entries(ri.cells)) if (v) appendCell(current, k as ColKey, v)
+        prevY = ri.y; continue
+      }
+      // Anything else (page footer, notes) ends the current record
+      flush()
+    }
+    flush()
+  }
+
+  if (!lines.length) return null
+  return { ...meta, sections: sections.filter(s => s.lines.length > 0), layout: 'tabular' }
+}
+
+/** Keep whichever parse identified more lines (ticket / room / guest name); ties → tabular. */
+function pickBetterParse(legacy: ParsedInvoice, tabular: ParsedInvoice | null): ParsedInvoice {
+  if (!tabular) return legacy
+  const score = (inv: ParsedInvoice) => {
+    const ls = inv.sections.flatMap(s => s.lines)
+    const identified = ls.filter(l => l.ticket || l.guestInfo).length
+    const sum = ls.reduce((s, l) => s + l.net, 0)
+    const totalsAgree = inv.totals.net > 0 && Math.abs(sum - inv.totals.net) < 0.05
+    return identified + (totalsAgree ? ls.length : 0)
+  }
+  return score(legacy) > score(tabular) ? legacy : tabular
+}
+
+const NAME_NOISE = new Set(['over', 'ngt', 'night', 'express', 'mr', 'mrs', 'ms', 'miss', 'dr'])
+
+/** Lower-case name tokens (≥3 letters) from an invoice guestInfo like "(SEAN)" or "(Mr Lee)". */
+export function guestNameTokens(guestInfo: string | null | undefined): string[] {
+  return String(guestInfo ?? '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/)
+    .filter(t => t.length >= 3 && !NAME_NOISE.has(t))
+}
+
+/**
+ * Does an invoice guest name match a stored guest_name? Word-prefix match either way, so
+ * Goldstar's truncated names still match ("ANG" ↔ "Angelys", "GRE" ↔ "Greg Smith").
+ */
+export function guestNameMatches(guestInfo: string | null | undefined, storedName: string | null | undefined): boolean {
+  const keys = guestNameTokens(guestInfo)
+  const words = String(storedName ?? '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(w => w.length >= 3)
+  return keys.some(k => words.some(w => w.startsWith(k) || k.startsWith(w)))
+}
+
 // ── Period parsing ──
 
 export function parseInvoicePeriod(period: string): { start: Date; end: Date } | null {
   // Normalize: replace en-dash/em-dash with hyphen, collapse whitespace
   const normalized = period.replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim()
 
-  // Try DD.MM.YY(YY) - DD.MM.YY(YY)
-  const dotM = normalized.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s*-\s*(\d{2})\.(\d{2})\.(\d{2,4})/)
-  if (dotM) return buildPeriod(dotM[1], dotM[2], dotM[3], dotM[4], dotM[5], dotM[6])
-
-  // Try DD/MM/YY(YY) - DD/MM/YY(YY)
-  const slashM = normalized.match(/(\d{2})\/(\d{2})\/(\d{2,4})\s*-\s*(\d{2})\/(\d{2})\/(\d{2,4})/)
-  if (slashM) return buildPeriod(slashM[1], slashM[2], slashM[3], slashM[4], slashM[5], slashM[6])
+  // D.M.YY(YY) - D.M.YY(YY), with "." "/" or "-" separators, 1-2 digit day/month and
+  // "-" or "to" between the two dates (e.g. "01.09.26 - 30.09.26", "1/9/2026 to 30/9/2026")
+  const m = normalized.match(/(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s*(?:-|to)\s*(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})/i)
+  if (m) return buildPeriod(m[1], m[2], m[3], m[4], m[5], m[6])
 
   return null
 }

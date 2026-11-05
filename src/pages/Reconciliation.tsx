@@ -2,8 +2,8 @@ import { useState, useMemo, useCallback, useEffect } from 'react'
 import { Upload, RefreshCw, Download, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileText, X, Save, Clock, ChevronRight, Plus, Mail, Ban, ArrowRightLeft, Send, Search, Scale, StickyNote } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import {
-  extractPdfLines, extractPdfLinesRaw, parseInvoice, parseInvoicePeriod, derivePeriodFromLines,
-  sectionTypeToOrderType, canonicalDocket,
+  extractPdfLinesRaw, parseInvoiceFile, parseInvoicePeriod, derivePeriodFromLines,
+  sectionTypeToOrderType, canonicalDocket, guestNameMatches,
   type ParsedInvoice, type InvoiceLine, type InvoiceSectionType,
   extractAndParseD140, type D140Report, type D140Transaction,
 } from '../lib/invoiceParser'
@@ -103,6 +103,23 @@ function notFoundKey(row: ReconciliationRow): string {
 
 // computeOrderCost is the shared canonical calculation — see src/lib/orderCost.ts
 
+// Unused weekly napkin minimum (the Napkin TopUp) is split by a fixed agreed ratio,
+// not by usage — a department that sent nothing that week still carries its share.
+const NAPKIN_TOPUP_SPLIT: [string, number][] = [
+  ['Kitchen E20 Front', 0.60],
+  ['Lounge', 0.15],
+  ['Events', 0.25],
+]
+
+/** Napkin TopUp NET → per-department shares; rounding remainder goes to the largest share so they sum exactly. */
+function splitNapkinTopUp(net: number): Map<string, number> {
+  const shares = new Map<string, number>()
+  for (const [name, pct] of NAPKIN_TOPUP_SPLIT) shares.set(name, +(net * pct).toFixed(2))
+  const remainder = +(net - Array.from(shares.values()).reduce((s, v) => s + v, 0)).toFixed(2)
+  if (remainder !== 0) shares.set(NAPKIN_TOPUP_SPLIT[0][0], +(shares.get(NAPKIN_TOPUP_SPLIT[0][0])! + remainder).toFixed(2))
+  return shares
+}
+
 function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: InvoiceLine[]): DepartmentBreakdown[] {
   const deptMap = new Map<string, DepartmentBreakdown>()
 
@@ -135,7 +152,6 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
       counts.set(row.order.department.name, (counts.get(row.order.department.name) || 0) + 1)
     }
 
-    const NAPKIN_TOPUP_DEPTS = ['Kitchen E20 Front', 'Lounge', 'Events']
     const MAIN_KITCHEN_NAME = 'Main Kitchen'
 
     for (const topUp of topUpCharges) {
@@ -155,26 +171,18 @@ function buildDepartmentBreakdown(rows: ReconciliationRow[], topUpCharges: Invoi
           })
         }
         deptMap.get(targetName)!.allocatedTopUp += topUp.net
-      } else if (secType === 'napkins' && deptCounts && deptCounts.size > 0) {
-        // Napkin TopUp distributed proportionally only across eligible departments
-        const eligibleCounts = new Map<string, number>()
-        for (const [name, count] of deptCounts) {
-          if (NAPKIN_TOPUP_DEPTS.includes(name)) eligibleCounts.set(name, count)
-        }
-        const totalCount = Array.from(eligibleCounts.values()).reduce((s, c) => s + c, 0)
-        if (totalCount > 0) {
-          for (const [name, count] of eligibleCounts) {
-            const share = +(topUp.net * count / totalCount).toFixed(2)
-            if (!deptMap.has(name)) {
-              deptMap.set(name, {
-                departmentName: name, departmentId: null,
-                orderCount: 0, invoiceNet: 0, invoiceGross: 0,
-                systemTotal: 0, difference: 0, allocatedTopUp: 0,
-                totalCostNet: 0, totalCostGross: 0,
-              })
-            }
-            deptMap.get(name)!.allocatedTopUp += share
+      } else if (secType === 'napkins') {
+        // Napkin TopUp: fixed split (Kitchen E20 Front 60% / Lounge 15% / Events 25%)
+        for (const [name, share] of splitNapkinTopUp(topUp.net)) {
+          if (!deptMap.has(name)) {
+            deptMap.set(name, {
+              departmentName: name, departmentId: null,
+              orderCount: 0, invoiceNet: 0, invoiceGross: 0,
+              systemTotal: 0, difference: 0, allocatedTopUp: 0,
+              totalCostNet: 0, totalCostGross: 0,
+            })
           }
+          deptMap.get(name)!.allocatedTopUp += share
         }
       } else if (deptCounts && deptCounts.size > 0) {
         // Other sections: distribute TopUp proportionally across all departments
@@ -315,6 +323,38 @@ function buildDepartmentDisplayRows(
   return displayRows
 }
 
+const DAY_MS = 86_400_000
+
+/** Invoice line date ("DD/MM/YY", "D/M/YYYY", ...) → UTC day number, or null. */
+function invoiceLineDay(date: string): number | null {
+  const m = date?.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/)
+  if (!m) return null
+  let yr = parseInt(m[3]); if (yr < 100) yr += 2000
+  return Math.floor(Date.UTC(yr, parseInt(m[2]) - 1, parseInt(m[1])) / DAY_MS)
+}
+
+function orderDay(o: Order): number {
+  return Math.floor(new Date(o.created_at).getTime() / DAY_MS)
+}
+
+/**
+ * Guest rooms repeat within a month (same guest, several bags; or a new guest in the same
+ * room), so "first unclaimed order for room 417" can pair the wrong bags. Rank candidates
+ * by: guest name matches → closest creation date to the invoice line → closest cost.
+ */
+function pickClosestGuestOrder(candidates: Order[], line: InvoiceLine): Order | null {
+  if (candidates.length <= 1) return candidates[0] ?? null
+  const lineDay = invoiceLineDay(line.date)
+  const rank = (o: Order): [number, number, number] => [
+    line.guestInfo && guestNameMatches(line.guestInfo, o.guest_name) ? 0 : 1,
+    lineDay == null ? 0 : Math.abs(orderDay(o) - lineDay),
+    Math.abs(computeOrderCost(o) - line.net),
+  ]
+  return candidates
+    .map(o => ({ o, r: rank(o) }))
+    .sort((a, b) => a.r[0] - b.r[0] || a.r[1] - b.r[1] || a.r[2] - b.r[2])[0].o
+}
+
 function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Date; end: Date } | null, strictPeriod?: { start: Date; end: Date } | null): ReconciliationResult {
   // Issue 2: Use array map to handle duplicate docket numbers.
   // Key by canonicalDocket so a reset-booklet ticket "6" matches a stored "0006", etc.
@@ -326,6 +366,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
   // invoice's lines is kept OUT of the docket/room pools so another line can't steal it.
   const wantedRefs = invoiceRefKeys(invoice)
   const byRef = new Map<string, Order[]>()
+  const guestPool: Order[] = [] // unpinned guest orders, for the name-only fallback
   for (const o of orders) {
     const refs = o.notes?.match(/\[ref:[^\]]+\]/g) ?? []
     let pinned = false
@@ -336,6 +377,7 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
       byRef.get(r)!.push(o)
     }
     if (pinned) continue
+    if (o.order_type === 'guest_laundry') guestPool.push(o)
     const dk = canonicalDocket(o.docket_number)
     if (!byDocket.has(dk)) byDocket.set(dk, [])
     byDocket.get(dk)!.push(o)
@@ -345,10 +387,9 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
     }
   }
 
-  const rows: ReconciliationRow[] = []
   const topUpCharges: InvoiceLine[] = []
   const matchedOrderIds = new Set<string>()
-  let rowCounter = 0
+  const pending: { line: InvoiceLine; sectionType: InvoiceSectionType; orderType: string; order: Order | null }[] = []
 
   for (const section of invoice.sections) {
     const orderType = sectionTypeToOrderType(section.type)
@@ -361,29 +402,45 @@ function reconcile(invoice: ParsedInvoice, orders: Order[], period: { start: Dat
       // Guest dockets are ROOM numbers; staff/napkin tickets are booklet numbers — the
       // same digits mean different things, so a docket match must stay within the right
       // family (otherwise staff ticket "0402" claims the room-402 guest order).
-      if (!order) {
-        const docketCandidates = (byDocket.get(canonicalDocket(line.ticket)) ?? []).filter(o =>
-          section.type === 'guest' ? o.order_type === 'guest_laundry' : o.order_type !== 'guest_laundry')
-        order = docketCandidates.find(o => !matchedOrderIds.has(o.id)) ?? null
+      // An empty ticket (guest line with no room) must not match orders with no docket.
+      const docketKey = canonicalDocket(line.ticket)
+      if (!order && docketKey) {
+        const docketCandidates = (byDocket.get(docketKey) ?? []).filter(o =>
+          !matchedOrderIds.has(o.id) &&
+          (section.type === 'guest' ? o.order_type === 'guest_laundry' : o.order_type !== 'guest_laundry'))
+        order = section.type === 'guest' ? pickClosestGuestOrder(docketCandidates, line) : (docketCandidates[0] ?? null)
       }
       // 3) Guest lines: fall back to room-number match
       if (!order && section.type === 'guest' && line.ticket) {
         const candidates = (byRoom.get(line.ticket) ?? []).filter(o => !matchedOrderIds.has(o.id))
-        if (candidates.length === 1) order = candidates[0]
-        else if (candidates.length > 1 && line.guestInfo) {
-          const name = line.guestInfo.replace(/[()]/g, '').toLowerCase()
-          order = candidates.find(o => o.guest_name?.toLowerCase().includes(name)) ?? candidates[0]
-        }
+        order = pickClosestGuestOrder(candidates, line)
       }
       if (order) matchedOrderIds.add(order.id)
-      const systemTotal = order ? computeOrderCost(order) : 0
-      const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
-      const status: ReconciliationRow['status'] = !order
-        ? 'not_found' : Math.abs(diff) < 0.02 ? 'matched' : 'price_mismatch'
-      const minorVariance = status === 'price_mismatch' && isMinorVariance(diff, systemTotal)
-      rows.push({ invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex: rowCounter++, minorVariance })
+      pending.push({ line, sectionType: section.type, orderType, order })
     }
   }
+
+  // 4) Guest lines the invoice prints with no room (e.g. "OVER GT EX MOHAMMED", "EX SHAFIQ"):
+  // after every room/docket match has claimed its order, try the guest name against the
+  // remaining guest orders created within 3 days of the line date.
+  for (const p of pending) {
+    if (p.order || p.sectionType !== 'guest' || p.line.ticket || !p.line.guestInfo) continue
+    const lineDay = invoiceLineDay(p.line.date)
+    const candidates = guestPool.filter(o =>
+      !matchedOrderIds.has(o.id) && guestNameMatches(p.line.guestInfo, o.guest_name) &&
+      (lineDay == null || Math.abs(orderDay(o) - lineDay) <= 3))
+    p.order = pickClosestGuestOrder(candidates, p.line)
+    if (p.order) matchedOrderIds.add(p.order.id)
+  }
+
+  const rows: ReconciliationRow[] = pending.map(({ line, orderType, order }, rowIndex) => {
+    const systemTotal = order ? computeOrderCost(order) : 0
+    const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
+    const status: ReconciliationRow['status'] = !order
+      ? 'not_found' : Math.abs(diff) < 0.02 ? 'matched' : 'price_mismatch'
+    const minorVariance = status === 'price_mismatch' && isMinorVariance(diff, systemTotal)
+    return { invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex, minorVariance }
+  })
 
   // Issue 1: Use strictPeriod (original invoice period) for "In System Only" filtering
   // so broader-search orders from the previous month don't appear as missing
@@ -609,10 +666,9 @@ export default function Reconciliation() {
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
     setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
     try {
-      const lines = await extractPdfLines(f)
-      console.log('[Reconciliation] Extracted PDF lines:', lines.slice(0, 30))
-      const parsed = parseInvoice(lines)
-      console.log('[Reconciliation] Parsed metadata:', { invoiceNumber: parsed.invoiceNumber, invoiceDate: parsed.invoiceDate, invoicePeriod: parsed.invoicePeriod })
+      // Handles both Goldstar layouts (legacy text lines and the 2026-09 column table)
+      const parsed = await parseInvoiceFile(f)
+      console.log('[Reconciliation] Parsed metadata:', { layout: parsed.layout, invoiceNumber: parsed.invoiceNumber, invoiceDate: parsed.invoiceDate, invoicePeriod: parsed.invoicePeriod })
       if (parsed.sections.every(s => s.lines.length === 0)) {
         setError('Could not parse any invoice lines.'); setParsing(false); return
       }
@@ -2618,6 +2674,9 @@ export default function Reconciliation() {
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
                     {row.invoiceLine.ticket}{row.invoiceLine.guestInfo && <span className="text-gray-400 ml-1">{row.invoiceLine.guestInfo}</span>}
+                    {row.invoiceLine.serviceNote && (
+                      <span className="ml-1.5 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[10px] font-sans align-middle" title="Service tag printed on the invoice">{row.invoiceLine.serviceNote}</span>
+                    )}
                     {rowNote && (
                       <span title={rowNote} className="inline-flex align-middle ml-1.5 cursor-help">
                         <StickyNote className="w-3.5 h-3.5 text-amber-500" />
