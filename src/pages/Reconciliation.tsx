@@ -1025,7 +1025,7 @@ export default function Reconciliation() {
         n.weight_kg = f.kg.trim() && !isNaN(Number(f.kg)) ? Number(f.kg) : null
       }
       err = await upsertLineNote(n)
-      if (!err) logAction({ invoice_number: invoice.invoiceNumber, line_key: key, action: chargeLabel(n), detail: [n.note, n.recharge_status ? `charged on: ${n.recharge_status.replace('_', ' ')}` : '', n.folio_ref ? `folio ${n.folio_ref}` : ''].filter(Boolean).join(' · ') || null })
+      if (!err) logAction({ invoice_number: invoice.invoiceNumber, line_key: key, action: chargeLabel(n), detail: [n.note, n.recharge_status ? `charged on: ${n.recharge_status.replace('_', ' ')}` : '', n.folio_ref ? `folio ${n.folio_ref}` : '', n.weight_kg != null ? `${n.weight_kg} kg` : ''].filter(Boolean).join(' · ') || null })
       if (!err) next[key] = { ...n, updated_at: new Date().toISOString() }
     }
     setNoteSaving(false)

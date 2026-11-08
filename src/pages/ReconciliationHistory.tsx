@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { Fragment, useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { RefreshCw, Clock, Upload, FileText, FileSpreadsheet, Trash2, ChevronLeft, ChevronRight } from 'lucide-react'
 import { supabase } from '../lib/supabase'
@@ -321,20 +321,20 @@ export default function ReconciliationHistory() {
             </select>
           </div>
         </div>
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-gray-200 overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-200 bg-gray-50">
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Category</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Invoice</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Period</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Reconciled</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Invoice NET</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">TopUp</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Total</th>
-                <th className="px-4 py-3 text-center font-medium text-gray-600">Matched</th>
-                <th className="px-4 py-3 text-center font-medium text-gray-600">Issues</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">By</th>
+                <th className="px-3 py-3 text-left font-medium text-gray-600">Category</th>
+                <th className="px-3 py-3 text-left font-medium text-gray-600">Invoice</th>
+                <th className="px-3 py-3 text-left font-medium text-gray-600">Period</th>
+                <th className="px-3 py-3 text-left font-medium text-gray-600">Reconciled</th>
+                <th className="px-3 py-3 text-right font-medium text-gray-600">Invoice NET</th>
+                <th className="px-3 py-3 text-right font-medium text-gray-600">TopUp</th>
+                <th className="px-3 py-3 text-right font-medium text-gray-600">Total</th>
+                <th className="px-3 py-3 text-center font-medium text-gray-600">Matched</th>
+                <th className="px-3 py-3 text-center font-medium text-gray-600">Issues</th>
+                <th className="px-3 py-3 text-left font-medium text-gray-600">By</th>
               </tr>
             </thead>
             <tbody>
@@ -342,13 +342,12 @@ export default function ReconciliationHistory() {
                 const issues = h.mismatch_count + h.not_found_count + h.missing_count
                 const isExpanded = expanded === h.id
                 return (
-                  <>{/* eslint-disable-next-line react/jsx-key */}
+                  <Fragment key={h.id}>
                     <tr
-                      key={h.id}
                       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${isExpanded ? 'bg-gray-50' : ''}`}
                       onClick={() => setExpanded(isExpanded ? null : h.id)}
                     >
-                      <td className="px-4 py-3">
+                      <td className="px-3 py-3">
                         <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
                           h.invoice_category === 'Staff Uniforms' ? 'bg-blue-100 text-blue-700'
                           : h.invoice_category === 'Guest Laundry' ? 'bg-purple-100 text-purple-700'
@@ -363,23 +362,23 @@ export default function ReconciliationHistory() {
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3 font-mono font-medium text-navy">{h.invoice_number || '—'}</td>
-                      <td className="px-4 py-3 text-gray-600">{h.invoice_period || '—'}</td>
-                      <td className="px-4 py-3 text-gray-500">{format(new Date(h.created_at), 'dd MMM yyyy HH:mm')}</td>
-                      <td className="px-4 py-3 text-right font-medium">{'\u00a3'}{h.invoice_net.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right text-amber-600">{h.topup_total > 0 ? `\u00a3${h.topup_total.toFixed(2)}` : '\u2014'}</td>
-                      <td className="px-4 py-3 text-right font-semibold">{'\u00a3'}{(h.invoice_net + h.topup_total).toFixed(2)}</td>
-                      <td className="px-4 py-3 text-center">
+                      <td className="px-3 py-3 font-mono font-medium text-navy">{h.invoice_number || '—'}</td>
+                      <td className="px-3 py-3 text-gray-600">{h.invoice_period || '—'}</td>
+                      <td className="px-3 py-3 text-gray-500">{format(new Date(h.created_at), 'dd MMM yyyy HH:mm')}</td>
+                      <td className="px-3 py-3 text-right font-medium">{'\u00a3'}{h.invoice_net.toFixed(2)}</td>
+                      <td className="px-3 py-3 text-right text-amber-600">{h.topup_total > 0 ? `\u00a3${h.topup_total.toFixed(2)}` : '\u2014'}</td>
+                      <td className="px-3 py-3 text-right font-semibold">{'\u00a3'}{(h.invoice_net + h.topup_total).toFixed(2)}</td>
+                      <td className="px-3 py-3 text-center">
                         <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">{h.matched_count}</span>
                       </td>
-                      <td className="px-4 py-3 text-center">
+                      <td className="px-3 py-3 text-center">
                         <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${issues > 0 ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>{issues}</span>
                       </td>
-                      <td className="px-4 py-3 text-gray-500 text-xs">
-                        <div>{h.created_by}</div>
+                      <td className="px-3 py-3 text-gray-500 text-xs">
+                        <div className="max-w-[80px] truncate" title={h.created_by}>{h.created_by?.split('@')[0]}</div>
                         {h.approved_by
-                          ? <div className="mt-0.5 text-[10px] font-medium text-green-700" title={h.approved_at ? format(new Date(h.approved_at), 'dd MMM yyyy HH:mm') : ''}>{'\u2713'} Approved: {h.approved_by}</div>
-                          : phase1 && <button onClick={e => { e.stopPropagation(); approve(h) }} className="mt-0.5 text-[10px] font-medium text-navy underline">Approve (accounts)</button>}
+                          ? <div className="mt-0.5 text-[10px] font-medium text-green-700" title={h.approved_at ? `Approved ${format(new Date(h.approved_at), 'dd MMM yyyy HH:mm')}` : ''}>{'\u2713'} {h.approved_by}</div>
+                          : phase1 && <button onClick={e => { e.stopPropagation(); approve(h) }} className="mt-1 px-2 py-0.5 rounded border border-navy/30 text-[11px] font-medium text-navy hover:bg-navy hover:text-white">Approve</button>}
                       </td>
                     </tr>
                     {isExpanded && (
@@ -499,7 +498,7 @@ export default function ReconciliationHistory() {
                         </td>
                       </tr>
                     )}
-                  </>
+                  </Fragment>
                 )
               })}
             </tbody>
