@@ -3106,6 +3106,8 @@ export default function Reconciliation() {
               const deptRows = row.isTopUp && row.lineLabel === 'Minimum TopUp'
                 ? departmentDisplayRows.filter(r => r.departmentName === row.departmentName) : null
               const usage = deptRows ? deptRows.filter(r => !r.isTopUp).reduce((s, r) => s + r.invoiceNet, 0) : 0
+              const topUpTotal = deptRows ? departmentDisplayRows.filter(r => r.isTopUp && r.lineLabel === 'Minimum TopUp').reduce((s, r) => s + r.invoiceNet, 0) : 0
+              const napkinTopUpQty = deptRows && napkinSummary ? napkinSummary.weeks.reduce((s, w) => s + w.topUpQty, 0) : 0
               return (<Fragment key={i}>
               <tr className={`border-b border-gray-100 ${row.isTopUp ? 'bg-amber-50/20' : ''}`}>
                 <td className={`px-4 py-2.5 ${row.isTopUp ? 'pl-8 italic text-gray-500 text-xs' : 'font-medium'}`}>
@@ -3124,7 +3126,8 @@ export default function Reconciliation() {
                 <tr className="border-b border-gray-200 bg-gray-50/70">
                   <td className="px-4 py-2 pl-8 text-xs font-semibold text-gray-800">
                     {row.departmentName} {'\u2014'} Total cost (usage {'\u00a3'}{usage.toFixed(2)} + minimum top-up {'\u00a3'}{row.invoiceNet.toFixed(2)})
-                    {usage + row.invoiceNet > 0 && <span className="ml-1 font-normal text-gray-500">{'\u00b7'} top-up is {((row.invoiceNet / (usage + row.invoiceNet)) * 100).toFixed(0)}% of the total</span>}
+                    {topUpTotal > 0 && <span className="ml-1 font-normal text-gray-500">{'\u00b7'} carries {((row.invoiceNet / topUpTotal) * 100).toFixed(0)}% of the {'\u00a3'}{topUpTotal.toFixed(2)} minimum top-up{napkinTopUpQty > 0 ? ` (≈${Math.round(napkinTopUpQty * row.invoiceNet / topUpTotal).toLocaleString()} of ${napkinTopUpQty.toLocaleString()} napkins)` : ''}</span>}
+                    {usage + row.invoiceNet > 0 && <span className="ml-1 font-normal text-gray-500">{'\u00b7'} top-up is {((row.invoiceNet / (usage + row.invoiceNet)) * 100).toFixed(0)}% of this department{'\u2019'}s cost</span>}
                   </td>
                   <td className="px-4 py-2" />
                   <td className="px-4 py-2 text-right text-xs font-semibold">{'\u00a3'}{(usage + row.invoiceNet).toFixed(2)}</td>
