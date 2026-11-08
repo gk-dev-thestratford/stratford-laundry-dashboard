@@ -5,6 +5,9 @@ import { supabase } from '../lib/supabase'
 import { MONTHS } from '../types'
 import { format } from 'date-fns'
 import { utils, writeFile } from 'xlsx'
+import CreditNotesPanel from '../components/reconciliation/CreditNotesPanel'
+import OpenItemsPanel from '../components/reconciliation/OpenItemsPanel'
+import { approveReconciliation, phase1Available } from '../lib/reconPhase1'
 
 interface SavedReconciliation {
   id: string
@@ -41,6 +44,9 @@ interface SavedReconciliation {
     d140GrandTotal: number
   } | null
   d140_margin_pct: number | null
+  /** Sign-off by accounts (migration 2026-11-08) */
+  approved_by?: string | null
+  approved_at?: string | null
 }
 
 export default function ReconciliationHistory() {
@@ -51,6 +57,22 @@ export default function ReconciliationHistory() {
   const [year, setYear] = useState(new Date().getFullYear())
   const [month, setMonth] = useState(0) // 0 = All
   const [categoryFilter, setCategoryFilter] = useState('all')
+  const [phase1, setPhase1] = useState(false)
+  useEffect(() => { phase1Available().then(setPhase1) }, [])
+
+  // Accounts sign-off: records who approved the saved reconciliation and when
+  const approve = async (h: SavedReconciliation) => {
+    const { data: { user } } = await supabase.auth.getUser()
+    let name = user?.email ?? 'unknown'
+    if (user) {
+      const { data: du } = await supabase.from('dashboard_users').select('name').eq('id', user.id).maybeSingle()
+      if (du?.name) name = du.name
+    }
+    if (!window.confirm(`Approve the ${h.invoice_category ?? ''} reconciliation of ${h.invoice_number || 'this invoice'} as ${name}?`)) return
+    const err = await approveReconciliation(h.id, name)
+    if (err) { window.alert(`Could not approve: ${err}`); return }
+    setHistory(prev => prev.map(x => x.id === h.id ? { ...x, approved_by: name, approved_at: new Date().toISOString() } : x))
+  }
 
   const filteredHistory = useMemo(() => {
     return history.filter(h => {
@@ -264,6 +286,8 @@ export default function ReconciliationHistory() {
           <p className="text-sm text-gray-400 mt-1">Upload an invoice on the Reconciliation page and click Save to create a record</p>
         </div>
       ) : (<>
+        {phase1 && <OpenItemsPanel />}
+        {phase1 && <CreditNotesPanel />}
         {/* Filters — same style as Orders page */}
         <div className="space-y-4 mb-4">
           {/* Year selector + Month pills */}
@@ -351,7 +375,12 @@ export default function ReconciliationHistory() {
                       <td className="px-4 py-3 text-center">
                         <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${issues > 0 ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>{issues}</span>
                       </td>
-                      <td className="px-4 py-3 text-gray-500 text-xs">{h.created_by}</td>
+                      <td className="px-4 py-3 text-gray-500 text-xs">
+                        <div>{h.created_by}</div>
+                        {h.approved_by
+                          ? <div className="mt-0.5 text-[10px] font-medium text-green-700" title={h.approved_at ? format(new Date(h.approved_at), 'dd MMM yyyy HH:mm') : ''}>{'\u2713'} Approved: {h.approved_by}</div>
+                          : phase1 && <button onClick={e => { e.stopPropagation(); approve(h) }} className="mt-0.5 text-[10px] font-medium text-navy underline">Approve (accounts)</button>}
+                      </td>
                     </tr>
                     {isExpanded && (
                       <tr key={`${h.id}-detail`}>

@@ -89,6 +89,9 @@ function isMissingTable(err: { message?: string; code?: string } | null): boolea
 
 export async function fetchLineNotes(invoiceNumber: string): Promise<{ notes: LineNote[]; available: boolean }> {
   if (!invoiceNumber) return { notes: [], available: true }
+  // Who-pays columns exist only after migration 2026-11-08; fall back to the base columns
+  const ext = await supabase.from('reconciliation_line_notes').select(`${NOTE_COLS}, recharge_status, folio_ref, weight_kg`).eq('invoice_number', invoiceNumber).limit(1000)
+  if (!ext.error) return { notes: (ext.data ?? []) as LineNote[], available: true }
   const { data, error } = await supabase.from('reconciliation_line_notes').select(NOTE_COLS).eq('invoice_number', invoiceNumber).limit(1000)
   if (error) {
     if (!isMissingTable(error)) console.error('Failed to load line notes:', error)
@@ -98,8 +101,11 @@ export async function fetchLineNotes(invoiceNumber: string): Promise<{ notes: Li
 }
 
 export async function upsertLineNote(n: LineNote): Promise<string | null> {
-  const { error } = await supabase.from('reconciliation_line_notes')
-    .upsert({ ...n, updated_at: new Date().toISOString() }, { onConflict: 'invoice_number,line_key' })
+  // Only send the who-pays fields when they are set, so saving still works on a database
+  // where migration 2026-11-08 hasn't been run yet.
+  const row: Record<string, unknown> = { ...n, updated_at: new Date().toISOString() }
+  for (const k of ['recharge_status', 'folio_ref', 'weight_kg'] as const) if (row[k] === undefined) delete row[k]
+  const { error } = await supabase.from('reconciliation_line_notes').upsert(row, { onConflict: 'invoice_number,line_key' })
   if (error) { console.error('Failed to save line note:', error); return error.message }
   return null
 }

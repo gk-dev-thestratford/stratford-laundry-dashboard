@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { Mail, Plus, Trash2, Loader2, Settings } from 'lucide-react'
 import { format } from 'date-fns'
 import { supabase } from '../lib/supabase'
+import GoldstarContactsCard from '../components/reconciliation/GoldstarContactsCard'
 
 /**
  * Configuration — the dashboard acts as the back office for the tablet app.
@@ -153,6 +154,9 @@ export default function Configuration() {
           </div>
         </div>
       </section>
+
+      {/* ── Goldstar contacts for credit note requests (Reconciliation) ── */}
+      <GoldstarContactsCard />
     </div>
   )
 }

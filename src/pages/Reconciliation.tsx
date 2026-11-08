@@ -11,6 +11,11 @@ import { downloadReconciliationPdf, generateReconciliationPdfBlob, type Departme
 import { computeOrderCost } from '../lib/orderCost'
 import { CHEF_WEEKLY_MINIMUMS, CHEF_TOPUP_RATES, NAPKIN_WEEKLY_MINIMUM, NAPKIN_RATE } from '../lib/minimums'
 import {
+  phase1Available, logAction, fetchActions, loadDraft, saveDraft,
+  fetchOrderResolutions, setOrderResolution, clearOrderResolution, fetchOpenExpected, markExpectedFound,
+  ORDER_RESOLUTION_LABELS, type ReconAction, type OrderResolution, type OrderResolutionRow,
+} from '../lib/reconPhase1'
+import {
   buildLineKeys, fetchLineNotes, upsertLineNote, deleteLineNote, fetchGroupFolios, upsertGroupFolio,
   fetchKnownGroupNames, chargeLabel, chargeBucket, CHARGE_TYPE_LABELS, isExplainedType,
   type LineNote, type GroupFolio, type ChargeType,
@@ -18,6 +23,9 @@ import {
 import type { Order, OrderType, Department } from '../types'
 import { ORDER_TYPE_LABELS } from '../types'
 import { utils, writeFile } from 'xlsx'
+import CreditRequestModal from '../components/reconciliation/CreditRequestModal'
+import CreditNotesPanel from '../components/reconciliation/CreditNotesPanel'
+import type { CreditLine } from '../lib/reconPhase1'
 import { format } from 'date-fns'
 
 // ── Types ──
@@ -727,7 +735,25 @@ export default function Reconciliation() {
   const applyGroupFolios = (rows: Record<string, GroupFolio>) => { groupFoliosRef.current = rows; setGroupFolios(rows) }
   const [knownGroups, setKnownGroups] = useState<string[]>([])
   const [noteModal, setNoteModal] = useState<ReconciliationRow | null>(null)
-  const [noteForm, setNoteForm] = useState<{ type: ChargeType; room: string; group: string; note: string; orderId: string | null }>({ type: 'note', room: '', group: '', note: '', orderId: null })
+  const [noteForm, setNoteForm] = useState<{ type: ChargeType; room: string; group: string; note: string; orderId: string | null; recharge: '' | 'recharged' | 'not_yet' | 'not_chargeable'; folio: string; kg: string }>({ type: 'note', room: '', group: '', note: '', orderId: null, recharge: '', folio: '', kg: '' })
+  // Phase 1 tables (migration 2026-11-08) present? Enables service wash / who-pays fields,
+  // history, autosaved invoice note, In-System-Only resolutions, credit notes.
+  const [phase1, setPhase1] = useState(false)
+  useEffect(() => { phase1Available().then(setPhase1) }, [])
+  const [actions, setActions] = useState<ReconAction[]>([])
+  const [orderRes, setOrderRes] = useState<Record<string, OrderResolutionRow>>({})
+  const [expectedFromBefore, setExpectedFromBefore] = useState<{ row: OrderResolutionRow; order: Order | null }[]>([])
+  const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null)
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Ticked invoice lines (by line key) and ticked In-System-Only orders (by order id)
+  const [selectedLines, setSelectedLines] = useState<Set<string>>(new Set())
+  const [selectedOrders, setSelectedOrders] = useState<Set<string>>(new Set())
+  const [bulkModal, setBulkModal] = useState<null | 'explain' | 'note'>(null)
+  const [bulkForm, setBulkForm] = useState<{ type: ChargeType; group: string; recharge: '' | 'recharged' | 'not_yet' | 'not_chargeable'; folio: string; note: string }>({ type: 'group', group: '', recharge: '', folio: '', note: '' })
+  const [bulkSaving, setBulkSaving] = useState(false)
+  const [bulkError, setBulkError] = useState('')
+  const [creditLines, setCreditLines] = useState<CreditLine[] | null>(null)
+  const [creditRefresh, setCreditRefresh] = useState(0)
   const [noteSaving, setNoteSaving] = useState(false)
   const [noteError, setNoteError] = useState('')
   const [noteCandidates, setNoteCandidates] = useState<Order[]>([])
@@ -845,6 +871,7 @@ export default function Reconciliation() {
     setNotFoundResolutions({}); setMissingResolutions({}); setChallengedItems(new Set())
     setReconciliationNote(''); setLineNotes({}); setRestoredFrom(null)
     applyNoteRows({}); applyGroupFolios({}); setNotesAvailable(true)
+    setActions([]); setOrderRes({}); setExpectedFromBefore([]); setDraftSavedAt(null); setSelectedLines(new Set()); setSelectedOrders(new Set())
     try {
       // Handles both Goldstar layouts (legacy text lines and the 2026-09 column table)
       const parsed = await parseInvoiceFile(f)
@@ -887,6 +914,21 @@ export default function Reconciliation() {
           if (prevRec.notes) setReconciliationNote(prevRec.notes)
           setRestoredFrom(prevRec.created_at)
         }
+        // Phase 1: autosaved invoice note (newer than the last Save wins), history,
+        // In-System-Only resolutions, and items expected from earlier invoices
+        if (await phase1Available()) {
+          const inv = parsed.invoiceNumber
+          const [draft, acts, res, expected] = await Promise.all([loadDraft(inv), fetchActions(inv), fetchOrderResolutions(inv), fetchOpenExpected(inv)])
+          if (draft && (!prevRec || draft.updated_at > prevRec.created_at)) { setReconciliationNote(draft.note ?? ''); setDraftSavedAt(draft.updated_at) }
+          setActions(acts)
+          setOrderRes(Object.fromEntries(res.map(r => [r.order_id, r])))
+          const types = new Set(parsed.sections.map(sec => sectionTypeToOrderType(sec.type)))
+          if (expected.length) {
+            const { data: exOrders } = await supabase.from('orders').select('*, department:departments(*), order_items(*)').in('id', expected.map(e => e.order_id))
+            const byId = new Map(((exOrders as Order[] | null) ?? []).map(o => [o.id, o]))
+            setExpectedFromBefore(expected.map(row => ({ row, order: byId.get(row.order_id) ?? null })).filter(x => x.order && types.has(x.order.order_type)))
+          }
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to parse PDF')
@@ -904,6 +946,7 @@ export default function Reconciliation() {
     setChallengedItems(new Set()); setAddModal(null); setShowSaveConfirm(false)
     setD140Report(null); setShowD140Prompt(false); setLastSavedRecId(null); setD140Saved(false)
     applyNoteRows({}); applyGroupFolios({}); setNoteModal(null)
+    setActions([]); setOrderRes({}); setExpectedFromBefore([]); setDraftSavedAt(null); setSelectedLines(new Set()); setSelectedOrders(new Set())
   }
 
   // ── Line notes ("Charge to") ──
@@ -925,6 +968,7 @@ export default function Reconciliation() {
     setNoteForm({
       type: n?.charge_type ?? (noRoomGuest ? 'room_missing' : 'note'),
       room: n?.room_override ?? '', group: n?.group_name ?? '', note: n?.note ?? '', orderId: n?.order_id ?? null,
+      recharge: n?.recharge_status ?? '', folio: n?.folio_ref ?? '', kg: n?.weight_kg != null ? String(n.weight_kg) : '',
     })
     setNoteError(''); setNoteCandidateSearch(''); setNoteCandidates([])
     setNoteModal(row)
@@ -952,7 +996,8 @@ export default function Reconciliation() {
     const group = f.group.trim()
     if (!remove) {
       if (f.type === 'room_missing' && !room && !f.orderId) { setNoteError('Type the room number, or pick the guest order below.'); return }
-      if (f.type === 'group' && !group) { setNoteError('Enter the group name.'); return }
+      if ((f.type === 'group' || f.type === 'service_wash') && !group) { setNoteError('Enter who pays (group / account).'); return }
+      if (f.type === 'other' && !f.note.trim()) { setNoteError('A note is required: why is this charge accepted?'); return }
     }
     setNoteSaving(true); setNoteError('')
     const isEmpty = f.type === 'note' && !f.note.trim()
@@ -960,7 +1005,7 @@ export default function Reconciliation() {
     const next = { ...noteRowsRef.current }
     if (remove || isEmpty) {
       err = await deleteLineNote(invoice.invoiceNumber, key)
-      if (!err) delete next[key]
+      if (!err) { delete next[key]; logAction({ invoice_number: invoice.invoiceNumber, line_key: key, action: 'Cleared tag / note' }) }
     } else {
       const { data: { user } } = await supabase.auth.getUser()
       const n: LineNote = {
@@ -969,12 +1014,18 @@ export default function Reconciliation() {
         description: line.description || null, net: line.net,
         charge_type: f.type,
         room_override: f.type === 'room_missing' ? (room || null) : null,
-        group_name: f.type === 'group' || f.type === 'house' || f.type === 'other' ? (group || null) : null,
+        group_name: isExplainedType(f.type) ? (group || null) : null,
         note: f.note.trim() || null,
         order_id: f.type === 'room_missing' ? f.orderId : null,
         updated_by: user?.email ?? null,
       }
+      if (phase1 && isExplainedType(f.type)) {
+        n.recharge_status = f.recharge || null
+        n.folio_ref = f.folio.trim() || null
+        n.weight_kg = f.kg.trim() && !isNaN(Number(f.kg)) ? Number(f.kg) : null
+      }
       err = await upsertLineNote(n)
+      if (!err) logAction({ invoice_number: invoice.invoiceNumber, line_key: key, action: chargeLabel(n), detail: [n.note, n.recharge_status ? `charged on: ${n.recharge_status.replace('_', ' ')}` : '', n.folio_ref ? `folio ${n.folio_ref}` : ''].filter(Boolean).join(' · ') || null })
       if (!err) next[key] = { ...n, updated_at: new Date().toISOString() }
     }
     setNoteSaving(false)
@@ -983,9 +1034,10 @@ export default function Reconciliation() {
     // Re-match with the new tag before closing, so the row's result is visible on close
     setNoteSaving(true)
     await refetchAndReconcile()
+    if (invoice.invoiceNumber) fetchActions(invoice.invoiceNumber).then(setActions)
     setNoteSaving(false)
     setNoteModal(null)
-  }, [noteModal, invoice, lineKeys, notesAvailable, noteForm, refetchAndReconcile])
+  }, [noteModal, invoice, lineKeys, notesAvailable, noteForm, refetchAndReconcile, phase1])
 
   const removeUnattachedNote = useCallback(async (n: LineNote) => {
     const err = await deleteLineNote(n.invoice_number, n.line_key)
@@ -1187,6 +1239,72 @@ export default function Reconciliation() {
   const matchedRoomDays = useMemo(() => new Set((result?.rows ?? [])
     .filter(r => r.order && r.sectionType === 'guest_laundry' && r.invoiceLine.ticket)
     .map(r => `${r.invoiceLine.date}|${r.invoiceLine.ticket}`)), [result])
+
+  // ── Bulk: explain / add note on all ticked lines (one note, required) ──
+  const applyBulk = async () => {
+    if (!invoice?.invoiceNumber || !bulkModal) return
+    if (!notesAvailable) { setBulkError('The line-notes table is not available.'); return }
+    if (!bulkForm.note.trim()) { setBulkError('A note is required for actions on several lines.'); return }
+    if (bulkModal === 'explain' && (bulkForm.type === 'group' || bulkForm.type === 'service_wash') && !bulkForm.group.trim()) { setBulkError('Enter who pays (group / account).'); return }
+    setBulkSaving(true); setBulkError('')
+    const { data: { user } } = await supabase.auth.getUser()
+    const next = { ...noteRowsRef.current }
+    for (const [line, key] of lineKeys) {
+      if (!selectedLines.has(key)) continue
+      const existing = next[key]
+      const n: LineNote = bulkModal === 'note' && existing
+        ? { ...existing, note: bulkForm.note.trim(), updated_by: user?.email ?? null }
+        : {
+          invoice_number: invoice.invoiceNumber, line_key: key, line_date: line.date, ticket: line.ticket || null,
+          guest_label: line.guestInfo ?? null, description: line.description || null, net: line.net,
+          charge_type: bulkModal === 'explain' ? bulkForm.type : 'note', room_override: null,
+          group_name: bulkModal === 'explain' ? (bulkForm.group.trim() || null) : null,
+          note: bulkForm.note.trim(), order_id: null, updated_by: user?.email ?? null,
+        }
+      if (bulkModal === 'explain' && phase1) { n.recharge_status = bulkForm.recharge || null; n.folio_ref = bulkForm.folio.trim() || null }
+      const err = await upsertLineNote(n)
+      if (err) { setBulkError(`Could not save: ${err}`); setBulkSaving(false); applyNoteRows(next); return }
+      next[key] = { ...n, updated_at: new Date().toISOString() }
+      logAction({ invoice_number: invoice.invoiceNumber, line_key: key, action: bulkModal === 'explain' ? `${chargeLabel(n)} (bulk)` : 'Note (bulk)', detail: n.note })
+    }
+    applyNoteRows(next)
+    await refetchAndReconcile()
+    fetchActions(invoice.invoiceNumber).then(setActions)
+    setBulkSaving(false); setBulkModal(null); setSelectedLines(new Set())
+  }
+
+  // ── Credit note request: one line per ticked invoice line, reason + amount pre-filled ──
+  const openCreditRequestFor = (onlyKey?: string) => () => openCreditRequest(onlyKey ? new Set([onlyKey]) : undefined)
+  const openCreditRequest = (keys?: Set<string>) => {
+    if (!result) return
+    const wanted = keys ?? selectedLines
+    const lines: CreditLine[] = []
+    for (const r of result.rows) {
+      const key = lineKeys.get(r.invoiceLine)
+      if (!key || !wanted.has(key)) continue
+      const invQty = r.invoiceLine.items.reduce((sum, it) => sum + it.quantity, 0)
+      const sysQty = (r.order?.order_items ?? []).reduce((sum, it) => sum + (it.quantity_sent ?? 0), 0)
+      let reason: CreditLine['reason'] = 'not_ours', credit = r.invoiceLine.net, text = ''
+      if (r.status === 'price_mismatch') { reason = 'wrong_price'; credit = Math.max(0, +(r.invoiceLine.net - r.systemTotal).toFixed(2)); text = `invoiced £${r.invoiceLine.net.toFixed(2)}, our records £${r.systemTotal.toFixed(2)}` }
+      else if (r.order && invQty > sysQty && sysQty > 0) { reason = 'wrong_quantity'; credit = +((invQty - sysQty) / invQty * r.invoiceLine.net).toFixed(2); text = `charged ${invQty}, sent ${sysQty}` }
+      else if (r.order) { reason = 'other'; credit = 0 }
+      lines.push({
+        line_key: key, date: r.invoiceLine.date, ticket: r.invoiceLine.ticket,
+        guest: [r.invoiceLine.guestInfo?.replace(/[()]/g, ''), r.invoiceLine.serviceNote].filter(Boolean).join(' '),
+        description: r.invoiceLine.description, invoice_net: r.invoiceLine.net, reason, reason_text: text, credit_net: credit,
+      })
+    }
+    if (lines.length) setCreditLines(lines)
+  }
+  const creditRequestButton = phase1 && invoice?.invoiceNumber
+    ? <button onClick={() => openCreditRequest()} className="px-2.5 py-1 text-xs text-white bg-orange-600 rounded">Request credit note{'\u2026'}</button>
+    : null
+
+  const actionsByLine = useMemo(() => {
+    const m = new Map<string, ReconAction[]>()
+    for (const a of actions) if (a.line_key) { if (!m.has(a.line_key)) m.set(a.line_key, []); m.get(a.line_key)!.push(a) }
+    return m
+  }, [actions])
 
   const filteredRows = useMemo(() => {
     if (!result) return []
@@ -1797,6 +1915,13 @@ export default function Reconciliation() {
       if (stampErr) console.error('Failed to stamp orders as reconciled:', stampErr)
     }
 
+    if (savedRec && invoice.invoiceNumber && expectedFromBefore.length) {
+      const found = expectedFromBefore.filter(x => x.order && result.matchedOrderIds.includes(x.order.id)).map(x => x.row)
+      if (found.length) {
+        await markExpectedFound(found, invoice.invoiceNumber)
+        for (const f of found) logAction({ invoice_number: invoice.invoiceNumber, order_id: f.order_id, action: 'Expected order found', detail: `expected from ${f.invoice_number}` })
+      }
+    }
     if (savedRec && notesAvailable && invoice.invoiceNumber) {
       // Older per-line notes saved in the jsonb snapshot (keyed by notFoundKey) move into
       // the line-notes table once, so there is a single source of truth from now on.
@@ -1888,7 +2013,7 @@ export default function Reconciliation() {
     setSaving(false); setSaved(true); loadHistory()
     // Prompt for D140 upload after saving a guest invoice
     if (invoice.sections.some(s => s.type === 'guest')) setShowD140Prompt(true)
-  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote, notFoundResolutions, missingResolutions, challengedItems, lineNotes, notesAvailable, lineKeys, chargeDetailByDept, pdfChargeGroups])
+  }, [result, invoice, file, loadHistory, napkinSummary, uniformMinSummary, reconciliationNote, notFoundResolutions, missingResolutions, challengedItems, lineNotes, notesAvailable, lineKeys, chargeDetailByDept, pdfChargeGroups, expectedFromBefore])
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
@@ -1919,9 +2044,10 @@ export default function Reconciliation() {
       }
     }
 
-    // Missing resolutions
+    // Missing resolutions (old in-page ones, or Phase 1 DB-backed ones)
     for (const o of result.missingFromInvoice) {
-      const res = missingResolutions[o.id]
+      const db = orderRes[o.id]
+      const res = missingResolutions[o.id] ?? (db ? { type: db.resolution === 'expect_next' ? 'deferred' as const : 'written_off' as const } : undefined)
       if (res) {
         resolvedCount++
         if (res.type === 'written_off' || res.type === 'deferred') {
@@ -1944,7 +2070,7 @@ export default function Reconciliation() {
       explainedTotal: +explainedTotal.toFixed(2),
       explainedCount,
     }
-  }, [result, notFoundResolutions, missingResolutions, challengedItems, noteFor])
+  }, [result, notFoundResolutions, missingResolutions, challengedItems, noteFor, orderRes])
 
   // Count unresolved items for save validation
   const unresolvedCounts = useMemo(() => {
@@ -1957,10 +2083,10 @@ export default function Reconciliation() {
     }
     let missCount = 0, missTotal = 0
     for (const o of result.missingFromInvoice) {
-      if (!missingResolutions[o.id]) { missCount++; missTotal += computeOrderCost(o) }
+      if (!missingResolutions[o.id] && !orderRes[o.id]) { missCount++; missTotal += computeOrderCost(o) }
     }
     return { nfCount, nfTotal: +nfTotal.toFixed(2), missCount, missTotal: +missTotal.toFixed(2) }
-  }, [result, notFoundResolutions, missingResolutions, noteFor])
+  }, [result, notFoundResolutions, missingResolutions, noteFor, orderRes])
 
   const handleSaveClick = useCallback(() => {
     const hasIssues = unresolvedCounts.nfCount > 0 || unresolvedCounts.missCount > 0 || Math.abs(adjustedTotals.unresolvedDiff) >= 1
@@ -2208,6 +2334,7 @@ export default function Reconciliation() {
       if (errors.length > 0) {
         setPriceUpdateError(`Docket ${docket}: ${errors.join('; ')}`)
       }
+      logAction({ invoice_number: invoice.invoiceNumber || null, line_key: lineKeys.get(row.invoiceLine) ?? null, order_id: orderId, action: 'Price updated to invoice', detail: `£${row.systemTotal.toFixed(2)} → £${invoiceNet.toFixed(2)}` })
       await refetchAndReconcile()
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error'
@@ -2215,13 +2342,17 @@ export default function Reconciliation() {
     } finally {
       setUpdatingPrices(prev => { const next = new Set(prev); next.delete(orderId); return next })
     }
-  }, [invoice, refetchAndReconcile])
+  }, [invoice, lineKeys, refetchAndReconcile])
 
   // ── Action: delete a missing order ──
   const handleDeleteOrder = useCallback(async (orderId: string) => {
-    if (!window.confirm('Are you sure you want to delete this order? This cannot be undone.')) return
     if (!invoice) return
+    const o = orders.find(x => x.id === orderId)
+    const reason = window.prompt(`Delete order ${o?.docket_number ?? ''} permanently?\nThis cannot be undone. Use it only for an order entered by mistake (never sent).\n\nReason (required):`)
+    if (reason == null) return
+    if (!reason.trim()) { window.alert('A reason is required to delete an order.'); return }
     try {
+      await logAction({ invoice_number: invoice.invoiceNumber || null, order_id: orderId, action: 'Deleted order', detail: `${o?.docket_number ?? ''} ${o?.department?.name ?? ''} £${o ? computeOrderCost(o).toFixed(2) : ''}: ${reason.trim()}` })
       await supabase.from('order_items').delete().eq('order_id', orderId)
       await supabase.from('orders').delete().eq('id', orderId)
       setMissingResolutions(prev => { const next = { ...prev }; delete next[orderId]; return next })
@@ -2229,7 +2360,42 @@ export default function Reconciliation() {
     } catch (e) {
       console.error('Failed to delete order:', e)
     }
-  }, [invoice, refetchAndReconcile])
+  }, [invoice, refetchAndReconcile, orders])
+
+  // ── In System Only: DB-backed resolutions (Phase 1) ──
+  const resolveOrders = useCallback(async (ids: string[], resolution: OrderResolution) => {
+    if (!invoice?.invoiceNumber) return
+    let note: string | null = null
+    if (resolution === 'write_off') {
+      const r = window.prompt(`Write off ${ids.length} order${ids.length > 1 ? 's' : ''}: why? (required)`)
+      if (r == null) return
+      if (!r.trim()) { window.alert('A note is required to write off.'); return }
+      note = r.trim()
+    } else if (resolution === 'not_charged') {
+      const r = window.prompt(`Mark ${ids.length} order${ids.length > 1 ? 's' : ''} as not charged by Goldstar (counts as £0 in reports). Note (optional):`, '')
+      if (r == null) return
+      note = r.trim() || null
+    }
+    const next = { ...orderRes }
+    for (const id of ids) {
+      const err = await setOrderResolution(invoice.invoiceNumber, id, resolution, note)
+      if (err) { setPriceUpdateError(`Could not save: ${err}`); break }
+      next[id] = { invoice_number: invoice.invoiceNumber, order_id: id, resolution, note, found_on_invoice: null, created_by: null, created_at: new Date().toISOString() }
+    }
+    setOrderRes(next); setSelectedOrders(new Set())
+    if (resolution === 'not_charged') await refetchAndReconcile()
+    fetchActions(invoice.invoiceNumber).then(setActions)
+  }, [invoice, orderRes, refetchAndReconcile])
+
+  const unresolveOrder = useCallback(async (id: string) => {
+    if (!invoice?.invoiceNumber) return
+    const was = orderRes[id]
+    const err = await clearOrderResolution(invoice.invoiceNumber, id, was?.resolution === 'not_charged')
+    if (err) { setPriceUpdateError(`Could not undo: ${err}`); return }
+    const next = { ...orderRes }; delete next[id]; setOrderRes(next)
+    if (was?.resolution === 'not_charged') await refetchAndReconcile()
+    fetchActions(invoice.invoiceNumber).then(setActions)
+  }, [invoice, orderRes, refetchAndReconcile])
 
   // ── Action: Add invoice-only item to system ──
   // Orders that probably ARE this line (same service, same ticket / room / guest, ±3 days):
@@ -2363,6 +2529,7 @@ export default function Reconciliation() {
       // Mark as resolved
       const key = notFoundKey(row)
       setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system' } }))
+      logAction({ invoice_number: invoice.invoiceNumber || null, line_key: lineKeys.get(row.invoiceLine) ?? null, order_id: newOrder?.id ?? null, action: 'Added new order', detail: `docket ${docket} · £${row.invoiceLine.net.toFixed(2)}` })
 
       // Re-reconcile to pick up the new order
       await refetchAndReconcile()
@@ -2373,7 +2540,7 @@ export default function Reconciliation() {
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile, refKeyMap])
+  }, [addModal, addModalDept, addModalDocket, addModalDate, invoice, refetchAndReconcile, refKeyMap, lineKeys])
 
   // ── Action: Link this invoice line to an EXISTING order ──
   // Used when the order is already in the system but wasn't matched (wrong/changed ticket
@@ -2449,6 +2616,8 @@ export default function Reconciliation() {
         setNotFoundResolutions(prev => ({ ...prev, [key]: { type: 'added_to_system', note: addModalNote.trim() || undefined } }))
       }
       if (addModalNote.trim()) setLineNotes(prev => ({ ...prev, [key]: addModalNote.trim() }))
+      logAction({ invoice_number: invoice.invoiceNumber || null, line_key: lineKeys.get(row.invoiceLine) ?? null, order_id: target.id, action: 'Linked to order', detail: `${target.docket_number}${correction}${addModalNote.trim() ? ` · ${addModalNote.trim()}` : ''}` })
+      if (invoice.invoiceNumber) fetchActions(invoice.invoiceNumber).then(setActions)
       await refetchAndReconcile()
       setAddModal(null); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkSearch(''); setAddModalMode('create')
       setAddModalLinkDocket(''); setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([]); setAddModalLinkDept('')
@@ -2458,7 +2627,7 @@ export default function Reconciliation() {
     } finally {
       setAddModalSaving(false)
     }
-  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, addModalLinkDept, orders, addModalLinkDbResults, refetchAndReconcile, refKeyMap])
+  }, [addModal, invoice, addModalLinkOrderId, addModalNote, addModalLinkDocket, addModalLinkUpdatePrice, addModalLinkDept, orders, addModalLinkDbResults, refetchAndReconcile, refKeyMap, lineKeys])
 
   // ── Open the Add/Link modal for ANY row (not-found, mismatch, or matched) ──
   // Lets the user link/relink a line to the right order (by docket, room, name…) and add
@@ -2894,9 +3063,20 @@ export default function Reconciliation() {
           <h3 className="text-sm font-semibold text-gray-900">Notes / Invoice Issues</h3>
           <span className="text-xs text-gray-400">— recorded on the saved report (PDF & Excel)</span>
         </div>
+        {phase1 && invoice.invoiceNumber && (
+          <p className="text-[11px] mb-1.5 text-gray-500">{draftSavedAt ? <span className="text-green-700">{'\u2713'} Draft saved {format(new Date(draftSavedAt), 'HH:mm')}: kept even if you re-upload without Save</span> : 'Saves automatically as you type'}</p>
+        )}
         <textarea
           value={reconciliationNote}
-          onChange={e => setReconciliationNote(e.target.value)}
+          onChange={e => {
+            const v = e.target.value
+            setReconciliationNote(v)
+            if (phase1 && invoice.invoiceNumber) {
+              if (draftTimer.current) clearTimeout(draftTimer.current)
+              const inv = invoice.invoiceNumber
+              draftTimer.current = setTimeout(async () => { if (!(await saveDraft(inv, v))) setDraftSavedAt(new Date().toISOString()) }, 900)
+            }
+          }}
           rows={3}
           placeholder={'e.g. Ticket 7208 doesn’t exist — should be 6208 (linked). Napkins billed at £0.22 but agreed rate is £0.215 — query with Goldstar. Charged £4.37 for jacket+apron (should be £2.40).'}
           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy/30 resize-y"
@@ -3350,6 +3530,11 @@ export default function Reconciliation() {
         </div>
       )}
 
+      {phase1 && invoice.invoiceNumber && (
+        <CreditNotesPanel invoiceNumber={invoice.invoiceNumber} refreshKey={creditRefresh}
+          creditLinesOnInvoice={invoice.sections.flatMap(sec => sec.lines).filter(l => l.net < 0).map(l => ({ date: l.date, description: l.description, net: l.net, gross: l.gross }))} />
+      )}
+
       {/* Search + Filter tabs */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="relative">
@@ -3380,11 +3565,54 @@ export default function Reconciliation() {
       </div>
       </div>
 
+      {/* Bulk actions for ticked lines / orders */}
+      {filter !== 'missing' && selectedLines.size > 0 && (
+        <div className="sticky top-2 z-20 bg-sky-50 border border-sky-200 rounded-xl px-4 py-2.5 flex flex-wrap items-center gap-2 text-sm shadow-sm">
+          <b>{selectedLines.size} line{selectedLines.size > 1 ? 's' : ''} selected</b>
+          <span className="text-gray-500">{'\u00b7'} {'\u00a3'}{(result?.rows ?? []).filter(r => { const k = lineKeys.get(r.invoiceLine); return k && selectedLines.has(k) }).reduce((s2, r) => s2 + r.invoiceLine.net, 0).toFixed(2)}</span>
+          <span className="ml-auto flex flex-wrap gap-1.5">
+            <button onClick={() => { setBulkForm({ type: 'group', group: '', recharge: '', folio: '', note: '' }); setBulkError(''); setBulkModal('explain') }} className="px-2.5 py-1 text-xs text-white bg-navy rounded">Explain as{'\u2026'}</button>
+            {creditRequestButton}
+            <button onClick={() => { setBulkForm(f => ({ ...f, note: '' })); setBulkError(''); setBulkModal('note') }} className="px-2.5 py-1 text-xs border border-gray-300 rounded bg-white">Add note</button>
+            <button onClick={() => setSelectedLines(new Set())} className="px-2.5 py-1 text-xs border border-gray-300 rounded bg-white">Clear selection</button>
+          </span>
+        </div>
+      )}
+      {filter === 'missing' && phase1 && selectedOrders.size > 0 && (
+        <div className="sticky top-2 z-20 bg-sky-50 border border-sky-200 rounded-xl px-4 py-2.5 flex flex-wrap items-center gap-2 text-sm shadow-sm">
+          <b>{selectedOrders.size} order{selectedOrders.size > 1 ? 's' : ''} selected</b>
+          <span className="ml-auto flex flex-wrap gap-1.5">
+            <button onClick={() => resolveOrders([...selectedOrders], 'expect_next')} className="px-2.5 py-1 text-xs border border-gray-300 rounded bg-white">Expect next invoice</button>
+            <button onClick={() => resolveOrders([...selectedOrders], 'not_charged')} className="px-2.5 py-1 text-xs text-white bg-teal-600 rounded">Not charged (£0)</button>
+            <button onClick={() => resolveOrders([...selectedOrders], 'write_off')} className="px-2.5 py-1 text-xs border border-gray-300 rounded bg-white">Write off</button>
+            <button onClick={() => setSelectedOrders(new Set())} className="px-2.5 py-1 text-xs border border-gray-300 rounded bg-white">Clear selection</button>
+          </span>
+        </div>
+      )}
+
+      {/* Expected from earlier invoices ("Expect on next invoice") */}
+      {expectedFromBefore.length > 0 && result && (() => {
+        const found = expectedFromBefore.filter(x => x.order && result.matchedOrderIds.includes(x.order.id))
+        const missing = expectedFromBefore.filter(x => !(x.order && result.matchedOrderIds.includes(x.order.id)))
+        return (
+          <div className="bg-white rounded-xl border-2 border-indigo-200 p-4 text-sm">
+            <p className="font-semibold">Expected from earlier invoices: {expectedFromBefore.length} order{expectedFromBefore.length > 1 ? 's' : ''}</p>
+            <p className="text-xs text-gray-600 mt-1">
+              {found.length > 0 && <span className="text-green-700">{'\u2713'} found on this invoice: {found.map(x => x.order?.docket_number).join(', ')} (ticked off when you Save). </span>}
+              {missing.length > 0 && <span className="text-red-700">{'\u2717'} still missing: {missing.map(x => `${x.order?.docket_number} (${x.row.invoice_number})`).join(', ')}</span>}
+            </p>
+          </div>
+        )
+      })()}
+
       {/* Detail table — all tabs except missing */}
       {filter !== 'missing' ? (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden"><div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-gray-200 bg-gray-50">
+              <th className="w-8 px-3 py-3"><input type="checkbox" aria-label="Select all lines"
+                checked={filteredRows.length > 0 && filteredRows.every(r => { const k = lineKeys.get(r.invoiceLine); return !!k && selectedLines.has(k) })}
+                onChange={e => setSelectedLines(e.target.checked ? new Set(filteredRows.map(r => lineKeys.get(r.invoiceLine)).filter((k): k is string => !!k)) : new Set())} /></th>
               <th className="w-10 px-3 py-3" />
               <th className="px-3 py-3 text-left font-medium text-gray-600">Date</th>
               <th className="px-3 py-3 text-left font-medium text-gray-600">Docket</th>
@@ -3398,7 +3626,7 @@ export default function Reconciliation() {
             </tr></thead>
             <tbody>
               {filteredRows.length === 0
-                ? <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
+                ? <tr><td colSpan={11} className="px-4 py-12 text-center text-gray-500">No items in this category</td></tr>
                 : filteredRows.map((row, i) => {
                 const nfKey = notFoundKey(row)
                 const nfRes = row.status === 'not_found' ? notFoundResolutions[nfKey] : undefined
@@ -3416,6 +3644,8 @@ export default function Reconciliation() {
                   || nfRes?.note
                   || row.order?.notes?.match(/Note:\s*([^[]+)/)?.[1]?.trim()
                 const explained = row.status === 'not_found' && isExplainedType(tag?.charge_type)
+                const lineKey = lineKeys.get(row.invoiceLine)
+                const history = lineKey ? actionsByLine.get(lineKey) ?? [] : []
                 const secondBag = row.status === 'not_found' && row.sectionType === 'guest_laundry' && !!row.invoiceLine.ticket
                   && matchedRoomDays.has(`${row.invoiceLine.date}|${row.invoiceLine.ticket}`)
                 return (
@@ -3427,6 +3657,8 @@ export default function Reconciliation() {
                   row.status === 'price_mismatch' ? 'bg-amber-50/50' :
                   row.status === 'not_found' ? 'bg-red-50/50' : ''
                 }`}>
+                  <td className="px-3 py-2.5">{lineKey && <input type="checkbox" checked={selectedLines.has(lineKey)}
+                    onChange={e => setSelectedLines(prev => { const n = new Set(prev); if (e.target.checked) n.add(lineKey); else n.delete(lineKey); return n })} />}</td>
                   <td className="px-3 py-2.5 text-center">{explained ? <Tag className="w-4 h-4 text-indigo-500 inline" /> : statusIcon(row.status, row.minorVariance)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
@@ -3456,6 +3688,12 @@ export default function Reconciliation() {
                     {rowNote && (
                       <p className="mt-1 font-sans font-normal text-[11px] italic text-gray-600 border-l-2 border-amber-300 pl-2 max-w-[260px] whitespace-normal">
                         {rowNote}{tag?.note && tag.updated_by ? <span className="not-italic text-gray-400"> {'\u00b7'} {tag.updated_by.split('@')[0]}{tag.updated_at ? ` ${tag.updated_at.slice(8, 10)}/${tag.updated_at.slice(5, 7)}` : ''}</span> : null}
+                      </p>
+                    )}
+                    {history.length > 0 && (
+                      <p className="mt-1 font-sans font-normal text-[10px] text-gray-400 cursor-help w-fit"
+                        title={history.map(h => `${format(new Date(h.created_at), 'dd/MM HH:mm')} · ${(h.actor ?? '').split('@')[0]} · ${h.action}${h.detail ? `: ${h.detail}` : ''}`).join('\n')}>
+                        History ({history.length})
                       </p>
                     )}
                     {row.order && isInactiveOrder(row.order) && (
@@ -3538,11 +3776,18 @@ export default function Reconciliation() {
                     {row.status === 'not_found' && !nfRes && (
                       <div className="flex items-center gap-1 justify-center">
                         <button
-                          onClick={() => openAddModal(row, i, 'link')}
+                          onClick={() => openNoteModal(row)}
                           className="px-2 py-1 text-xs font-medium text-white bg-navy rounded hover:bg-navy/90 whitespace-nowrap"
+                          title="Link to an order, add the missing room, explain it (group / service wash / house use / other) or add a note"
+                        >
+                          Resolve{'\u2026'}
+                        </button>
+                        <button
+                          onClick={() => openAddModal(row, i, 'link')}
+                          className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-navy"
                           title="Link this invoice line to an order already in the system (wrong/changed ticket or room number)"
                         >
-                          <ArrowRightLeft className="w-3 h-3 inline mr-0.5" />Link
+                          <ArrowRightLeft className="w-3.5 h-3.5" />
                         </button>
                         <button
                           onClick={() => openAddModal(row, i, 'create')}
@@ -3551,13 +3796,23 @@ export default function Reconciliation() {
                         >
                           <Plus className="w-3 h-3 inline mr-0.5" />Add
                         </button>
-                        <button
-                          onClick={() => handleChallenge(nfKey, 'nf')}
-                          className={`p-1 rounded hover:bg-orange-100 ${isChallenged ? 'text-orange-600 bg-orange-100' : 'text-gray-400'}`}
-                          title="Flag to the cleaning company — billed but not in our records"
-                        >
-                          <Mail className="w-3.5 h-3.5" />
-                        </button>
+                        {phase1 && invoice.invoiceNumber && lineKey ? (
+                          <button
+                            onClick={() => { setSelectedLines(new Set([lineKey])); setTimeout(openCreditRequestFor(lineKey), 0) }}
+                            className="p-1 rounded hover:bg-orange-100 text-gray-400 hover:text-orange-600"
+                            title="Request a credit note from Goldstar for this line"
+                          >
+                            <Mail className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handleChallenge(nfKey, 'nf')}
+                            className={`p-1 rounded hover:bg-orange-100 ${isChallenged ? 'text-orange-600 bg-orange-100' : 'text-gray-400'}`}
+                            title="Flag to the cleaning company — billed but not in our records"
+                          >
+                            <Mail className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     )}
                     {/* Not Found — already resolved */}
@@ -3574,7 +3829,7 @@ export default function Reconciliation() {
               )})}
             </tbody>
             {filteredRows.length > 0 && <tfoot><tr className="bg-gray-50 font-medium">
-              <td colSpan={6} className="px-3 py-3 text-right text-gray-700">Totals</td>
+              <td colSpan={7} className="px-3 py-3 text-right text-gray-700">Totals</td>
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.invoiceLine.net, 0).toFixed(2)}</td>
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.systemTotal, 0).toFixed(2)}</td>
               <td className="px-3 py-3 text-right">{'\u00a3'}{filteredRows.reduce((s, r) => s + r.difference, 0).toFixed(2)}</td>
@@ -3587,6 +3842,9 @@ export default function Reconciliation() {
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden"><div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-gray-200 bg-gray-50">
+              {phase1 && <th className="w-8 px-3 py-3"><input type="checkbox" aria-label="Select all"
+                checked={filteredMissing.length > 0 && filteredMissing.every(o => selectedOrders.has(o.id))}
+                onChange={e => setSelectedOrders(e.target.checked ? new Set(filteredMissing.map(o => o.id)) : new Set())} /></th>}
               <th className="px-3 py-3 text-left font-medium text-gray-600">Docket</th>
               <th className="px-3 py-3 text-left font-medium text-gray-600">Department</th>
               <th className="px-3 py-3 text-left font-medium text-gray-600">Type</th>
@@ -3598,17 +3856,20 @@ export default function Reconciliation() {
             </tr></thead>
             <tbody>
               {filteredMissing.length === 0
-                ? <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-500">{searchTerm ? 'No matching orders' : 'All system orders found on invoice'}</td></tr>
+                ? <tr><td colSpan={phase1 ? 9 : 8} className="px-4 py-12 text-center text-gray-500">{searchTerm ? 'No matching orders' : 'All system orders found on invoice'}</td></tr>
                 : filteredMissing.map(o => {
                 const resolution = missingResolutions[o.id]
                 const isChallenged = challengedItems.has(`miss:${o.id}`)
                 return (
                 <tr key={o.id} className={`border-b border-gray-100 ${
+                  orderRes[o.id] ? 'bg-gray-50/70' :
                   resolution?.type === 'written_off' ? 'bg-gray-50/60 opacity-60' :
                   resolution?.type === 'deferred' ? 'bg-purple-50/40' :
                   isChallenged ? 'bg-orange-50/40' :
                   'bg-blue-50/30'
                 }`}>
+                  {phase1 && <td className="px-3 py-2.5"><input type="checkbox" checked={selectedOrders.has(o.id)}
+                    onChange={e => setSelectedOrders(prev => { const n = new Set(prev); if (e.target.checked) n.add(o.id); else n.delete(o.id); return n })} /></td>}
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">{o.docket_number}
                     {isInactiveOrder(o) && <div className="mt-1 font-sans text-[10px] text-gray-700 bg-gray-100 rounded px-1.5 py-0.5 w-fit">tablet status: {o.status}</div>}
                     {isTopUpCopy(o) && <div className="mt-1 font-sans text-[10px] font-medium text-red-700 bg-red-100 rounded px-1.5 py-0.5 w-fit" title="Created by 'Add to System' from a weekly Minimum top-up line: it copies a top-up CHARGE, it is not real laundry, and it double-counts the top-up">Copy of a top-up charge, not a real order</div>}
@@ -3621,7 +3882,26 @@ export default function Reconciliation() {
                   <td className="px-3 py-2.5 text-right font-medium">{'\u00a3'}{computeOrderCost(o).toFixed(2)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{format(new Date(o.created_at), 'dd/MM/yyyy')}</td>
                   <td className="px-3 py-2.5 text-center">
-                    {!resolution ? (
+                    {phase1 && orderRes[o.id] ? (
+                      <div className="flex items-center gap-1 justify-center">
+                        <span className={`px-2 py-0.5 rounded text-[11px] font-medium ${orderRes[o.id].resolution === 'not_charged' ? 'bg-teal-100 text-teal-700' : orderRes[o.id].resolution === 'expect_next' ? 'bg-slate-200 text-slate-700' : 'bg-gray-200 text-gray-700'}`}
+                          title={[orderRes[o.id].note, orderRes[o.id].created_by].filter(Boolean).join(' · ')}>
+                          {ORDER_RESOLUTION_LABELS[orderRes[o.id].resolution]}
+                        </span>
+                        <button onClick={() => unresolveOrder(o.id)} className="p-0.5 rounded hover:bg-gray-200 text-gray-400" title="Undo"><X className="w-3 h-3" /></button>
+                      </div>
+                    ) : phase1 && !resolution ? (
+                      <div className="flex items-center gap-1 justify-center flex-wrap">
+                        <button onClick={() => resolveOrders([o.id], 'expect_next')} className="px-2 py-1 text-xs font-medium text-slate-700 bg-slate-100 rounded hover:bg-slate-200 whitespace-nowrap"
+                          title="Sent late in the month: show it on next month's reconciliation to tick off">Expect next invoice</button>
+                        <button onClick={() => resolveOrders([o.id], 'not_charged')} className="px-2 py-1 text-xs font-medium text-teal-700 bg-teal-50 rounded hover:bg-teal-100 whitespace-nowrap"
+                          title="Goldstar didn't bill it: keep the order, count it as £0 in reports">Not charged (£0)</button>
+                        <button onClick={() => resolveOrders([o.id], 'write_off')} className="px-2 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded hover:bg-gray-200 whitespace-nowrap"
+                          title="Accept the order is wrong / lost: leaves this reconciliation (note required)"><Ban className="w-3 h-3 inline mr-0.5" />Write off</button>
+                        <button onClick={() => handleDeleteOrder(o.id)} className="px-2 py-1 text-xs font-medium text-red-600 bg-red-50 rounded hover:bg-red-100 whitespace-nowrap"
+                          title="Entered by mistake (never sent): delete permanently, reason required"><X className="w-3 h-3 inline mr-0.5" />Delete</button>
+                      </div>
+                    ) : !resolution ? (
                       <div className="flex items-center gap-1 justify-center flex-wrap">
                         <button
                           onClick={() => handleChallenge(o.id, 'miss')}
@@ -3860,6 +4140,54 @@ export default function Reconciliation() {
         </div>
       )}
 
+      {/* ── Bulk explain / note modal ── */}
+      {bulkModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !bulkSaving && setBulkModal(null)}>
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-xl mx-4" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-gray-200 flex justify-between">
+              <h3 className="text-base font-semibold text-gray-900">{bulkModal === 'explain' ? `Explain ${selectedLines.size} selected line${selectedLines.size > 1 ? 's' : ''}` : `Add a note to ${selectedLines.size} line${selectedLines.size > 1 ? 's' : ''}`}</h3>
+              <button onClick={() => setBulkModal(null)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
+            </div>
+            <div className="p-5 space-y-3 text-sm">
+              {bulkModal === 'explain' && (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                  <div><label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Explain as</label>
+                    <select value={bulkForm.type} onChange={e => setBulkForm(f => ({ ...f, type: e.target.value as ChargeType }))} className="w-full h-[38px] px-3 border border-gray-300 rounded-lg bg-white">
+                      <option value="group">Group charge</option>{phase1 && <option value="service_wash">Service wash (kg)</option>}<option value="house">House use</option><option value="other">Other / accept charge</option>
+                    </select><p className="min-h-[15px]" /></div>
+                  <div><label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Who pays / account</label>
+                    <input value={bulkForm.group} onChange={e => setBulkForm(f => ({ ...f, group: e.target.value }))} list="known-groups-bulk" className="w-full h-[38px] px-3 border border-gray-300 rounded-lg" />
+                    <datalist id="known-groups-bulk">{knownGroups.map(g => <option key={g} value={g} />)}</datalist><p className="text-[11px] text-gray-400 mt-1 min-h-[15px]">remembered list</p></div>
+                  {phase1 && <>
+                    <div><label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Charged on to them?</label>
+                      <select value={bulkForm.recharge} onChange={e => setBulkForm(f => ({ ...f, recharge: e.target.value as typeof f.recharge }))} className="w-full h-[38px] px-3 border border-gray-300 rounded-lg bg-white">
+                        <option value="">{'\u2014'} choose {'\u2014'}</option><option value="recharged">Yes, recharged</option><option value="not_yet">Not yet</option><option value="not_chargeable">Not chargeable</option>
+                      </select></div>
+                    <div><label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Folio / reference</label>
+                      <input value={bulkForm.folio} onChange={e => setBulkForm(f => ({ ...f, folio: e.target.value }))} className="w-full h-[38px] px-3 border border-gray-300 rounded-lg" /></div>
+                  </>}
+                </div>
+              )}
+              <div><label className="block text-xs font-medium text-gray-700 mb-1">Note <span className="text-red-600">* required</span></label>
+                <textarea value={bulkForm.note} onChange={e => setBulkForm(f => ({ ...f, note: e.target.value }))} rows={3} className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                  placeholder="The same note is added to every selected line. You can still edit lines one by one afterwards." /></div>
+              {bulkError && <p className="text-xs text-red-600">{bulkError}</p>}
+            </div>
+            <div className="p-4 border-t border-gray-200 flex justify-end gap-2">
+              <button onClick={() => setBulkModal(null)} className="px-4 py-2 text-sm bg-gray-100 rounded-lg">Cancel</button>
+              <button onClick={applyBulk} disabled={bulkSaving} className="px-4 py-2 text-sm text-white bg-navy rounded-lg disabled:opacity-50">{bulkSaving ? 'Saving' + '\u2026' : `Apply to ${selectedLines.size} line${selectedLines.size > 1 ? 's' : ''}`}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Credit note request ── */}
+      {creditLines && invoice?.invoiceNumber && (
+        <CreditRequestModal invoiceNumber={invoice.invoiceNumber} invoiceLabel={invoice.invoicePeriod || invoice.invoiceDate}
+          initialLines={creditLines} onClose={() => setCreditLines(null)}
+          onCreated={() => { setCreditLines(null); setSelectedLines(new Set()); setCreditRefresh(n => n + 1); fetchActions(invoice.invoiceNumber).then(setActions) }} />
+      )}
+
       {/* ── Line note / "Charge to" modal ── */}
       {noteModal && (() => {
         const line = noteModal.invoiceLine
@@ -3885,13 +4213,15 @@ export default function Reconciliation() {
           .map(t => ({ t, nameHit: guestNameSimilar(line.guestInfo, t.guestName), days: lineDay == null ? 0 : Math.abs((d140Day(t.date) ?? lineDay) - lineDay) }))
           .sort((a, b) => Number(b.nameHit) - Number(a.nameHit) || a.days - b.days || Math.abs(a.t.amount - line.gross) - Math.abs(b.t.amount - line.gross))
           .slice(0, 6)
-        const types: ChargeType[] = noteModal.sectionType === 'guest_laundry' ? ['room_missing', 'group', 'house', 'other', 'note'] : ['note', 'other']
+        const types: ChargeType[] = noteModal.sectionType === 'guest_laundry'
+          ? ['room_missing', 'group', ...(phase1 ? ['service_wash' as ChargeType] : []), 'house', 'other', 'note']
+          : ['note', 'other']
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !noteSaving && setNoteModal(null)}>
             <div className="bg-white rounded-xl shadow-xl max-w-2xl w-full mx-4 max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
               <div className="p-5 border-b border-gray-200 flex items-start justify-between gap-3">
                 <div>
-                  <h3 className="text-base font-semibold text-gray-900">Charge to / note</h3>
+                  <h3 className="text-base font-semibold text-gray-900">Resolve this line</h3>
                   <p className="text-xs text-gray-500 mt-1">
                     {line.date} {'·'} <span className="font-mono">{line.ticket || 'no room'}</span> {line.guestInfo} {line.serviceNote && <span className="px-1 rounded bg-amber-50 text-amber-700">{line.serviceNote}</span>} {'·'} {'£'}{line.net.toFixed(2)} net
                   </p>
@@ -3900,13 +4230,23 @@ export default function Reconciliation() {
                 <button onClick={() => setNoteModal(null)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
               </div>
               <div className="flex-1 overflow-auto p-5 space-y-4">
-                <div className="flex flex-wrap gap-1.5">
-                  {types.map(t => (
-                    <button key={t} onClick={() => setNoteForm(prev => ({ ...prev, type: t }))}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border ${f.type === t ? 'bg-navy text-white border-navy' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}`}>
-                      {CHARGE_TYPE_LABELS[t]}
-                    </button>
-                  ))}
+                <div>
+                  <p className="text-xs font-medium text-gray-700 mb-1.5">What is this line?</p>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {noteModal.status === 'not_found' && (
+                      <button onClick={() => { const row = noteModal; setNoteModal(null); openAddModal(row, row.rowIndex, 'link') }}
+                        className="px-2 py-2 text-xs font-medium rounded-lg border bg-white text-gray-700 border-gray-300 hover:bg-gray-50">
+                        Link to an order{'\u2026'}
+                      </button>
+                    )}
+                    {types.map(t => (
+                      <button key={t} onClick={() => setNoteForm(prev => ({ ...prev, type: t }))}
+                        className={`px-2 py-2 text-xs font-medium rounded-lg border ${f.type === t ? 'bg-navy text-white border-navy' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}`}>
+                        {CHARGE_TYPE_LABELS[t]}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-gray-400 mt-1.5">Group, Service wash, House use and Other count as <b>Explained</b>, not as discrepancies.</p>
                 </div>
 
                 {f.type === 'room_missing' && (
@@ -3962,21 +4302,45 @@ export default function Reconciliation() {
                   </div>
                 )}
 
-                {(f.type === 'group' || f.type === 'house' || f.type === 'other') && (
-                  <div>
-                    <label className="block text-xs font-medium text-gray-700 mb-1">
-                      {f.type === 'group' ? 'Group name' : 'Account / label (optional)'}
-                    </label>
-                    <input value={f.group} onChange={e => setNoteForm(prev => ({ ...prev, group: e.target.value }))} list="known-groups"
-                      placeholder={f.type === 'group' ? 'e.g. Arsenal WFC' : 'e.g. Spa, Front office'}
-                      className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
-                    <datalist id="known-groups">{knownGroups.map(g => <option key={g} value={g} />)}</datalist>
-                    {f.type === 'group' && <p className="text-[11px] text-gray-400 mt-1">Use the same spelling each time {'—'} lines are totalled per group name. Set the group{'’'}s Opera master room in the Group & No-room panel.</p>}
+                {isExplainedType(f.type) && (
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">
+                        {f.type === 'group' || f.type === 'service_wash' ? 'Who pays / account responsible' : 'Account / label (optional)'}
+                      </label>
+                      <input value={f.group} onChange={e => setNoteForm(prev => ({ ...prev, group: e.target.value }))} list="known-groups"
+                        placeholder={f.type === 'house' ? 'e.g. Spa, Front office' : 'e.g. Ecuador team – LTA'}
+                        className="w-full h-[38px] px-3 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                      <datalist id="known-groups">{knownGroups.map(g => <option key={g} value={g} />)}</datalist>
+                      <p className="text-[11px] text-gray-400 mt-1 min-h-[15px]">remembered list: same spelling each time</p>
+                    </div>
+                    {phase1 ? (<>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Charged on to them?</label>
+                        <select value={f.recharge} onChange={e => setNoteForm(prev => ({ ...prev, recharge: e.target.value as typeof prev.recharge }))}
+                          className="w-full h-[38px] px-3 text-sm border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-navy/30">
+                          <option value="">{'\u2014'} choose {'\u2014'}</option><option value="recharged">Yes, recharged</option><option value="not_yet">Not yet</option><option value="not_chargeable">Not chargeable</option>
+                        </select>
+                        <p className="text-[11px] text-gray-400 mt-1 min-h-[15px]"></p>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Folio / reference</label>
+                        <input value={f.folio} onChange={e => setNoteForm(prev => ({ ...prev, folio: e.target.value }))} placeholder="e.g. 4471"
+                          className="w-full h-[38px] px-3 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                        <p className="text-[11px] text-gray-400 mt-1 min-h-[15px]"></p>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1 h-[18px]">Weight (kg) <span className="text-gray-400 font-normal">optional</span></label>
+                        <input value={f.kg} onChange={e => setNoteForm(prev => ({ ...prev, kg: e.target.value }))} inputMode="decimal" placeholder={/(\d+(?:\.\d+)?)\s*kg/i.exec(line.description)?.[1] ?? ''}
+                          className="w-full h-[38px] px-3 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />
+                        <p className="text-[11px] text-gray-400 mt-1 min-h-[15px]">{/kg|kilo/i.test(line.description) ? 'from the invoice line' : ''}</p>
+                      </div>
+                    </>) : <div />}
                   </div>
                 )}
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-700 mb-1">Note {f.type !== 'note' && <span className="text-gray-400 font-normal">(optional)</span>}</label>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Note {f.type === 'other' ? <span className="text-red-600 font-normal">* required: why is it accepted?</span> : f.type !== 'note' && <span className="text-gray-400 font-normal">(optional)</span>}</label>
                   <textarea value={f.note} onChange={e => setNoteForm(prev => ({ ...prev, note: e.target.value }))} rows={2}
                     placeholder="Shown on this line, in the Excel / PDF, and copied to the matched order when you Save"
                     className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-navy/30" />

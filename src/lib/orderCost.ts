@@ -10,7 +10,9 @@ import type { Order } from '../types'
  * fail under RLS while the order total still saved. Falls back to total_price when there
  * are no priced items.
  */
-export function computeOrderCost(o: Pick<Order, 'order_items' | 'total_price'>): number {
+export function computeOrderCost(o: Pick<Order, 'order_items' | 'total_price'> & { not_charged_at?: string | null }): number {
+  // Goldstar didn't charge it (marked in reconciliation): no cost anywhere in the reports
+  if (o.not_charged_at) return 0
   if (o.order_items && o.order_items.length > 0) {
     const t = o.order_items.reduce((s, i) => s + (i.price_at_time ?? 0) * (i.quantity_sent ?? 0), 0)
     if (t > 0) {

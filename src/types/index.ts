@@ -51,6 +51,9 @@ export interface Order {
   updated_at: string
   synced_at: string | null
   reconciliation_id: string | null
+  /** Set when Goldstar did not charge this order (counts as £0 cost) — migration 2026-11-08 */
+  not_charged_at?: string | null
+  not_charged_reason?: string | null
   /** Set on outstanding child tickets created by a partial receipt — points at the original order */
   parent_order_id: string | null
   // Joined
