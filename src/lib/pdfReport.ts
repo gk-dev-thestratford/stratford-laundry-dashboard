@@ -453,7 +453,7 @@ export function generateReconciliationPdf(
     doc.setTextColor(NAVY)
     doc.setFontSize(11)
     doc.setFont('helvetica', 'bold')
-    doc.text('Group & No-room Charges', 14, y)
+    doc.text('Explained, Group & No-room Charges', 14, y)
     y += 2
     const body: (string | { content: string; colSpan?: number; styles?: Record<string, unknown> })[][] = []
     for (const g of chargeGroups) {

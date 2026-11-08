@@ -9,15 +9,20 @@ import type { InvoiceLine, ParsedInvoice } from './invoiceParser'
 // shows in the breakdown / Excel / PDF, and lets accounts cross-check revenue per group.
 // See db/migrations/2026-11-05_reconciliation_line_notes.sql.
 
-export type ChargeType = 'note' | 'room_missing' | 'group' | 'house' | 'other'
+export type ChargeType = 'note' | 'room_missing' | 'group' | 'service_wash' | 'house' | 'other'
 
 export const CHARGE_TYPE_LABELS: Record<ChargeType, string> = {
   note: 'Note only',
   room_missing: 'Room missing on invoice',
   group: 'Group charge',
+  service_wash: 'Service wash (kg)',
   house: 'House use',
-  other: 'Other',
+  other: 'Other / accept charge',
 }
+
+/** Tags that EXPLAIN an unmatched line: it is not a discrepancy (someone else pays / accepted). */
+export const EXPLAINED_TYPES: ChargeType[] = ['group', 'service_wash', 'house', 'other']
+export const isExplainedType = (t: ChargeType | null | undefined) => !!t && EXPLAINED_TYPES.includes(t)
 
 export interface LineNote {
   invoice_number: string
@@ -35,6 +40,10 @@ export interface LineNote {
   mirrored_to_order_at?: string | null
   updated_by: string | null
   updated_at?: string
+  // Added by migration 2026-11-08 (who pays / recharge details); absent before it runs
+  recharge_status?: 'recharged' | 'not_yet' | 'not_chargeable' | null
+  folio_ref?: string | null
+  weight_kg?: number | null
 }
 
 export interface GroupFolio {
@@ -128,6 +137,7 @@ export function chargeLabel(n: Pick<LineNote, 'charge_type' | 'group_name' | 'ro
   switch (n.charge_type) {
     case 'room_missing': return n.room_override ? `Room ${n.room_override} (missing on invoice)` : 'Room missing on invoice'
     case 'group': return `Group: ${n.group_name || '?'}`
+    case 'service_wash': return n.group_name ? `Service wash: ${n.group_name}` : 'Service wash (kg)'
     case 'house': return n.group_name ? `House use: ${n.group_name}` : 'House use'
     case 'other': return n.group_name ? `Other: ${n.group_name}` : 'Other'
     default: return 'Note'
@@ -137,6 +147,7 @@ export function chargeLabel(n: Pick<LineNote, 'charge_type' | 'group_name' | 'ro
 /** Grouping bucket for the "Group & No-room charges" breakdown. */
 export function chargeBucket(n: LineNote | undefined, line: InvoiceLine): string | null {
   if (n && n.charge_type === 'group') return `Group: ${n.group_name || '?'}`
+  if (n && n.charge_type === 'service_wash') return n.group_name ? `Group: ${n.group_name}` : 'Service wash (kg)'
   if (n && n.charge_type === 'house') return 'House use'
   if (n && n.charge_type === 'other') return `Other${n.group_name ? `: ${n.group_name}` : ''}`
   if (n && n.charge_type === 'room_missing') return 'Room missing on invoice (room added)'

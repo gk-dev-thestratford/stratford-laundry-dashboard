@@ -12,7 +12,7 @@ import { computeOrderCost } from '../lib/orderCost'
 import { CHEF_WEEKLY_MINIMUMS, CHEF_TOPUP_RATES, NAPKIN_WEEKLY_MINIMUM, NAPKIN_RATE } from '../lib/minimums'
 import {
   buildLineKeys, fetchLineNotes, upsertLineNote, deleteLineNote, fetchGroupFolios, upsertGroupFolio,
-  fetchKnownGroupNames, chargeLabel, chargeBucket, CHARGE_TYPE_LABELS,
+  fetchKnownGroupNames, chargeLabel, chargeBucket, CHARGE_TYPE_LABELS, isExplainedType,
   type LineNote, type GroupFolio, type ChargeType,
 } from '../lib/lineNotes'
 import type { Order, OrderType, Department } from '../types'
@@ -34,6 +34,8 @@ interface ReconciliationRow {
   // amount (e.g. the £0.215 vs £0.22 napkin rate gap). Still a 'price_mismatch', but
   // surfaced as a calm "minor variance" rather than an alarming discrepancy.
   minorVariance: boolean
+  /** Why a line is unmatched when that's useful, e.g. "ticket 1691 is a F&B Linen order…" */
+  hint?: string
 }
 
 /** Price-difference tolerance: minor if within max(£0.15, 3% of the system total). */
@@ -58,6 +60,8 @@ interface ReconciliationResult {
   rows: ReconciliationRow[]
   topUpCharges: InvoiceLine[]
   missingFromInvoice: Order[]
+  /** Not on this invoice but written on the period's last day: probably next invoice */
+  nextInvoice: Order[]
   matchedOrderIds: string[]
   stats: { matched: number; priceMismatch: number; minorVariance: number; notFound: number; missing: number }
   invoiceTotal: number
@@ -359,9 +363,56 @@ function orderDay(o: Order): number {
  * room), so "first unclaimed order for room 417" can pair the wrong bags. Rank candidates
  * by: guest name matches → closest creation date to the invoice line → closest cost.
  */
-function pickClosestGuestOrder(candidates: Order[], line: InvoiceLine): Order | null {
+/**
+ * Rejected / expired on the tablet. NOT excluded: Goldstar still invoices many of them
+ * (Sept 2026: napkins 1440, 1445, 1448… were rejected yet invoiced and reconciled), so they
+ * stay matchable, rank below active orders, and are labelled on the row.
+ */
+function isInactiveOrder(o: Order): boolean {
+  return o.status === 'rejected' || o.status === 'expired'
+}
+
+/**
+ * Orders that "Add to System" created from a weekly Minimum top-up line (old parser, before
+ * 5 Nov 2026). They are copies of a top-up CHARGE, not real laundry, and double-count it.
+ */
+function isTopUpCopy(o: Order): boolean {
+  return /^REC-/i.test(o.docket_number ?? '') && /Added from invoice reconciliation/.test(o.notes ?? '') && /\[ref:\|/.test(o.notes ?? '')
+}
+
+const itemWords = (s: string) => s.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !['and', 'the'].includes(w))
+
+/**
+ * Several orders with the same ticket in the same service (typos, re-used numbers): pick
+ * the one whose items, date and amount fit the invoice line best, instead of the first.
+ * Sept 2026: staff 1563 (2x Chef Jacket) took the Front Office shirts order before this.
+ */
+function pickBestDocketOrder(candidates: Order[], line: InvoiceLine): Order | null {
   if (candidates.length <= 1) return candidates[0] ?? null
   const lineDay = invoiceLineDay(line.date)
+  const invQty = line.items.reduce((s, it) => s + it.quantity, 0)
+  const invWords = new Set(line.items.flatMap(it => itemWords(it.name)))
+  const score = (o: Order) => {
+    const items = o.order_items ?? []
+    const sysQty = items.reduce((s, it) => s + (it.quantity_sent ?? 0), 0)
+    const sysWords = new Set(items.flatMap(it => itemWords(it.item_name ?? '')))
+    const overlap = invWords.size ? [...invWords].filter(w => sysWords.has(w)).length / invWords.size : 0
+    const days = lineDay == null ? 0 : Math.abs(orderDay(o) - lineDay)
+    return (invQty > 0 && sysQty === invQty ? 3 : 0) + overlap * 2 + (Math.abs(computeOrderCost(o) - line.net) < 0.02 ? 1 : 0) - Math.min(days, 10) * 0.3
+      - (isInactiveOrder(o) ? 0.5 : 0)
+  }
+  return [...candidates].sort((a, b) => score(b) - score(a))[0]
+}
+
+function pickClosestGuestOrder(candidates: Order[], line: InvoiceLine): Order | null {
+  const lineDay0 = invoiceLineDay(line.date)
+  // Orders within a few days of the line come first; only fall back to further ones
+  if (lineDay0 != null && candidates.length > 1) {
+    const near = candidates.filter(o => Math.abs(orderDay(o) - lineDay0) <= GUEST_NEAR_DAYS)
+    if (near.length) candidates = near
+  }
+  if (candidates.length <= 1) return candidates[0] ?? null
+  const lineDay = lineDay0
   const rank = (o: Order): [number, number, number] => [
     line.guestInfo && guestNameMatches(line.guestInfo, o.guest_name) ? 0 : 1,
     lineDay == null ? 0 : Math.abs(orderDay(o) - lineDay),
@@ -374,6 +425,11 @@ function pickClosestGuestOrder(candidates: Order[], line: InvoiceLine): Order | 
 
 // Days either side of the invoice line date for name-only and room-override matching.
 const GUEST_MATCH_WINDOW_DAYS = 1
+// Days before the invoice period start that orders are still considered (written the
+// evening before Goldstar's first collection of the month).
+const LEAD_WINDOW_DAYS = 3
+// Guest room/docket candidates within this many days of the invoice line are preferred.
+const GUEST_NEAR_DAYS = 3
 
 /**
  * Manual-link keys per invoice line, stamped as "[ref:...]" into the linked order's notes.
@@ -443,7 +499,7 @@ function reconcile(
 
   const topUpCharges: InvoiceLine[] = []
   const matchedOrderIds = new Set<string>()
-  const pending: { line: InvoiceLine; sectionType: InvoiceSectionType; orderType: string; order: Order | null }[] = []
+  const pending: { line: InvoiceLine; sectionType: InvoiceSectionType; orderType: string; order: Order | null; hint?: string }[] = []
 
   for (const section of invoice.sections) {
     const orderType = sectionTypeToOrderType(section.type)
@@ -458,17 +514,22 @@ function reconcile(
       // 1b) Order explicitly picked for this line in its note
       const pickedId = notesByLine?.get(line)?.order_id
       if (!order && pickedId) order = orders.find(o => o.id === pickedId && !matchedOrderIds.has(o.id)) ?? null
-      // 2) Issue 2: Pick first unclaimed order with this docket (canonicalised both sides).
-      // Guest dockets are ROOM numbers; staff/napkin tickets are booklet numbers — the
-      // same digits mean different things, so a docket match must stay within the right
-      // family (otherwise staff ticket "0402" claims the room-402 guest order).
-      // An empty ticket (guest line with no room) must not match orders with no docket.
+      // 2) Docket match (canonicalised both sides), SAME SERVICE ONLY. Goldstar uses one
+      // ticket booklet for every service, so a number only means something within its own
+      // service: a bathrobe line must never take a napkin order with the same ticket
+      // (Sept 2026: bathrobe 1691 ↔ napkin 1691). Guest dockets are room numbers.
+      // When a ticket exists more than once, pick the best order (items, date, amount),
+      // not the first one. An empty ticket must not match orders with no docket.
       const docketKey = canonicalDocket(line.ticket)
+      let hint: string | undefined
       if (!order && docketKey) {
-        const docketCandidates = (byDocket.get(docketKey) ?? []).filter(o =>
-          !matchedOrderIds.has(o.id) &&
-          (section.type === 'guest' ? o.order_type === 'guest_laundry' : o.order_type !== 'guest_laundry'))
-        order = section.type === 'guest' ? pickClosestGuestOrder(docketCandidates, line) : (docketCandidates[0] ?? null)
+        const sameTicket = (byDocket.get(docketKey) ?? []).filter(o => !matchedOrderIds.has(o.id))
+        const docketCandidates = sameTicket.filter(o => o.order_type === orderType)
+        order = section.type === 'guest' ? pickClosestGuestOrder(docketCandidates, line) : pickBestDocketOrder(docketCandidates, line)
+        if (!order) {
+          const other = sameTicket.find(o => o.order_type !== orderType)
+          if (other) hint = `ticket ${line.ticket} is a ${ORDER_TYPE_LABELS[other.order_type as OrderType] ?? other.order_type} order (${other.department?.name ?? 'no department'}): different service, not matched`
+        }
       }
       // 3) Guest lines: fall back to room-number match
       if (!order && section.type === 'guest' && line.ticket) {
@@ -476,7 +537,7 @@ function reconcile(
         order = pickClosestGuestOrder(candidates, line)
       }
       if (order) matchedOrderIds.add(order.id)
-      pending.push({ line, sectionType: section.type, orderType, order })
+      pending.push({ line, sectionType: section.type, orderType, order, hint })
     }
   }
 
@@ -509,20 +570,23 @@ function reconcile(
     if (p.order) matchedOrderIds.add(p.order.id)
   }
 
-  const rows: ReconciliationRow[] = pending.map(({ line, orderType, order }, rowIndex) => {
+  const rows: ReconciliationRow[] = pending.map(({ line, orderType, order, hint }, rowIndex) => {
     const systemTotal = order ? computeOrderCost(order) : 0
     const diff = order ? +(line.net - systemTotal).toFixed(2) : line.net
     const status: ReconciliationRow['status'] = !order
       ? 'not_found' : Math.abs(diff) < 0.02 ? 'matched' : 'price_mismatch'
     const minorVariance = status === 'price_mismatch' && isMinorVariance(diff, systemTotal)
-    return { invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex, minorVariance }
+    return { invoiceLine: line, sectionType: orderType, order, status, systemTotal, difference: diff, rowIndex, minorVariance, hint }
   })
 
   // Issue 1: Use strictPeriod (original invoice period) for "In System Only" filtering
-  // so broader-search orders from the previous month don't appear as missing
+  // so broader-search orders from the previous month don't appear as missing.
+  // Orders written on the period's LAST day are usually collected and invoiced the next
+  // day, i.e. on next month's invoice: listed as "probably next invoice", not missing.
   const missingPeriod = strictPeriod ?? period
   const invoiceOrderTypes = new Set(invoice.sections.map(s => sectionTypeToOrderType(s.type)))
-  const missingFromInvoice = orders.filter(o => {
+  const lastDay = missingPeriod ? Math.floor(missingPeriod.end.getTime() / DAY_MS) : null
+  const unmatched = orders.filter(o => {
     if (matchedOrderIds.has(o.id)) return false
     if (!invoiceOrderTypes.has(o.order_type)) return false
     if (missingPeriod) {
@@ -531,9 +595,11 @@ function reconcile(
     }
     return true
   })
+  const nextInvoice = lastDay == null ? [] : unmatched.filter(o => orderDay(o) === lastDay)
+  const missingFromInvoice = unmatched.filter(o => !nextInvoice.includes(o))
 
   return {
-    rows, topUpCharges, missingFromInvoice,
+    rows, topUpCharges, missingFromInvoice, nextInvoice,
     matchedOrderIds: Array.from(matchedOrderIds),
     stats: {
       matched: rows.filter(r => r.status === 'matched').length,
@@ -571,7 +637,9 @@ function notesMapFor(invoice: ParsedInvoice | null, notes: Record<string, LineNo
 async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { start: Date; end: Date } | null, broaderSearch: boolean, pickedOrderIds: string[] = []): Promise<Order[]> {
   let fetched: Order[] = []
   if (period) {
-    let fetchStart = period.start
+    // Tickets are often written the evening before Goldstar collects (e.g. 31/08 for an
+    // invoice line dated 01/09), so always look a few days before the period starts.
+    let fetchStart = new Date(period.start.getTime() - LEAD_WINDOW_DAYS * DAY_MS)
     if (broaderSearch) {
       fetchStart = new Date(period.start)
       fetchStart.setUTCMonth(fetchStart.getUTCMonth() - 1)
@@ -607,7 +675,7 @@ async function fetchOrdersForReconciliation(invoice: ParsedInvoice, period: { st
   return fetched
 }
 
-type FilterTab = 'all' | 'matched' | 'mismatch' | 'not_found' | 'missing' | 'group'
+type FilterTab = 'all' | 'matched' | 'mismatch' | 'not_found' | 'missing' | 'group' | 'explained'
 
 // ── Component ──
 
@@ -698,6 +766,8 @@ export default function Reconciliation() {
   // Link search hits the WHOLE database (not just this period's unmatched orders), so any
   // existing order — matched elsewhere, or from another month — can be found and linked.
   const [addModalLinkDbResults, setAddModalLinkDbResults] = useState<Order[]>([])
+  // Guard: confirm before creating a new order when a likely existing order is shown
+  const [addCreateAnyway, setAddCreateAnyway] = useState(false)
   const [addModalLinkSearching, setAddModalLinkSearching] = useState(false)
   const [departments, setDepartments] = useState<Department[]>([])
   const [catalogueItems, setCatalogueItems] = useState<{ name: string; price: number | null; category: string }[]>([])
@@ -1098,12 +1168,33 @@ export default function Reconciliation() {
     setD140Saving(false)
   }, [guestMarginData, lastSavedRecId, d140Report, d140IncludesVat])
 
+  // Guest room + day pairs that already matched: a second unmatched line for the same room
+  // and day is most likely a 2nd bag the tablet recorded as one order.
+  // In System Only: the same ticket in the same service was matched to another order, so
+  // this one is probably a ticket typo (Sept 2026: Front Office 1563 vs Main Kitchen 1563).
+  const matchedTickets = useMemo(() => {
+    const m = new Map<string, Order>()
+    for (const r of result?.rows ?? []) if (r.order && r.order.order_type !== 'guest_laundry') m.set(`${r.order.order_type}|${canonicalDocket(r.order.docket_number)}`, r.order)
+    return m
+  }, [result])
+  const duplicateTicketHint = (o: Order): string | null => {
+    if (o.order_type === 'guest_laundry') return null
+    const other = matchedTickets.get(`${o.order_type}|${canonicalDocket(o.docket_number)}`)
+    if (!other || other.id === o.id) return null
+    return `ticket also used by ${other.department?.name ?? 'another order'} ${format(new Date(other.created_at), 'dd/MM')} (matched): typo?`
+  }
+
+  const matchedRoomDays = useMemo(() => new Set((result?.rows ?? [])
+    .filter(r => r.order && r.sectionType === 'guest_laundry' && r.invoiceLine.ticket)
+    .map(r => `${r.invoiceLine.date}|${r.invoiceLine.ticket}`)), [result])
+
   const filteredRows = useMemo(() => {
     if (!result) return []
     let rows = result.rows
     if (filter === 'matched') rows = rows.filter(r => r.status === 'matched')
     else if (filter === 'mismatch') rows = rows.filter(r => r.status === 'price_mismatch')
-    else if (filter === 'not_found') rows = rows.filter(r => r.status === 'not_found')
+    else if (filter === 'not_found') rows = rows.filter(r => r.status === 'not_found' && !isExplainedType(noteFor(r.invoiceLine)?.charge_type))
+    else if (filter === 'explained') rows = rows.filter(r => r.status === 'not_found' && isExplainedType(noteFor(r.invoiceLine)?.charge_type))
     else if (filter === 'group') rows = rows.filter(r => chargeBucket(noteFor(r.invoiceLine), r.invoiceLine) != null)
     if (searchTerm) {
       const s = searchTerm.toLowerCase()
@@ -1442,6 +1533,24 @@ export default function Reconciliation() {
   }, [result, invoice, orders, linenLedger])
 
   // ── Chef Uniform Minimum Usage (Main Kitchen) ──
+  // Napkins by week: what Goldstar would charge using OUR count (the weekly minimum still
+  // applies on weeks that carry a top-up), and the £ difference. Below the minimum on both
+  // counts the bill is identical, so piece differences only matter above it.
+  const napkinOverUnder = (w: { invoiceSentQty: number; systemSentQty: number; topUpQty: number; totalChargedQty: number }) => {
+    if (!napkinSummary || w.systemSentQty <= 0) return null
+    const ourQty = w.topUpQty > 0 ? Math.max(w.systemSentQty, napkinSummary.weeklyMinimum) : w.systemSentQty
+    return { ourQty, pounds: +((w.totalChargedQty - ourQty) * napkinSummary.unitRate).toFixed(2) }
+  }
+  const napkinMonth = (() => {
+    let ourQty = 0, pounds = 0, weeks = 0
+    for (const w of napkinSummary?.weeks ?? []) {
+      const ow = napkinOverUnder(w)
+      if (!ow) continue
+      ourQty += ow.ourQty; pounds += ow.pounds; weeks++
+    }
+    return { ourQty, pounds: +pounds.toFixed(2), weeks }
+  })()
+
   const uniformMinSummary = useMemo(() => {
     if (!result || !invoice) return null
     const staffSection = invoice.sections.find(s => s.type === 'staff')
@@ -1783,15 +1892,23 @@ export default function Reconciliation() {
 
   // ── Adjusted totals considering resolutions ──
   const adjustedTotals = useMemo(() => {
-    if (!result) return { unresolvedDiff: 0, resolvedCount: 0, acceptedTotal: 0, writtenOffTotal: 0, challengedCount: 0 }
+    if (!result) return { unresolvedDiff: 0, resolvedCount: 0, acceptedTotal: 0, writtenOffTotal: 0, challengedCount: 0, explainedTotal: 0, explainedCount: 0 }
 
     let acceptedTotal = 0
     let writtenOffTotal = 0
     let resolvedCount = 0
+    let explainedTotal = 0
+    let explainedCount = 0
 
     // Not Found resolutions
     for (const row of result.rows) {
       if (row.status !== 'not_found') continue
+      // Explained (group / service wash / house use / other): someone else pays or the
+      // charge is accepted, so the line is not a discrepancy.
+      if (isExplainedType(noteFor(row.invoiceLine)?.charge_type)) {
+        explainedTotal += row.invoiceLine.net; explainedCount++
+        continue
+      }
       const key = notFoundKey(row)
       const res = notFoundResolutions[key]
       if (res) {
@@ -1816,7 +1933,7 @@ export default function Reconciliation() {
     // Original difference = invoiceTotal - systemTotal
     // Accepted not-found items mean we acknowledge the charge → system effectively increases
     // Written-off missing items mean we don't expect billing → system effectively decreases
-    const unresolvedDiff = (result.invoiceTotal - result.systemTotal) - acceptedTotal + writtenOffTotal
+    const unresolvedDiff = (result.invoiceTotal - result.systemTotal) - acceptedTotal - explainedTotal + writtenOffTotal
 
     return {
       unresolvedDiff: +unresolvedDiff.toFixed(2),
@@ -1824,8 +1941,10 @@ export default function Reconciliation() {
       acceptedTotal: +acceptedTotal.toFixed(2),
       writtenOffTotal: +writtenOffTotal.toFixed(2),
       challengedCount: challengedItems.size,
+      explainedTotal: +explainedTotal.toFixed(2),
+      explainedCount,
     }
-  }, [result, notFoundResolutions, missingResolutions, challengedItems])
+  }, [result, notFoundResolutions, missingResolutions, challengedItems, noteFor])
 
   // Count unresolved items for save validation
   const unresolvedCounts = useMemo(() => {
@@ -1833,6 +1952,7 @@ export default function Reconciliation() {
     let nfCount = 0, nfTotal = 0
     for (const row of result.rows) {
       if (row.status !== 'not_found') continue
+      if (isExplainedType(noteFor(row.invoiceLine)?.charge_type)) continue
       if (!notFoundResolutions[notFoundKey(row)]) { nfCount++; nfTotal += row.invoiceLine.net }
     }
     let missCount = 0, missTotal = 0
@@ -1840,7 +1960,7 @@ export default function Reconciliation() {
       if (!missingResolutions[o.id]) { missCount++; missTotal += computeOrderCost(o) }
     }
     return { nfCount, nfTotal: +nfTotal.toFixed(2), missCount, missTotal: +missTotal.toFixed(2) }
-  }, [result, notFoundResolutions, missingResolutions])
+  }, [result, notFoundResolutions, missingResolutions, noteFor])
 
   const handleSaveClick = useCallback(() => {
     const hasIssues = unresolvedCounts.nfCount > 0 || unresolvedCounts.missCount > 0 || Math.abs(adjustedTotals.unresolvedDiff) >= 1
@@ -1927,7 +2047,7 @@ export default function Reconciliation() {
     utils.book_append_sheet(wb, utils.json_to_sheet(deptExcelRows), 'Department Breakdown')
 
     utils.book_append_sheet(wb, utils.json_to_sheet(result.rows.map(r => ({
-      'Status': r.status === 'matched' ? 'Matched' : r.status === 'price_mismatch' ? 'Price Discrepancy' : 'On Invoice Only',
+      'Status': r.status === 'matched' ? 'Matched' : r.status === 'price_mismatch' ? 'Price Discrepancy' : isExplainedType(noteFor(r.invoiceLine)?.charge_type) ? 'Explained' : 'On Invoice Only',
       'Department': r.order?.department?.name || 'Unallocated',
       'Date': r.invoiceLine.date, 'Docket': r.invoiceLine.ticket,
       'Type': ORDER_TYPE_LABELS[r.sectionType as OrderType] ?? r.sectionType,
@@ -1981,7 +2101,7 @@ export default function Reconciliation() {
       'Line note': noteFor(r.invoiceLine)?.note || lineNotes[notFoundKey(r)] || '',
       'Recommended Action': 'Verify pricing with Goldstar / update system prices',
     }))
-    result.rows.filter(r => r.status === 'not_found').forEach(r => discRows.push({
+    result.rows.filter(r => r.status === 'not_found' && !isExplainedType(noteFor(r.invoiceLine)?.charge_type)).forEach(r => discRows.push({
       'Issue': 'On invoice but not in system', 'Docket': r.invoiceLine.ticket, 'Department': '',
       'Invoice NET (\u00a3)': +r.invoiceLine.net.toFixed(2), 'System NET (\u00a3)': 0,
       'Difference (\u00a3)': +r.invoiceLine.net.toFixed(2), 'Description': r.invoiceLine.description,
@@ -2018,6 +2138,18 @@ export default function Reconciliation() {
   // Sets per-item unit price (full precision) and total_price (authoritative, 2dp).
   const handleUpdatePrice = useCallback(async (row: ReconciliationRow) => {
     if (!row.order || !invoice) return
+    // Overwrite stays the rule, but show the piece difference first: a price overwrite on
+    // an order whose pieces don't agree hides the real problem (Sept 2026 napkins).
+    const invQty = row.invoiceLine.items.reduce((s, it) => s + it.quantity, 0)
+    const sysQty = (row.order.order_items ?? []).reduce((s, it) => s + (it.quantity_sent ?? 0), 0)
+    if (invQty > 0 && sysQty > 0 && invQty !== sysQty) {
+      const ok = window.confirm(
+        `Pieces don't agree on ticket ${row.invoiceLine.ticket || row.order.docket_number}:\n` +
+        `  Invoice: ${invQty} pcs    Our order: ${sysQty} pcs\n\n` +
+        `Update Price will overwrite our order price £${row.systemTotal.toFixed(2)} → £${row.invoiceLine.net.toFixed(2)}.\n` +
+        `The piece difference will no longer show as a price difference.\n\nOverwrite anyway?`)
+      if (!ok) return
+    }
     const orderId = row.order.id
     const docket = row.order.docket_number
     setUpdatingPrices(prev => new Set(prev).add(orderId))
@@ -2100,6 +2232,25 @@ export default function Reconciliation() {
   }, [invoice, refetchAndReconcile])
 
   // ── Action: Add invoice-only item to system ──
+  // Orders that probably ARE this line (same service, same ticket / room / guest, ±3 days):
+  // shown in the Add pop-up so a duplicate isn't created by mistake.
+  const likelyExisting = useMemo(() => {
+    if (!addModal || addModal.row.order) return []
+    const line = addModal.row.invoiceLine
+    const lineDay = invoiceLineDay(line.date)
+    const key = canonicalDocket(line.ticket)
+    const isGuest = addModal.row.sectionType === 'guest_laundry'
+    const out: { o: Order; why: string }[] = []
+    for (const o of orders) {
+      if (o.order_type !== addModal.row.sectionType) continue
+      const days = lineDay == null ? 0 : Math.abs(orderDay(o) - lineDay)
+      if (key && canonicalDocket(o.docket_number) === key) { out.push({ o, why: `same ticket · ${days}d` }); continue }
+      if (days > 3) continue
+      if (isGuest && line.guestInfo && guestNameSimilar(line.guestInfo, o.guest_name)) out.push({ o, why: `similar guest name · ${days}d` })
+    }
+    return out.slice(0, 4)
+  }, [addModal, orders])
+
   const handleAddToSystem = useCallback(async () => {
     if (!addModal || !invoice) return
     const { row } = addModal
@@ -2108,6 +2259,16 @@ export default function Reconciliation() {
     try {
       const docket = addModalDocket.trim() || row.invoiceLine.ticket || `REC-${String(Date.now()).slice(-6)}`
       const orderType = row.sectionType as OrderType
+      // A line that was linked before and is now added: move the link, never keep both
+      // (Aug 2026 tickets 1341 / 1389 ended up with a linked AND an added order).
+      const addRefKey = refKeyMap.get(row.invoiceLine)?.[0]
+      if (addRefKey) {
+        const { data: stale } = await supabase.from('orders').select('id, notes').ilike('notes', `%${addRefKey}%`)
+        for (const st of stale ?? []) {
+          const cleaned = (st.notes || '').split(addRefKey).join(' ').replace(/\s{2,}/g, ' ').trim()
+          await supabase.from('orders').update({ notes: cleaned || null }).eq('id', st.id)
+        }
+      }
 
       // Set created_at within the invoice period so re-reconciliation finds this order
       const period = parseInvoicePeriod(invoice.invoicePeriod) || derivePeriodFromLines(invoice)
@@ -2244,8 +2405,10 @@ export default function Reconciliation() {
         ? ` (docket ${target.docket_number} → ${newDocket})`
         : (canonicalDocket(target.docket_number) !== canonicalDocket(row.invoiceLine.ticket)
             ? ` (invoice ticket ${row.invoiceLine.ticket} → our docket ${target.docket_number})` : '')
+      // Re-linking the same line to the same order must not append a second copy
+      const existingNotes = (target.notes || '').split(refKey).join(' ').replace(/\s{2,}/g, ' ').trim()
       const noteParts = [
-        target.notes?.trim() || '',
+        existingNotes,
         `Linked to invoice ${invoice.invoiceNumber}${correction} ${refKey}`,
       ]
       if (addModalNote.trim()) noteParts.push(`Note: ${addModalNote.trim()}`)
@@ -2301,6 +2464,7 @@ export default function Reconciliation() {
   // Lets the user link/relink a line to the right order (by docket, room, name…) and add
   // a per-line note, on every line — including guest rooms and already-matched lines.
   const openAddModal = useCallback((row: ReconciliationRow, index: number, mode: 'create' | 'link') => {
+    setAddCreateAnyway(false)
     setAddModal({ row, index }); setAddModalDept('')
     setAddModalMode(mode); setAddModalLinkOrderId(''); setAddModalNote(''); setAddModalLinkDocket('')
     setAddModalLinkUpdatePrice(false); setAddModalLinkDbResults([]); setAddModalLinkDept('')
@@ -2669,15 +2833,20 @@ export default function Reconciliation() {
       )}
 
       {/* Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatCard icon={<CheckCircle className="w-5 h-5 text-green-500" />} label="Matched" value={result.stats.matched} color="green" />
+        <button onClick={() => setFilter('explained')} className="text-left bg-white rounded-xl border-2 border-indigo-200 p-4 hover:border-indigo-300" title="Lines tagged Group / Service wash / House use / Other: someone else pays or the charge is accepted, so they are not discrepancies">
+          <div className="flex items-center gap-2 mb-1"><Tag className="w-5 h-5 text-indigo-500" /><span className="text-xs text-indigo-700 font-medium">Explained</span></div>
+          <p className="text-2xl font-bold text-indigo-700">{adjustedTotals.explainedCount}</p>
+          {adjustedTotals.explainedCount > 0 && <p className="text-[10px] text-gray-500 mt-0.5">{'\u00a3'}{adjustedTotals.explainedTotal.toFixed(2)} · not discrepancies</p>}
+        </button>
         <StatCard icon={<AlertTriangle className="w-5 h-5 text-amber-500" />} label="Price Discrepancy" value={result.stats.priceMismatch} color="amber"
           subtitle={result.stats.minorVariance > 0 ? `${result.stats.minorVariance} minor (≤3%)` : undefined} />
         {/* "minor" = matched order, price within tolerance (e.g. £0.215 vs £0.22 napkin rate). Real overcharges stay flagged. */}
-        <StatCard icon={<XCircle className="w-5 h-5 text-red-500" />} label="On Invoice Only" value={result.stats.notFound} color="red"
+        <StatCard icon={<XCircle className="w-5 h-5 text-red-500" />} label="On Invoice Only" value={result.stats.notFound - adjustedTotals.explainedCount} color="red"
           subtitle={Object.keys(notFoundResolutions).length > 0 ? `${Object.keys(notFoundResolutions).length} resolved` : undefined} />
         <StatCard icon={<HelpCircle className="w-5 h-5 text-blue-500" />} label="In System Only" value={result.stats.missing} color="blue"
-          subtitle={Object.keys(missingResolutions).length > 0 ? `${Object.keys(missingResolutions).length} resolved` : undefined} />
+          subtitle={[Object.keys(missingResolutions).length > 0 ? `${Object.keys(missingResolutions).length} resolved` : '', result.nextInvoice.length > 0 ? `+${result.nextInvoice.length} probably next invoice` : ''].filter(Boolean).join(' · ') || undefined} />
         <div className="bg-white rounded-xl border border-gray-200 p-4">
           <p className="text-xs text-gray-500 mb-1">Unresolved</p>
           <p className={`text-xl font-bold ${Math.abs(adjustedTotals.unresolvedDiff) < 0.02 ? 'text-green-600' : 'text-amber-600'}`}>
@@ -2823,6 +2992,8 @@ export default function Reconciliation() {
                 {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Received</th>}
                 {napkinSummary.hasLedgerData && <th className="px-3 py-2.5 text-right font-medium text-gray-600">Shrinkage</th>}
                 <th className="px-3 py-2.5 text-right font-medium text-gray-600">Min Used</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600" title="What Goldstar would charge if they used OUR sent count (the weekly minimum still applies)">Charge by our count</th>
+                <th className="px-3 py-2.5 text-right font-medium text-gray-600" title="Charged minus 'charge by our count', at the napkin rate. £0 when both counts are under the weekly minimum.">Over / under {'\u00a3'}</th>
                 <th className="px-3 py-2.5 text-left font-medium text-gray-600" title="Invoice top-up vs minimum minus sent, and £ charged vs quantity x rate">Check</th>
               </tr></thead>
               <tbody>
@@ -2861,6 +3032,16 @@ export default function Reconciliation() {
                         ) : <span className="text-gray-400">{'\u2014'}</span>}
                       </td>
                       {(() => {
+                        const ow = napkinOverUnder(w)
+                        return (<>
+                          <td className="px-3 py-2 text-right">{ow ? ow.ourQty.toLocaleString() : <span className="text-gray-300">{'\u2014'}</span>}</td>
+                          <td className={`px-3 py-2 text-right font-medium ${!ow ? 'text-gray-300' : ow.pounds > 0.005 ? 'text-red-600' : ow.pounds < -0.005 ? 'text-amber-600' : 'text-green-600'}`}
+                            title={ow ? (ow.pounds === 0 ? (hasTopUp ? 'Both counts are under the weekly minimum: the bill is the same either way' : 'Counts agree') : `${ow.pounds > 0 ? 'Charged more' : 'Charged less'} than our count: ${Math.abs(w.totalChargedQty - ow.ourQty)} napkins`) : 'No tablet orders for this week'}>
+                            {!ow ? '\u2014' : ow.pounds > 0.005 ? `+\u00a3${ow.pounds.toFixed(2)} over` : ow.pounds < -0.005 ? `\u2212\u00a3${Math.abs(ow.pounds).toFixed(2)} under` : '\u00a30.00'}
+                          </td>
+                        </>)
+                      })()}
+                      {(() => {
                         const expectedQty = hasTopUp ? Math.max(0, napkinSummary.weeklyMinimum - w.invoiceSentQty) : 0
                         const qtyOff = hasTopUp && w.topUpQty !== expectedQty
                         const expectedNet = w.topUpQty * napkinSummary.unitRate
@@ -2895,6 +3076,10 @@ export default function Reconciliation() {
                   {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right">{napkinSummary.totalReceived > 0 ? napkinSummary.totalReceived.toLocaleString() : '-'}</td>}
                   {napkinSummary.hasLedgerData && <td className="px-3 py-3 text-right text-red-600">{napkinSummary.totalReceived > 0 ? (napkinSummary.totalInvoiceSent - napkinSummary.totalReceived).toLocaleString() : '-'}</td>}
                   <td className="px-3 py-3" />
+                  <td className="px-3 py-3 text-right">{napkinMonth.ourQty > 0 ? napkinMonth.ourQty.toLocaleString() : '\u2014'}</td>
+                  <td className={`px-3 py-3 text-right ${napkinMonth.pounds > 0.005 ? 'text-red-600' : napkinMonth.pounds < -0.005 ? 'text-amber-600' : 'text-green-600'}`}>
+                    {napkinMonth.pounds > 0.005 ? `+\u00a3${napkinMonth.pounds.toFixed(2)}` : napkinMonth.pounds < -0.005 ? `\u2212\u00a3${Math.abs(napkinMonth.pounds).toFixed(2)}` : '\u00a30.00'}
+                  </td>
                   <td className="px-3 py-3" />
                 </tr>
               </tfoot>
@@ -2903,6 +3088,14 @@ export default function Reconciliation() {
           {/* Summary footer */}
           <div className="px-5 py-3 bg-gray-50 border-t border-gray-200 text-xs text-gray-600 space-y-1">
             <div>Weekly minimum: {napkinSummary.weeklyMinimum.toLocaleString()} napkins @ {'\u00a3'}{napkinSummary.unitRate.toFixed(3)}/each = {'\u00a3'}{napkinSummary.weeklyMinCost.toFixed(2)}/week</div>
+            {napkinMonth.weeks > 0 && (
+              <div className={`font-medium ${Math.abs(napkinMonth.pounds) < 1 ? 'text-green-700' : napkinMonth.pounds > 0 ? 'text-red-700' : 'text-amber-700'}`}>
+                Verdict by our count: {Math.abs(napkinMonth.pounds) < 1
+                  ? `billed correctly (difference ${'\u00a3'}${Math.abs(napkinMonth.pounds).toFixed(2)}). Weeks under the minimum cost the same whatever the count.`
+                  : napkinMonth.pounds > 0 ? `over-charged by ${'\u00a3'}${napkinMonth.pounds.toFixed(2)}: check the weeks marked "over" and consider a credit request.`
+                  : `under-charged by ${'\u00a3'}${Math.abs(napkinMonth.pounds).toFixed(2)} compared with our count.`}
+              </div>
+            )}
             {napkinSummary.totalTopUp > 0 && (
               <div className="text-amber-700 font-medium">
                 TopUp waste: {napkinSummary.totalTopUp.toLocaleString()} napkins paid but not sent ({'\u00a3'}{napkinSummary.totalTopUpCost.toFixed(2)})
@@ -3176,7 +3369,8 @@ export default function Reconciliation() {
         </div>
       <div className="flex gap-1.5 bg-gray-100 rounded-lg p-1 w-fit">
         {([['all', 'All', result.rows.length], ['matched', 'Matched', result.stats.matched],
-          ['mismatch', 'Price Discrepancy', result.stats.priceMismatch], ['not_found', 'On Invoice Only', result.stats.notFound],
+          ['mismatch', 'Price Discrepancy', result.stats.priceMismatch], ['not_found', 'On Invoice Only', result.stats.notFound - adjustedTotals.explainedCount],
+          ['explained', 'Explained', adjustedTotals.explainedCount],
           ['missing', 'In System Only', result.stats.missing],
           ...(chargeGroups.length > 0 ? [['group', 'Group / No-room', chargeGroups.reduce((s, g) => s + g.rows.length, 0)]] : [])] as [FilterTab, string, number][]).map(([key, label, count]) => (
           <button key={key} onClick={() => setFilter(key)}
@@ -3221,46 +3415,58 @@ export default function Reconciliation() {
                   || lineNotes[nfKey]
                   || nfRes?.note
                   || row.order?.notes?.match(/Note:\s*([^[]+)/)?.[1]?.trim()
+                const explained = row.status === 'not_found' && isExplainedType(tag?.charge_type)
+                const secondBag = row.status === 'not_found' && row.sectionType === 'guest_laundry' && !!row.invoiceLine.ticket
+                  && matchedRoomDays.has(`${row.invoiceLine.date}|${row.invoiceLine.ticket}`)
                 return (
                 <tr key={i} className={`border-b border-gray-100 ${
+                  explained ? 'bg-indigo-50/40' :
                   nfRes?.type === 'accepted' ? 'bg-green-50/40' :
                   nfRes?.type === 'added_to_system' ? 'bg-blue-50/40' :
                   isChallenged ? 'bg-orange-50/40' :
                   row.status === 'price_mismatch' ? 'bg-amber-50/50' :
                   row.status === 'not_found' ? 'bg-red-50/50' : ''
                 }`}>
-                  <td className="px-3 py-2.5 text-center">{statusIcon(row.status, row.minorVariance)}</td>
+                  <td className="px-3 py-2.5 text-center">{explained ? <Tag className="w-4 h-4 text-indigo-500 inline" /> : statusIcon(row.status, row.minorVariance)}</td>
                   <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.invoiceLine.date}</td>
                   <td className="px-3 py-2.5 font-mono font-medium text-navy">
                     {row.invoiceLine.ticket}{row.invoiceLine.guestInfo && <span className="text-gray-400 ml-1">{row.invoiceLine.guestInfo}</span>}
                     {row.invoiceLine.serviceNote && (
                       <span className="ml-1.5 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[10px] font-sans align-middle" title="Service tag printed on the invoice">{row.invoiceLine.serviceNote}</span>
                     )}
-                    {rowNote && (
-                      <span title={rowNote} className="inline-flex align-middle ml-1.5 cursor-help">
-                        <StickyNote className="w-3.5 h-3.5 text-amber-500" />
-                      </span>
-                    )}
                     <div className="mt-1 flex items-center gap-1 flex-wrap font-sans">
                       {tag && tag.charge_type !== 'note' && (
-                        <button onClick={() => openNoteModal(row)} title={tag.note || 'Edit charge-to tag'}
-                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${tag.charge_type === 'group' ? 'bg-indigo-50 text-indigo-700' : tag.charge_type === 'room_missing' ? 'bg-sky-50 text-sky-700' : 'bg-gray-100 text-gray-700'}`}>
-                          {chargeLabel(tag)}
+                        <button onClick={() => openNoteModal(row)} title="Edit"
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${isExplainedType(tag.charge_type) ? 'bg-indigo-100 text-indigo-700' : tag.charge_type === 'room_missing' ? 'bg-sky-50 text-sky-700' : 'bg-gray-100 text-gray-700'}`}>
+                          {explained ? 'Explained · ' : ''}{chargeLabel(tag)}
                         </button>
                       )}
-                      {noRoomGuest && !tag ? (
+                      {noRoomGuest && row.status === 'not_found' && (!tag || tag.charge_type === 'note') && (
                         <button onClick={() => openNoteModal(row)}
                           className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-800 hover:bg-amber-200"
                           title="No room on the invoice: add the room, pick the guest, or tag it as a group / house charge">
                           Assign room / group
                         </button>
-                      ) : (!tag || tag.charge_type === 'note') && (
-                        <button onClick={() => openNoteModal(row)} className="p-0.5 rounded text-gray-300 hover:text-navy hover:bg-gray-100"
-                          title={tag ? 'Edit note' : 'Add a note / charge-to tag to this line'}>
-                          <Tag className="w-3 h-3" />
-                        </button>
                       )}
+                      <button onClick={() => openNoteModal(row)} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-gray-200 text-[10px] text-gray-500 hover:text-navy hover:border-gray-300"
+                        title={rowNote ? 'Edit the note' : 'Add a note to this line'}>
+                        <StickyNote className="w-3 h-3" />{rowNote ? 'Edit note' : 'Note'}
+                      </button>
                     </div>
+                    {rowNote && (
+                      <p className="mt-1 font-sans font-normal text-[11px] italic text-gray-600 border-l-2 border-amber-300 pl-2 max-w-[260px] whitespace-normal">
+                        {rowNote}{tag?.note && tag.updated_by ? <span className="not-italic text-gray-400"> {'\u00b7'} {tag.updated_by.split('@')[0]}{tag.updated_at ? ` ${tag.updated_at.slice(8, 10)}/${tag.updated_at.slice(5, 7)}` : ''}</span> : null}
+                      </p>
+                    )}
+                    {row.order && isInactiveOrder(row.order) && (
+                      <p className="mt-1 font-sans font-normal text-[11px] text-gray-700 bg-gray-100 rounded px-1.5 py-0.5 w-fit">tablet status: {row.order.status}</p>
+                    )}
+                    {row.hint && (
+                      <p className="mt-1 font-sans font-normal text-[11px] text-gray-700 bg-gray-100 rounded px-1.5 py-0.5 max-w-[260px] whitespace-normal">{row.hint}</p>
+                    )}
+                    {secondBag && (
+                      <p className="mt-1 font-sans font-normal text-[11px] text-amber-800 bg-amber-50 rounded px-1.5 py-0.5 max-w-[260px] whitespace-normal">Same room and day as a matched line: <b>probably a 2nd bag</b> on one tablet order</p>
+                    )}
                   </td>
                   <td className="px-3 py-2.5 text-gray-600">{row.order?.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-700 max-w-[220px] truncate" title={row.invoiceLine.description}>{row.invoiceLine.description}</td>
@@ -3272,9 +3478,10 @@ export default function Reconciliation() {
                     const sysQty = (row.order?.order_items || []).reduce((s, it) => s + (it.quantity_sent ?? 0), 0)
                     const qtyDiffers = !!row.order && invQty > 0 && sysQty > 0 && invQty !== sysQty
                     return (
-                      <td className={`px-3 py-2.5 max-w-[220px] truncate ${qtyDiffers ? 'text-amber-700 bg-amber-50/60' : 'text-gray-600'}`}
+                      <td className={`px-3 py-2.5 max-w-[220px] ${qtyDiffers ? 'text-amber-700' : 'text-gray-600'}`}
                         title={sysItems ? `${sysItems}${qtyDiffers ? `  (invoice ${invQty} pcs vs system ${sysQty} pcs)` : ''}` : 'Not in system'}>
-                        {row.order ? (sysItems || <span className="text-gray-400">no items</span>) : <span className="text-gray-300">{'\u2014'}</span>}
+                        <div className="truncate">{row.order ? (sysItems || <span className="text-gray-400">no items recorded on the tablet</span>) : <span className="text-gray-300">{'\u2014'}</span>}</div>
+                        {qtyDiffers && <span className="inline-block mt-0.5 text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5">pieces: invoice {invQty} {'\u00b7'} ours {sysQty}</span>}
                       </td>
                     )
                   })()}
@@ -3402,7 +3609,11 @@ export default function Reconciliation() {
                   isChallenged ? 'bg-orange-50/40' :
                   'bg-blue-50/30'
                 }`}>
-                  <td className="px-3 py-2.5 font-mono font-medium text-navy">{o.docket_number}</td>
+                  <td className="px-3 py-2.5 font-mono font-medium text-navy">{o.docket_number}
+                    {isInactiveOrder(o) && <div className="mt-1 font-sans text-[10px] text-gray-700 bg-gray-100 rounded px-1.5 py-0.5 w-fit">tablet status: {o.status}</div>}
+                    {isTopUpCopy(o) && <div className="mt-1 font-sans text-[10px] font-medium text-red-700 bg-red-100 rounded px-1.5 py-0.5 w-fit" title="Created by 'Add to System' from a weekly Minimum top-up line: it copies a top-up CHARGE, it is not real laundry, and it double-counts the top-up">Copy of a top-up charge, not a real order</div>}
+                    {(() => { const dup = duplicateTicketHint(o); return dup ? <div className="mt-1 font-sans text-[10px] text-amber-800 bg-amber-50 rounded px-1.5 py-0.5 w-fit">{dup}</div> : null })()}
+                  </td>
                   <td className="px-3 py-2.5 text-gray-600">{o.department?.name || '\u2014'}</td>
                   <td className="px-3 py-2.5 text-gray-600">{ORDER_TYPE_LABELS[o.order_type as OrderType] ?? o.order_type}</td>
                   <td className="px-3 py-2.5 text-gray-900">{o.staff_name || o.guest_name || '\u2014'}</td>
@@ -3422,9 +3633,9 @@ export default function Reconciliation() {
                         <button
                           onClick={() => handleDefer(o.id)}
                           className="px-2 py-1 text-xs font-medium text-purple-700 bg-purple-50 rounded hover:bg-purple-100 whitespace-nowrap"
-                          title="Expected on next invoice"
+                          title="Expect this order on next month's invoice"
                         >
-                          <ArrowRightLeft className="w-3 h-3 inline mr-0.5" />Defer
+                          <ArrowRightLeft className="w-3 h-3 inline mr-0.5" />Expect next invoice
                         </button>
                         <button
                           onClick={() => handleWriteOff(o.id)}
@@ -3454,7 +3665,20 @@ export default function Reconciliation() {
               )})}
             </tbody>
           </table>
-        </div></div>
+        </div>
+        {result.nextInvoice.length > 0 && (
+          <div className="border-t border-gray-200 bg-gray-50/70 px-4 py-3">
+            <p className="text-xs font-semibold text-gray-600 mb-1.5">Probably next invoice ({result.nextInvoice.length}): written on the last day of the period, usually collected and invoiced the next day. Not counted as missing.</p>
+            <div className="flex flex-wrap gap-1.5">
+              {result.nextInvoice.map(o => (
+                <span key={o.id} className="text-[11px] text-gray-600 bg-white border border-gray-200 rounded px-2 py-0.5" title={(o.order_items || []).map(i => `${i.quantity_sent}x ${i.item_name}`).join(', ')}>
+                  <span className="font-mono font-medium text-navy">{o.docket_number}</span> {'\u00b7'} {o.department?.name || ORDER_TYPE_LABELS[o.order_type as OrderType]} {'\u00b7'} {'\u00a3'}{computeOrderCost(o).toFixed(2)}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+        </div>
       )}
 
       {/* TopUp charges */}
@@ -3915,8 +4139,8 @@ export default function Reconciliation() {
                 <AlertTriangle className="w-5 h-5 text-amber-600" />
               </div>
               <div>
-                <h3 className="text-base font-semibold text-gray-900">Unresolved Discrepancies</h3>
-                <p className="text-xs text-gray-500 mt-0.5">Review before saving</p>
+                <h3 className="text-base font-semibold text-gray-900">Before saving</h3>
+                <p className="text-xs text-gray-500 mt-0.5">Review what's still open</p>
               </div>
             </div>
             <div className="p-5 space-y-3 text-sm">
@@ -3947,7 +4171,19 @@ export default function Reconciliation() {
                   </div>
                 </div>
               )}
-              <p className="text-gray-500 text-xs pt-1">You can still save, but these items will remain unresolved in the reconciliation record.</p>
+              {adjustedTotals.explainedCount > 0 && (
+                <div className="flex items-start gap-2 bg-indigo-50 border-2 border-indigo-200 rounded-lg p-3">
+                  <Tag className="w-4 h-4 text-indigo-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium text-indigo-800">{adjustedTotals.explainedCount} explained line{adjustedTotals.explainedCount > 1 ? 's' : ''}: {'\u00a3'}{adjustedTotals.explainedTotal.toFixed(2)} NET</p>
+                    <p className="text-indigo-600 text-xs mt-0.5">Group / service wash / house use / other: not counted as discrepancies</p>
+                  </div>
+                </div>
+              )}
+              {result.nextInvoice.length > 0 && (
+                <p className="text-xs text-gray-500">{result.nextInvoice.length} order{result.nextInvoice.length > 1 ? 's' : ''} written on the last day ({'\u00a3'}{result.nextInvoice.reduce((s, o) => s + computeOrderCost(o), 0).toFixed(2)}) are probably on next month's invoice, so they are not counted.</p>
+              )}
+              <p className="text-gray-500 text-xs pt-1">You can still save; open items stay listed in the reconciliation record.</p>
             </div>
             <div className="p-4 border-t border-gray-200 flex gap-2 justify-end">
               <button onClick={() => setShowSaveConfirm(false)}
@@ -3956,7 +4192,7 @@ export default function Reconciliation() {
               </button>
               <button onClick={() => { setShowSaveConfirm(false); saveReconciliation() }}
                 className="px-4 py-2 text-sm font-medium text-white bg-amber-500 rounded-lg hover:bg-amber-600">
-                Save Anyway
+                Save
               </button>
             </div>
           </div>
@@ -3968,7 +4204,7 @@ export default function Reconciliation() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setAddModal(null)}>
           <div className="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4" onClick={e => e.stopPropagation()}>
             <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-gray-900">{addModal.row.order ? 'Link / Note' : 'Add to System'}</h3>
+              <h3 className="text-lg font-semibold text-gray-900">{addModal.row.order ? 'Re-link / note' : addModalMode === 'link' ? 'Link to an existing order' : 'Add to system'}</h3>
               <button onClick={() => setAddModal(null)} className="p-1 rounded hover:bg-gray-100"><X className="w-5 h-5 text-gray-400" /></button>
             </div>
             <div className="px-6 py-4 space-y-4">
@@ -3985,6 +4221,21 @@ export default function Reconciliation() {
                 <div className="flex justify-between"><span className="text-gray-500">Amount (NET):</span><span className="font-bold">{'\u00a3'}{addModal.row.invoiceLine.net.toFixed(2)}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Service Type:</span><span>{ORDER_TYPE_LABELS[addModal.row.sectionType as OrderType] ?? addModal.row.sectionType}</span></div>
               </div>
+
+              {/* Likely existing order: link instead of creating a duplicate */}
+              {!addModal.row.order && addModalMode === 'create' && likelyExisting.length > 0 && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2">
+                  <p className="text-sm font-semibold text-amber-800">An order like this already exists</p>
+                  {likelyExisting.map(({ o, why }) => (
+                    <div key={o.id} className="flex items-center justify-between gap-2 bg-white border border-amber-200 rounded px-2 py-1.5 text-xs">
+                      <span><b className="font-mono">{o.docket_number}</b> {'\u00b7'} {o.department?.name || '\u2014'} {'\u00b7'} {format(new Date(o.created_at), 'dd/MM')} {'\u00b7'} {'\u00a3'}{computeOrderCost(o).toFixed(2)} <span className="text-gray-500">({why})</span></span>
+                      <button onClick={() => { setAddModalMode('link'); setAddModalLinkOrderId(o.id); setAddModalLinkDocket(o.docket_number) }}
+                        className="px-2 py-0.5 rounded bg-navy text-white whitespace-nowrap">Link this</button>
+                    </div>
+                  ))}
+                  <label className="flex items-center gap-2 text-xs text-amber-900"><input type="checkbox" checked={addCreateAnyway} onChange={e => setAddCreateAnyway(e.target.checked)} /> Create a new order anyway</label>
+                </div>
+              )}
 
               {/* Mode toggle: create new vs link existing */}
               <div className="flex rounded-lg border border-gray-200 p-1 bg-gray-50">
@@ -4206,7 +4457,7 @@ export default function Reconciliation() {
                 {addModalMode === 'create' ? (
                   <button
                     onClick={handleAddToSystem}
-                    disabled={!addModalDept || addModalSaving}
+                    disabled={!addModalDept || addModalSaving || (likelyExisting.length > 0 && !addCreateAnyway)}
                     className="flex-1 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
                   >
                     {addModalSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
